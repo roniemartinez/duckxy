@@ -1,0 +1,23 @@
+[package]
+name = "duckxy"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "URL-based geospatial processing API powered by DuckDB"
+repository = "https://github.com/roniemartinez/duckxy"
+
+[dependencies]
+anyhow = "1.0.102"
+axum = "0.8.9"
+duckdb = { version = "1.10502.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6.10", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = "symbols"
