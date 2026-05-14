@@ -1,0 +1,13 @@
+target/
+.env
+.env.*
+!.env.example
+*.log
+.git/
+.gitignore
+README.md
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

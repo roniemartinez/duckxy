@@ -1,0 +1,7 @@
+version: "3"
+
+tasks:
+  dev:
+    desc: Start the dev container (cargo-watch hot reload) in the foreground
+    cmds:
+      - docker compose up --build
