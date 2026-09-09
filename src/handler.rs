@@ -19,8 +19,8 @@ pub fn build_sql(source: &str, format: Format) -> String {
 
     match format {
         Format::GeoJson => {
-            // REPLACE avoids adding a column; a source attribute named geom still
-            // collides inside ST_Read itself, which we cannot rename away here
+            // REPLACE avoids adding a column; a source attribute named geom still collides inside ST_Read itself,
+            // which we cannot rename away here
             let rendered = Query::select()
                 .expr(Expr::cust("* REPLACE (ST_AsGeoJSON(geom) AS geom)"))
                 .from_subquery(relation, Alias::new("src"))

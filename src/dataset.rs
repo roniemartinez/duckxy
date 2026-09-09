@@ -142,8 +142,6 @@ mod tests {
         rows.next().map_err(|e| e.to_string())?.unwrap().get(0).map_err(|e| e.to_string())
     }
 
-    // archive and member names differ on purpose: a resolver that guesses the member
-    // from the archive stem would pass if they matched
     #[rstest]
     #[case("cities.zip", "somethingelse.geojson")]
     #[case("cities.shp.zip", "somethingelse.geojson")]

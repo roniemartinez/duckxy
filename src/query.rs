@@ -117,7 +117,6 @@ mod tests {
 
     #[test]
     fn a_sink_returning_false_stops_the_scan() {
-        // big enough that the in-loop sink fires before the tail flush
         crate::ensure_spatial();
         let src = fixture("stop", &many_features(2000));
         let f = Format::GeoJson;

@@ -1,3 +1,4 @@
+use axum::extract::Request;
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::{Router, routing::get};
@@ -18,14 +19,21 @@ async fn favicon_ico() -> impl IntoResponse {
     (StatusCode::OK, headers, FAVICON_ICO)
 }
 
-/// The open routes, before state is applied, so another crate can add its own
-/// before finalising.
+fn request_span(request: &Request) -> tracing::Span {
+    let path = request.uri().path();
+    let redacted = match path.trim_start_matches('/').split_once('/') {
+        Some((_signature, rest)) => format!("/<redacted>/{rest}"),
+        None => path.to_string(),
+    };
+    tracing::info_span!("request", method = %request.method(), path = %redacted)
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/favicon.ico", get(favicon_ico))
         .route("/{signature}/{*path}", get(handler::dataset))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
 }
 
 pub fn router(state: AppState) -> Router {
