@@ -7,17 +7,31 @@ description = "URL-based geospatial processing API powered by DuckDB"
 repository = "https://github.com/roniemartinez/duckxy"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 axum = "0.8.9"
-duckdb = { version = "1.10502.0", features = ["bundled"] }
-serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal"] }
-tower-http = { version = "0.6.10", features = ["trace"] }
+duckdb = { version = "1.10505.0", features = ["bundled"] }
+sea-query = "1.0.2"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio-stream = "0.1.18"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+hmac = "0.13.0"
+sha2 = "0.11.0"
+subtle = "2.6.1"
+base64 = "0.23.1"
+hex = "0.4.3"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 16
 strip = "symbols"
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+rstest = "0.27.0"
+serde_json = "1.0.151"
+tower = { version = "0.5.3", features = ["util"] }
+zip = "8.6.0"

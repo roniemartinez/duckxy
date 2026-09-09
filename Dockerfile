@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.95.0-slim AS base
+FROM rust:1.98.1-slim AS base
 
 WORKDIR /app
 
@@ -36,7 +36,7 @@ RUN mkdir src && \
     rm -rf src target/release/duckxy* target/release/deps/duckxy*
 
 COPY src/ ./src/
-COPY favicon.ico favicon.svg ./
+COPY favicon.ico ./
 
 RUN cargo build --release
 
