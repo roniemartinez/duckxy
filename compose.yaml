@@ -17,7 +17,6 @@ services:
       - ./Cargo.toml:/app/Cargo.toml
       - ./Cargo.lock:/app/Cargo.lock
       - ./favicon.ico:/app/favicon.ico
-      - ./favicon.svg:/app/favicon.svg
       - duckxy-target:/app/target
       - cargo-registry:/usr/local/cargo/registry
     healthcheck:

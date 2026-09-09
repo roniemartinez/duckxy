@@ -1,56 +1,11 @@
-use axum::{Json, Router, http::StatusCode, http::header, response::IntoResponse, routing::get};
-use serde::Serialize;
+use anyhow::Result;
+use duckxy::auth::Auth;
+use duckxy::dataset::DatasetRoot;
+use duckxy::{AppState, Config, VERSION, query, routes};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_BIND: &str = "0.0.0.0:5757";
-
-#[derive(Serialize)]
-struct ServiceInfo {
-    service: &'static str,
-    version: &'static str,
-}
-
-async fn root() -> impl IntoResponse {
-    (StatusCode::OK, Json(ServiceInfo { service: "duckxy", version: VERSION }))
-}
-
-async fn health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
-}
-
-const FAVICON_ICO: &[u8] = include_bytes!("../favicon.ico");
-const FAVICON_SVG: &[u8] = include_bytes!("../favicon.svg");
-const ICON_CACHE_CONTROL: &str = "public, max-age=86400, immutable";
-
-async fn favicon_ico() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "image/vnd.microsoft.icon"), (header::CACHE_CONTROL, ICON_CACHE_CONTROL)],
-        FAVICON_ICO,
-    )
-}
-
-async fn favicon_svg() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, ICON_CACHE_CONTROL)],
-        FAVICON_SVG,
-    )
-}
-
-fn router() -> Router {
-    Router::new()
-        .route("/", get(root))
-        .route("/health", get(health))
-        .route("/favicon.ico", get(favicon_ico))
-        .route("/favicon.svg", get(favicon_svg))
-        .layer(TraceLayer::new_for_http())
-}
 
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -69,14 +24,49 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
+fn sign_path(config: &Config, path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        anyhow::bail!("path must start with '/', got: {path}");
+    }
+    let Some(key) = config.key.as_deref() else {
+        anyhow::bail!("DUCKXY_KEY is required to sign");
+    };
+    let signature = Auth::new(Some(key), false)?.sign(path).expect("a key was supplied");
+    println!("/{signature}{path}");
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
+    let config = Config::from_env();
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "sign") {
+        let Some(path) = args.get(2) else {
+            anyhow::bail!(
+                "usage: DUCKXY_KEY=<hex> duckxy sign /@dataset:name/output.geojson\n\
+                 via cargo: DUCKXY_KEY=<hex> cargo run -- sign /@dataset:name/output.geojson"
+            );
+        };
+        return sign_path(&config, path);
+    }
+
     fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))).init();
 
-    let bind = std::env::var("DUCKXY_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
-    let listener = TcpListener::bind(&bind).await?;
-    info!(%bind, version = VERSION, "duckxy starting");
+    let auth = Auth::new(config.key.as_deref(), config.allow_insecure)?;
+    let root = DatasetRoot::new(config.data_root);
 
-    axum::serve(listener, router()).with_graceful_shutdown(shutdown_signal()).await?;
+    query::install_extensions()?;
+
+    let listener = TcpListener::bind(&config.bind).await?;
+    info!(
+        bind = %config.bind,
+        version = VERSION,
+        data_root = %root.root().display(),
+        allow_insecure = config.allow_insecure,
+        "duckxy starting"
+    );
+
+    axum::serve(listener, routes::router(AppState { root, auth })).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
 }
