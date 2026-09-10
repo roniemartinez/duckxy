@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod dataset;
+mod encodings;
 pub mod formats;
 pub mod handler;
 pub mod query;
@@ -59,7 +60,10 @@ pub fn error(status: StatusCode, message: impl Into<String>) -> Response {
 
 pub fn resolve_error(e: ResolveError) -> Response {
     match e {
-        ResolveError::NotFound(_) => error(StatusCode::NOT_FOUND, e.to_string()),
+        ResolveError::NotFound(_) | ResolveError::EmptyArchive(_) => error(StatusCode::NOT_FOUND, e.to_string()),
+        ResolveError::PathNotFound { .. } | ResolveError::NotAnArchive(_) => {
+            error(StatusCode::BAD_REQUEST, e.to_string())
+        }
         // e.to_string() would leak the data root path
         ResolveError::InvalidRoot(_) => {
             tracing::error!(error = %e, "data root is unusable");

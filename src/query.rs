@@ -1,41 +1,81 @@
 use crate::formats::Format;
 use anyhow::{Context, Result};
 use duckdb::Connection;
+use sea_query::{Expr, Func, PostgresQueryBuilder, Query};
+use std::cell::OnceCell;
 
 const CHUNK_BYTES: usize = 64 * 1024;
+const DEFAULT_GEOMETRY: &str = "geom";
+
+thread_local! {
+    static CONNECTION: OnceCell<Connection> = const { OnceCell::new() };
+}
 
 pub fn install_extensions() -> Result<()> {
     let conn = Connection::open_in_memory().context("open duckdb")?;
     conn.execute_batch("INSTALL spatial; LOAD spatial;").context("install the spatial extension")
 }
 
-pub fn run(sql: &str, format: Format, on_ready: impl FnOnce(), sink: &mut dyn FnMut(String) -> bool) -> Result<()> {
-    let conn = Connection::open_in_memory().context("open duckdb")?;
-    conn.execute_batch("LOAD spatial;").context("load the spatial extension")?;
-
-    let mut stmt = conn.prepare(sql).context("prepare query")?;
-    let mut rows = stmt.query([]).context("run query")?;
-    on_ready();
-
-    let mut buf = String::with_capacity(CHUNK_BYTES * 2);
-    let mut first = true;
-
-    while let Some(row) = rows.next().context("read row")? {
-        let Some(text) = row.get::<_, Option<String>>(0).context("read row")? else { continue };
-        if !first {
-            buf.push_str(format.separator());
+fn with_connection<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    CONNECTION.with(|cell| {
+        if cell.get().is_none() {
+            let conn = Connection::open_in_memory().context("open duckdb")?;
+            conn.execute_batch("LOAD spatial;").context("load the spatial extension")?;
+            let _ = cell.set(conn);
         }
-        first = false;
-        buf.push_str(&text);
-        if buf.len() >= CHUNK_BYTES && !sink(std::mem::take(&mut buf)) {
-            return Ok(());
-        }
-    }
+        f(cell.get().expect("just initialised"))
+    })
+}
 
-    if !buf.is_empty() {
-        sink(buf);
+pub fn run(
+    source: &str,
+    format: Format,
+    sql_for: impl FnOnce(&str) -> String,
+    on_ready: impl FnOnce(),
+    sink: &mut dyn FnMut(String) -> bool,
+) -> Result<()> {
+    with_connection(|conn| {
+        let geometry = geometry_column(conn, source)?.unwrap_or_else(|| DEFAULT_GEOMETRY.to_string());
+        let sql = sql_for(&geometry);
+
+        let mut stmt = conn.prepare(&sql).context("prepare query")?;
+        let mut rows = stmt.query([]).context("run query")?;
+        on_ready();
+
+        let mut buf = String::with_capacity(CHUNK_BYTES * 2);
+        let mut first = true;
+
+        while let Some(row) = rows.next().context("read row")? {
+            let Some(text) = row.get::<_, Option<String>>(0).context("read row")? else { continue };
+            if !first {
+                buf.push_str(format.separator());
+            }
+            first = false;
+            buf.push_str(&text);
+            if buf.len() >= CHUNK_BYTES && !sink(std::mem::take(&mut buf)) {
+                return Ok(());
+            }
+        }
+
+        if !buf.is_empty() {
+            sink(buf);
+        }
+        Ok(())
+    })
+}
+
+fn geometry_column(conn: &Connection, source: &str) -> Result<Option<String>> {
+    let relation = Query::select()
+        .expr(Expr::cust("*"))
+        .from_function(Func::cust("ST_Read").arg(source), "src")
+        .to_string(PostgresQueryBuilder);
+    let sql = format!("SELECT column_name FROM (DESCRIBE {relation}) WHERE column_type LIKE 'GEOMETRY%' LIMIT 1");
+    let mut stmt = conn.prepare(&sql).context("describe source")?;
+    let mut rows = stmt.query([]).context("describe source")?;
+    match rows.next().context("describe source")? {
+        Some(row) => Ok(row.get::<_, Option<String>>(0).context("describe source")?),
+        None => Ok(None),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -67,13 +107,55 @@ mod tests {
         crate::ensure_spatial();
         let f = Format::from_extension(ext).unwrap();
         let mut out = String::from(f.header());
-        run(&crate::handler::build_sql(source, f), f, || {}, &mut |chunk| {
-            out.push_str(&chunk);
-            true
-        })
+        run(
+            source,
+            f,
+            |g| crate::handler::build_sql(source, crate::url::DEFAULT_ENCODING, f, g),
+            || {},
+            &mut |chunk| {
+                out.push_str(&chunk);
+                true
+            },
+        )
         .unwrap();
         out.push_str(f.footer());
         out
+    }
+
+    #[test]
+    fn a_source_whose_geometry_column_is_not_called_geom_still_renders() {
+        crate::ensure_spatial();
+        let dir = std::env::temp_dir().join(format!("duckxy-gdb-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let gdb = dir.join("ds.gdb");
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("LOAD spatial;").unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT ST_Point(1, 2) AS geom, 7 AS id) TO '{}' \
+             WITH (FORMAT GDAL, DRIVER 'OpenFileGDB', LAYER_NAME 'ds', GEOMETRY_TYPE 'Point')",
+            gdb.display()
+        ))
+        .unwrap();
+
+        let src = crate::dataset::DatasetRoot::new(dir).resolve("ds", None).unwrap();
+        let mut out = String::from(Format::GeoJson.header());
+        run(
+            &src,
+            Format::GeoJson,
+            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, Format::GeoJson, g),
+            || {},
+            &mut |chunk| {
+                out.push_str(&chunk);
+                true
+            },
+        )
+        .unwrap();
+        out.push_str(Format::GeoJson.footer());
+
+        assert!(out.contains(r#""coordinates":[1.0,2.0]"#), "{out}");
+        assert!(!out.contains("SHAPE"), "the geometry column leaked into properties: {out}");
     }
 
     #[test]
@@ -120,10 +202,8 @@ mod tests {
         crate::ensure_spatial();
         let src = fixture("stop", &many_features(2000));
         let f = Format::GeoJson;
-        let sql = crate::handler::build_sql(&src, f);
-
         let mut stopped_after = 0;
-        run(&sql, f, || {}, &mut |_| {
+        run(&src, f, |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g), || {}, &mut |_| {
             stopped_after += 1;
             false
         })
@@ -131,7 +211,7 @@ mod tests {
         assert_eq!(stopped_after, 1, "scan continued after the sink asked it to stop");
 
         let mut chunks = 0;
-        run(&sql, f, || {}, &mut |_| {
+        run(&src, f, |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g), || {}, &mut |_| {
             chunks += 1;
             true
         })

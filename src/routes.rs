@@ -79,9 +79,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case("/@dataset:pts/output.geojson")]
-    #[case("/@dataset:pts/output.json")]
-    #[case("/@dataset:pts/anything.geojson")]
+    #[case("/@dataset:pts.geojson")]
+    #[case("/@dataset:pts.json")]
+    #[case("/@dataset:pts,enc:utf-8.geojson")]
     #[tokio::test]
     async fn a_signed_request_is_served(#[case] path: &str) {
         let s = state("ok", false);
@@ -107,7 +107,7 @@ mod tests {
 
     #[tokio::test]
     async fn insecure_works_only_when_enabled() {
-        let path = "/@dataset:pts/output.geojson";
+        let path = "/@dataset:pts.geojson";
         let (status, _) = get(state("ins-off", false), &format!("/insecure{path}")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
@@ -117,8 +117,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case("/@dataset:pts/output.xml", StatusCode::BAD_REQUEST)]
-    #[case("/@dataset:nope/output.geojson", StatusCode::NOT_FOUND)]
+    #[case("/@dataset:pts.xml", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:nope.geojson", StatusCode::NOT_FOUND)]
     #[tokio::test]
     async fn errors_keep_their_status_behind_a_valid_signature(#[case] path: &str, #[case] expected: StatusCode) {
         let s = state("err", false);
