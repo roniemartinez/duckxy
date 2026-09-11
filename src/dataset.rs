@@ -73,6 +73,10 @@ impl Candidate {
     }
 }
 
+pub fn looks_like_source(segment: &str) -> bool {
+    Source::of(segment).is_some()
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ResolveError {
     NotFound(String),
@@ -144,13 +148,20 @@ fn read_entries(root: &Path) -> Option<Vec<Entry>> {
         let (Ok(name), Ok(kind)) = (entry.file_name().into_string(), entry.file_type()) else {
             continue;
         };
-        out.push(Entry { name, is_dir: kind.is_dir() });
+        let is_dir = match kind.is_symlink() {
+            true => std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir()),
+            false => kind.is_dir(),
+        };
+        out.push(Entry { name, is_dir });
     }
     Some(out)
 }
 
 fn pick_entry<'a>(entries: &'a [Entry], wanted: &str) -> Option<&'a Entry> {
-    entries.iter().find(|e| e.name == wanted).or_else(|| entries.iter().find(|e| e.name.eq_ignore_ascii_case(wanted)))
+    entries
+        .iter()
+        .find(|e| e.name == wanted)
+        .or_else(|| entries.iter().filter(|e| e.name.eq_ignore_ascii_case(wanted)).min_by_key(|e| &e.name))
 }
 
 fn gdal_path(file: &Path, archive: bool, wanted: Option<&str>) -> Result<String, ResolveError> {
@@ -172,19 +183,35 @@ fn gdal_path(file: &Path, archive: bool, wanted: Option<&str>) -> Result<String,
                 candidates: paths.iter().take(MAX_CANDIDATES).map(|(_, name)| name.clone()).collect(),
             }
         })?,
-        None => paths.iter().min_by_key(|(source, _)| *source as usize).ok_or(ResolveError::EmptyArchive(label))?,
+        None => paths
+            .iter()
+            .min_by(|a, b| {
+                (a.0 as usize)
+                    .cmp(&(b.0 as usize))
+                    .then_with(|| a.1.matches('/').count().cmp(&b.1.matches('/').count()))
+                    .then_with(|| a.1.cmp(&b.1))
+            })
+            .ok_or(ResolveError::EmptyArchive(label))?,
     };
     Ok(format!("/vsizip/{abs}/{}", chosen.1))
 }
 
 fn archive_paths(file: &Path) -> Vec<(Source, String)> {
-    let Ok(handle) = std::fs::File::open(file) else {
-        return Vec::new();
+    let handle = match std::fs::File::open(file) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(archive = %file.display(), error = %e, "cannot open archive");
+            return Vec::new();
+        }
     };
-    let Ok(mut zip) = zip::ZipArchive::new(handle) else {
-        return Vec::new();
+    let mut zip = match zip::ZipArchive::new(handle) {
+        Ok(zip) => zip,
+        Err(e) => {
+            tracing::warn!(archive = %file.display(), error = %e, "cannot read archive");
+            return Vec::new();
+        }
     };
-    let mut out = Vec::new();
+    let mut out: Vec<(Source, String)> = Vec::new();
     for i in 0..zip.len() {
         let Ok(entry) = zip.by_index_raw(i) else { continue };
         let name = entry.name();
@@ -192,11 +219,26 @@ fn archive_paths(file: &Path) -> Vec<(Source, String)> {
             continue;
         }
         let name = name.trim_end_matches('/');
-        if let Some(source) = Source::of(name) {
-            out.push((source, name.to_string()));
+        let Some((source, found)) = Source::of(name).map(|s| (s, name)).or_else(|| directory_prefix(name)) else {
+            continue;
+        };
+        if !out.iter().any(|(_, seen)| seen == found) {
+            out.push((source, found.to_string()));
         }
     }
     out
+}
+
+fn directory_prefix(name: &str) -> Option<(Source, &str)> {
+    let mut end = 0;
+    for part in name.split('/') {
+        let prefix = &name[..end + part.len()];
+        end += part.len() + 1;
+        if let Some(source) = Source::of(prefix).filter(|s| s.is_directory()) {
+            return Some((source, prefix));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -292,6 +334,14 @@ mod tests {
     }
 
     #[test]
+    fn two_members_of_the_same_kind_are_picked_by_name() {
+        let dir = archive_tempdir("tiebreak");
+        zip_named(&dir, "ds.zip", &["zebra.geojson", "alpha.geojson", "deep/aaa.geojson"]);
+        let resolved = DatasetRoot::new(dir).resolve("ds", None).expect("resolve");
+        assert!(resolved.ends_with("/alpha.geojson"), "{resolved}");
+    }
+
+    #[test]
     fn an_archive_with_nothing_readable_is_reported() {
         let dir = archive_tempdir("sidecars");
         zip_named(&dir, "ds.zip", &["ds.dbf", "ds.prj", "ds.shx"]);
@@ -325,12 +375,34 @@ mod tests {
         assert!(matches!(err, ResolveError::NotAnArchive(_)), "{err:?}");
     }
 
-    #[test]
-    fn a_geodatabase_directory_inside_an_archive_is_selectable() {
-        let dir = archive_tempdir("gdb");
-        zip_named(&dir, "ds.zip", &["ds/ds.gdb/", "ds/ds.gdb/a00000001.gdbtable"]);
+    #[rstest]
+    #[case("explicit", &["ds/ds.gdb/", "ds/ds.gdb/a00000001.gdbtable"])]
+    #[case("implicit", &["ds/ds.gdb/a00000001.gdbtable", "ds/ds.gdb/a00000001.gdbtablx"])]
+    fn a_geodatabase_directory_inside_an_archive_is_selectable(#[case] tag: &str, #[case] entries: &[&str]) {
+        let dir = archive_tempdir(&format!("gdb-{tag}"));
+        zip_named(&dir, "ds.zip", entries);
         let resolved = DatasetRoot::new(dir).resolve("ds", None).expect("resolve");
         assert!(resolved.ends_with("/ds/ds.gdb"), "{resolved}");
+    }
+
+    #[test]
+    fn a_geodatabase_appears_once_however_many_members_it_holds() {
+        let dir = archive_tempdir("gdbonce");
+        zip_named(&dir, "ds.zip", &["ds.gdb/a00000001.gdbtable", "ds.gdb/a00000002.gdbtable", "ds.gdb/timestamps"]);
+        let err = DatasetRoot::new(dir).resolve("ds", Some("nope")).unwrap_err();
+        let ResolveError::PathNotFound { candidates, .. } = &err else { panic!("{err:?}") };
+        assert_eq!(candidates, &["ds.gdb"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_geodatabase_resolves() {
+        let dir = archive_tempdir("symlink");
+        let target = dir.join("elsewhere").join("real.gdb");
+        fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("ds.gdb")).unwrap();
+        let resolved = DatasetRoot::new(dir).resolve("ds", None).expect("resolve");
+        assert!(resolved.ends_with("ds.gdb"), "{resolved}");
     }
 
     #[rstest]
@@ -350,5 +422,13 @@ mod tests {
             Entry { name: "ds.shp".to_string(), is_dir: false },
         ];
         assert_eq!(pick_entry(&entries, "ds.shp").map(|e| e.name.as_str()), Some("ds.shp"));
+    }
+
+    #[rstest]
+    #[case(&["DS.GeoJSON", "ds.GEOJSON"])]
+    #[case(&["ds.GEOJSON", "DS.GeoJSON"])]
+    fn a_case_variant_is_picked_the_same_way_whatever_the_listing_order(#[case] names: &[&str]) {
+        let entries: Vec<Entry> = names.iter().map(|n| Entry { name: n.to_string(), is_dir: false }).collect();
+        assert_eq!(pick_entry(&entries, "ds.geojson").map(|e| e.name.as_str()), Some("DS.GeoJSON"));
     }
 }

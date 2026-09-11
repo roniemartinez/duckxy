@@ -1,11 +1,13 @@
 use crate::formats::Format;
 use anyhow::{Context, Result};
 use duckdb::Connection;
-use sea_query::{Expr, Func, PostgresQueryBuilder, Query};
+use sea_query::{Expr, Func, FunctionCall, PostgresQueryBuilder, Query};
 use std::cell::OnceCell;
 
 const CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_GEOMETRY: &str = "geom";
+const DEFAULT_MEMORY_LIMIT: &str = "1GB";
+const DEFAULT_THREADS: &str = "2";
 
 thread_local! {
     static CONNECTION: OnceCell<Connection> = const { OnceCell::new() };
@@ -20,22 +22,54 @@ fn with_connection<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     CONNECTION.with(|cell| {
         if cell.get().is_none() {
             let conn = Connection::open_in_memory().context("open duckdb")?;
-            conn.execute_batch("LOAD spatial;").context("load the spatial extension")?;
+            conn.execute_batch(&format!("LOAD spatial; {}", tuning())).context("load the spatial extension")?;
             let _ = cell.set(conn);
         }
         f(cell.get().expect("just initialised"))
     })
 }
 
+fn tuning() -> &'static str {
+    static TUNING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TUNING.get_or_init(|| {
+        let memory = setting("DUCKXY_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT, valid_memory_limit);
+        let threads = setting("DUCKXY_THREADS", DEFAULT_THREADS, |v| v.parse::<u16>().is_ok_and(|n| n > 0));
+        format!("SET memory_limit = '{memory}'; SET threads = {threads};")
+    })
+}
+
+fn valid_memory_limit(value: &str) -> bool {
+    value.starts_with(|c: char| c.is_ascii_digit())
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '%'))
+}
+
+fn setting(key: &str, fallback: &str, valid: impl Fn(&str) -> bool) -> String {
+    match std::env::var(key) {
+        Ok(value) if valid(value.trim()) => value.trim().to_string(),
+        Ok(value) => {
+            tracing::warn!(key, value, fallback, "ignoring unusable setting");
+            fallback.to_string()
+        }
+        Err(_) => fallback.to_string(),
+    }
+}
+
+pub fn read_source(source: &str, encoding: &str) -> FunctionCall {
+    Func::cust("ST_Read")
+        .arg(source)
+        .arg(Expr::cust_with_exprs("open_options=list_value($1)", [Expr::val(format!("ENCODING={encoding}"))]))
+}
+
 pub fn run(
     source: &str,
+    encoding: &str,
     format: Format,
     sql_for: impl FnOnce(&str) -> String,
     on_ready: impl FnOnce(),
     sink: &mut dyn FnMut(String) -> bool,
 ) -> Result<()> {
     with_connection(|conn| {
-        let geometry = geometry_column(conn, source)?.unwrap_or_else(|| DEFAULT_GEOMETRY.to_string());
+        let geometry = geometry_column(conn, source, encoding)?.unwrap_or_else(|| DEFAULT_GEOMETRY.to_string());
         let sql = sql_for(&geometry);
 
         let mut stmt = conn.prepare(&sql).context("prepare query")?;
@@ -64,10 +98,10 @@ pub fn run(
     })
 }
 
-fn geometry_column(conn: &Connection, source: &str) -> Result<Option<String>> {
+fn geometry_column(conn: &Connection, source: &str, encoding: &str) -> Result<Option<String>> {
     let relation = Query::select()
         .expr(Expr::cust("*"))
-        .from_function(Func::cust("ST_Read").arg(source), "src")
+        .from_function(read_source(source, encoding), "src")
         .to_string(PostgresQueryBuilder);
     let sql = format!("SELECT column_name FROM (DESCRIBE {relation}) WHERE column_type LIKE 'GEOMETRY%' LIMIT 1");
     let mut stmt = conn.prepare(&sql).context("describe source")?;
@@ -109,6 +143,7 @@ mod tests {
         let mut out = String::from(f.header());
         run(
             source,
+            crate::url::DEFAULT_ENCODING,
             f,
             |g| crate::handler::build_sql(source, crate::url::DEFAULT_ENCODING, f, g),
             || {},
@@ -143,6 +178,7 @@ mod tests {
         let mut out = String::from(Format::GeoJson.header());
         run(
             &src,
+            crate::url::DEFAULT_ENCODING,
             Format::GeoJson,
             |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, Format::GeoJson, g),
             || {},
@@ -156,6 +192,30 @@ mod tests {
 
         assert!(out.contains(r#""coordinates":[1.0,2.0]"#), "{out}");
         assert!(!out.contains("SHAPE"), "the geometry column leaked into properties: {out}");
+    }
+
+    #[test]
+    fn the_encoding_reaches_sql_as_an_escaped_literal() {
+        let sql = Query::select()
+            .expr(Expr::cust("*"))
+            .from_function(read_source("/x.geojson", "UTF-8', bogus='1"), "src")
+            .to_string(PostgresQueryBuilder);
+        assert!(!sql.contains("bogus='1'"), "the encoding closed the literal: {sql}");
+        assert!(sql.contains("open_options=list_value("), "{sql}");
+    }
+
+    #[rstest::rstest]
+    #[case("1GB", true)]
+    #[case("512MB", true)]
+    #[case("1.5GB", true)]
+    #[case("80%", true)]
+    #[case("", false)]
+    #[case("   ", false)]
+    #[case("abc", false)]
+    #[case("%", false)]
+    #[case("-1GB", false)]
+    fn only_a_number_with_a_unit_is_a_usable_memory_limit(#[case] value: &str, #[case] usable: bool) {
+        assert_eq!(valid_memory_limit(value.trim()), usable);
     }
 
     #[test]
@@ -203,18 +263,32 @@ mod tests {
         let src = fixture("stop", &many_features(2000));
         let f = Format::GeoJson;
         let mut stopped_after = 0;
-        run(&src, f, |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g), || {}, &mut |_| {
-            stopped_after += 1;
-            false
-        })
+        run(
+            &src,
+            crate::url::DEFAULT_ENCODING,
+            f,
+            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g),
+            || {},
+            &mut |_| {
+                stopped_after += 1;
+                false
+            },
+        )
         .unwrap();
         assert_eq!(stopped_after, 1, "scan continued after the sink asked it to stop");
 
         let mut chunks = 0;
-        run(&src, f, |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g), || {}, &mut |_| {
-            chunks += 1;
-            true
-        })
+        run(
+            &src,
+            crate::url::DEFAULT_ENCODING,
+            f,
+            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g),
+            || {},
+            &mut |_| {
+                chunks += 1;
+                true
+            },
+        )
         .unwrap();
         assert!(chunks > 1, "fixture too small to exercise chunking: {chunks} chunk");
     }

@@ -23,7 +23,7 @@ pub enum ParseError {
     UnknownFormat(String),
     UnknownOption(String),
     UnknownSource(String),
-    UnsupportedEncoding(String),
+    MalformedEncoding(String),
 }
 
 impl fmt::Display for ParseError {
@@ -39,7 +39,7 @@ impl fmt::Display for ParseError {
             ParseError::UnknownFormat(s) => write!(f, "unknown format: {s}"),
             ParseError::UnknownOption(s) => write!(f, "unknown option: {s}"),
             ParseError::UnknownSource(s) => write!(f, "unknown source type: {s}"),
-            ParseError::UnsupportedEncoding(s) => write!(f, "invalid encoding: {s}"),
+            ParseError::MalformedEncoding(s) => write!(f, "encoding has characters that are not allowed: {s}"),
         }
     }
 }
@@ -66,7 +66,7 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
     }
     scan.expect(b':')?;
 
-    let name = scan.take_until(b":,");
+    let name = scan.take_until(b":,/");
     if name.is_empty() {
         return Err(ParseError::EmptySourceValue);
     }
@@ -80,16 +80,16 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
         if value.is_empty() {
             return Err(ParseError::EmptySourceValue);
         }
-        path = Some(value.to_string());
+        path = Some(trim_filename(value).to_string());
     }
 
     let mut encoding = None;
     while scan.eat(b',') {
-        let key = scan.take_until(b":,");
+        let key = scan.take_until(b":,/");
         if !scan.eat(b':') {
             return Err(ParseError::UnknownOption(key.to_string()));
         }
-        let value = scan.take_until(b",");
+        let value = scan.take_until(b",/");
         let slot = match key {
             "enc" | "encoding" => &mut encoding,
             _ => return Err(ParseError::UnknownOption(key.to_string())),
@@ -104,7 +104,7 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
     }
 
     let encoding = match encoding {
-        Some(label) => resolve_encoding(&label).ok_or(ParseError::UnsupportedEncoding(label))?,
+        Some(label) => resolve_encoding(&label).ok_or(ParseError::MalformedEncoding(label))?,
         None => DEFAULT_ENCODING.to_string(),
     };
 
@@ -151,6 +151,19 @@ impl<'a> Scan<'a> {
     }
 }
 
+fn trim_filename(path: &str) -> &str {
+    let mut at = 0;
+    let mut readable = None;
+    for part in path.split('/') {
+        let end = at + part.len();
+        if crate::dataset::looks_like_source(&path[at..end]) {
+            readable = Some(end);
+        }
+        at = end + 1;
+    }
+    readable.map_or(path, |end| &path[..end])
+}
+
 fn resolve_encoding(label: &str) -> Option<String> {
     if let Some((_, name)) = crate::encodings::ALIASES.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(label)) {
         return Some(name.to_string());
@@ -191,14 +204,39 @@ mod tests {
     }
 
     #[rstest]
+    #[case("/@dataset:plz-5stellig/output.geojson", "plz-5stellig", None, "UTF-8")]
+    #[case("/@dataset:plz-5stellig/map.geojson", "plz-5stellig", None, "UTF-8")]
+    #[case("/@dataset:plz-5stellig.geojson", "plz-5stellig", None, "UTF-8")]
+    #[case("/@dataset:a/b/c.json", "a", None, "UTF-8")]
+    #[case("/@dataset:a/b,enc:iso-8859-1.json", "a", None, "UTF-8")]
+    #[case("/@dataset:a/.json", "a", None, "UTF-8")]
+    #[case("/@dataset:x,enc:iso-8859-1/output.geojson", "x", None, "ISO-8859-1")]
+    #[case("/@dataset:x:a/b/c.shp,enc:iso-8859-1/output.geojson", "x", Some("a/b/c.shp"), "ISO-8859-1")]
+    #[case("/@dataset:uk:gb.geojson/download.geojson", "uk", Some("gb.geojson"), "UTF-8")]
+    #[case("/@dataset:uk:gb.geojson,enc:utf-8/download.geojson", "uk", Some("gb.geojson"), "UTF-8")]
+    #[case("/@dataset:uk:ds/ds.gdb/download.geojson", "uk", Some("ds/ds.gdb"), "UTF-8")]
+    #[case("/@dataset:uk:a/b.geojson/c.shp/name.geojson", "uk", Some("a/b.geojson/c.shp"), "UTF-8")]
+    #[case("/@dataset:uk:nothing/readable.geojson", "uk", Some("nothing/readable"), "UTF-8")]
+    fn the_filename_segment_is_discarded(
+        #[case] url: &str,
+        #[case] dataset: &str,
+        #[case] path: Option<&str>,
+        #[case] encoding: &str,
+    ) {
+        let p = parse(url).unwrap();
+        assert_eq!(p.dataset, dataset);
+        assert_eq!(p.path.as_deref(), path);
+        assert_eq!(p.encoding, encoding);
+    }
+
+    #[rstest]
     #[case("/", ParseError::Empty)]
     #[case("/@dataset:cities", ParseError::MissingOutputSegment)]
     #[case("/@dataset:cities.xml", ParseError::UnknownFormat("xml".to_string()))]
     #[case("/@elsewhere:thing.json", ParseError::UnknownSource("elsewhere".to_string()))]
     #[case("/dataset:cities.json", ParseError::MissingSourcePrefix)]
     #[case("/@dataset:.json", ParseError::EmptySourceValue)]
-    #[case("/@dataset:a/b.json", ParseError::InvalidName("a/b".to_string()))]
-    #[case("/@dataset:x,enc:KOI8/8.geojson", ParseError::UnsupportedEncoding("KOI8/8".to_string()))]
+    #[case("/@dataset:x,enc:KOI8@8.geojson", ParseError::MalformedEncoding("KOI8@8".to_string()))]
     #[case("/@dataset:x,enc:.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
     #[case("/@dataset:x,enc:utf-8,encoding:latin1.geojson", ParseError::RepeatedOption("encoding".to_string()))]
     #[case("/@dataset:x,zzz:1.geojson", ParseError::UnknownOption("zzz".to_string()))]

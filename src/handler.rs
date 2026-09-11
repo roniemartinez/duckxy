@@ -18,16 +18,23 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
     };
 
     let format = parsed.format;
-    let source = match root.resolve(&parsed.dataset, parsed.path.as_deref()) {
-        Ok(s) => s,
-        Err(e) => return resolve_error(e),
+    let download = format!("{}.{}", parsed.dataset, parsed.extension);
+    let dataset = parsed.dataset;
+    let encoding = parsed.encoding;
+
+    let name = dataset.clone();
+    let selected = parsed.path;
+    let source = match tokio::task::spawn_blocking(move || root.resolve(&name, selected.as_deref())).await {
+        Ok(Ok(source)) => source,
+        Ok(Err(e)) => return resolve_error(e),
+        Err(e) => {
+            tracing::error!(dataset, error = ?e, "resolve failed");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "dataset lookup failed");
+        }
     };
 
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(CHANNEL_DEPTH);
-    let download = format!("{}.{}", parsed.dataset, parsed.extension);
-    let dataset = parsed.dataset;
-    let encoding = parsed.encoding;
 
     tokio::task::spawn_blocking(move || {
         if tx.blocking_send(Ok(Bytes::from_static(format.header().as_bytes()))).is_err() {
@@ -35,6 +42,7 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
         }
         let sent = query::run(
             &source,
+            &encoding,
             format,
             |geometry| build_sql(&source, &encoding, format, geometry),
             || {
@@ -74,15 +82,7 @@ pub fn build_sql(source: &str, encoding: &str, format: Format, geometry: &str) -
     ctes.cte(
         CommonTableExpression::new()
             .query(
-                Query::select()
-                    .expr(Expr::cust("*"))
-                    .from_function(
-                        Func::cust("ST_Read")
-                            .arg(source)
-                            .arg(Expr::cust(format!("open_options=['ENCODING={encoding}']"))),
-                        "src",
-                    )
-                    .take(),
+                Query::select().expr(Expr::cust("*")).from_function(query::read_source(source, encoding), "src").take(),
             )
             .table_name(input.clone())
             .to_owned(),

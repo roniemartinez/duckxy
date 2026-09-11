@@ -126,6 +126,20 @@ mod tests {
         assert_eq!(status, expected);
     }
 
+    #[rstest]
+    #[case("/@dataset:pts.geojson", "pts.geojson")]
+    #[case("/@dataset:pts/output.geojson", "pts.geojson")]
+    #[case("/@dataset:pts/my.export.json", "pts.json")]
+    #[tokio::test]
+    async fn the_download_filename_comes_from_the_dataset(#[case] path: &str, #[case] expected: &str) {
+        let s = state("download", false);
+        let uri = signed(&s, path);
+        let response = router(s).oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposition = response.headers().get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
+        assert_eq!(disposition, format!("inline; filename=\"{expected}\""));
+    }
+
     #[tokio::test]
     async fn health_needs_no_signature() {
         let (status, body) = get(state("health", false), "/health").await;
