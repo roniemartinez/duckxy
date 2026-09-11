@@ -3,13 +3,21 @@ pub enum Format {
     GeoJson,
 }
 
+const EXTENSIONS: &[(&str, Format)] = &[("geojson", Format::GeoJson), ("json", Format::GeoJson)];
+
 impl Format {
     pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext {
-            // only @info makes .json differ from .geojson
-            "json" | "geojson" => Some(Self::GeoJson),
-            _ => None,
-        }
+        let ext = ext.to_ascii_lowercase();
+        EXTENSIONS.iter().find(|(known, _)| *known == ext).map(|(_, format)| *format)
+    }
+
+    pub fn split(segment: &str) -> Option<(&str, &'static str, Format)> {
+        let lower = segment.to_ascii_lowercase();
+        EXTENSIONS
+            .iter()
+            .filter(|(ext, _)| lower.strip_suffix(ext).is_some_and(|stem| stem.ends_with('.')))
+            .max_by_key(|(ext, _)| ext.len())
+            .map(|(ext, format)| (&segment[..segment.len() - ext.len() - 1], *ext, *format))
     }
 
     pub fn content_type(self) -> &'static str {

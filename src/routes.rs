@@ -79,9 +79,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case("/@dataset:pts/output.geojson")]
-    #[case("/@dataset:pts/output.json")]
-    #[case("/@dataset:pts/anything.geojson")]
+    #[case("/@dataset:pts.geojson")]
+    #[case("/@dataset:pts.json")]
+    #[case("/@dataset:pts,enc:utf-8.geojson")]
+    #[case("/@ds:pts.geojson")]
+    #[case("/@ds:pts/output.geojson")]
     #[tokio::test]
     async fn a_signed_request_is_served(#[case] path: &str) {
         let s = state("ok", false);
@@ -107,7 +109,7 @@ mod tests {
 
     #[tokio::test]
     async fn insecure_works_only_when_enabled() {
-        let path = "/@dataset:pts/output.geojson";
+        let path = "/@dataset:pts.geojson";
         let (status, _) = get(state("ins-off", false), &format!("/insecure{path}")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
 
@@ -117,13 +119,27 @@ mod tests {
     }
 
     #[rstest]
-    #[case("/@dataset:pts/output.xml", StatusCode::BAD_REQUEST)]
-    #[case("/@dataset:nope/output.geojson", StatusCode::NOT_FOUND)]
+    #[case("/@dataset:pts.xml", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:nope.geojson", StatusCode::NOT_FOUND)]
     #[tokio::test]
     async fn errors_keep_their_status_behind_a_valid_signature(#[case] path: &str, #[case] expected: StatusCode) {
         let s = state("err", false);
         let (status, _) = get(s.clone(), &signed(&s, path)).await;
         assert_eq!(status, expected);
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts.geojson", "pts.geojson")]
+    #[case("/@dataset:pts/output.geojson", "pts.geojson")]
+    #[case("/@dataset:pts/my.export.json", "pts.json")]
+    #[tokio::test]
+    async fn the_download_filename_comes_from_the_dataset(#[case] path: &str, #[case] expected: &str) {
+        let s = state("download", false);
+        let uri = signed(&s, path);
+        let response = router(s).oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposition = response.headers().get(header::CONTENT_DISPOSITION).unwrap().to_str().unwrap();
+        assert_eq!(disposition, format!("inline; filename=\"{expected}\""));
     }
 
     #[tokio::test]

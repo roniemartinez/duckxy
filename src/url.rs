@@ -1,84 +1,182 @@
 use std::fmt;
 
+pub const DEFAULT_ENCODING: &str = crate::encodings::UTF8;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedUrl {
     pub dataset: String,
-    pub format: String,
+    pub path: Option<String>,
+    pub encoding: String,
+    pub format: crate::formats::Format,
+    pub extension: &'static str,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum ParseError {
     Empty,
-    MissingSourcePrefix,
-    UnknownSource(String),
+    EmptyOptionValue(String),
     EmptySourceValue,
     InvalidName(String),
+    MisplacedOption(String),
     MissingOutputSegment,
-    InvalidOutputSegment(String),
+    MissingSourcePrefix,
+    RepeatedOption(String),
     UnknownFormat(String),
+    UnknownOption(String),
+    UnknownSource(String),
+    MalformedEncoding(String),
 }
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseError::Empty => write!(f, "empty path"),
-            ParseError::MissingSourcePrefix => write!(f, "path must start with @"),
-            ParseError::UnknownSource(s) => write!(f, "unknown source type: {s}"),
+            ParseError::EmptyOptionValue(s) => write!(f, "option has no value: {s}"),
             ParseError::EmptySourceValue => write!(f, "source value is empty"),
             ParseError::InvalidName(n) => write!(f, "invalid name: {n}"),
-            ParseError::MissingOutputSegment => write!(f, "missing /<name>.<format> segment"),
-            ParseError::InvalidOutputSegment(s) => write!(f, "invalid output segment: {s}"),
+            ParseError::MisplacedOption(s) => write!(f, "options must come before the output name: {s}"),
+            ParseError::MissingOutputSegment => write!(f, "missing .<format> suffix"),
+            ParseError::MissingSourcePrefix => write!(f, "path must start with @"),
+            ParseError::RepeatedOption(s) => write!(f, "option given more than once: {s}"),
             ParseError::UnknownFormat(s) => write!(f, "unknown format: {s}"),
+            ParseError::UnknownOption(s) => write!(f, "unknown option: {s}"),
+            ParseError::UnknownSource(s) => write!(f, "unknown source type: {s}"),
+            ParseError::MalformedEncoding(s) => write!(f, "encoding has characters that are not allowed: {s}"),
         }
     }
 }
 
 impl std::error::Error for ParseError {}
 
-pub fn parse(path: &str) -> Result<ParsedUrl, ParseError> {
-    let path = path.trim_start_matches('/');
-    if path.is_empty() {
+pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
+    let url = url.trim_start_matches('/');
+    if url.is_empty() {
         return Err(ParseError::Empty);
     }
-
-    let (source_part, output_part) = match path.rsplit_once('/') {
-        Some((s, o)) => (s, o),
-        None => return Err(ParseError::MissingOutputSegment),
+    let Some((source, extension, format)) = crate::formats::Format::split(url) else {
+        return Err(match url.rsplit_once('.') {
+            Some((_, ext)) => ParseError::UnknownFormat(ext.to_ascii_lowercase()),
+            None => ParseError::MissingOutputSegment,
+        });
     };
 
-    let format = parse_output(output_part)?;
-    let dataset = parse_source(source_part)?;
-    Ok(ParsedUrl { dataset, format })
-}
-
-fn parse_output(seg: &str) -> Result<String, ParseError> {
-    let (_filename, ext) = seg.rsplit_once('.').ok_or_else(|| ParseError::InvalidOutputSegment(seg.to_string()))?;
-    let ext = ext.to_ascii_lowercase();
-    if crate::formats::Format::from_extension(&ext).is_none() {
-        return Err(ParseError::UnknownFormat(ext));
-    }
-    Ok(ext)
-}
-
-fn parse_source(seg: &str) -> Result<String, ParseError> {
-    if !seg.starts_with('@') {
+    let mut scan = Scan { text: source, at: 0 };
+    if !scan.eat(b'@') {
         return Err(ParseError::MissingSourcePrefix);
     }
-    let (kind, value) = seg[1..].split_once(':').ok_or_else(|| ParseError::UnknownSource(seg.to_string()))?;
-    if kind != "dataset" {
+    let kind = scan.take_until(b":");
+    if !matches!(kind, "dataset" | "ds") {
         return Err(ParseError::UnknownSource(kind.to_string()));
     }
-    if value.is_empty() {
+    if !scan.eat(b':') {
         return Err(ParseError::EmptySourceValue);
     }
-    if !is_valid_name(value) {
-        return Err(ParseError::InvalidName(value.to_string()));
+
+    let name = scan.take_until(b":,/");
+    if name.is_empty() {
+        return Err(ParseError::EmptySourceValue);
     }
-    Ok(value.to_string())
+    if !is_valid_name(name) {
+        return Err(ParseError::InvalidName(name.to_string()));
+    }
+
+    let mut path = None;
+    if scan.eat(b':') {
+        let value = scan.take_until(b",");
+        if value.is_empty() {
+            return Err(ParseError::EmptySourceValue);
+        }
+        path = Some(trim_filename(value).to_string());
+    }
+
+    let mut encoding = None;
+    while scan.eat(b',') {
+        let key = scan.take_until(b":,/");
+        let slot = match key {
+            "enc" | "encoding" => &mut encoding,
+            _ => return Err(ParseError::UnknownOption(key.to_string())),
+        };
+        if !scan.eat(b':') {
+            return Err(ParseError::EmptyOptionValue(key.to_string()));
+        }
+        let value = scan.take_until(b",/");
+        if value.is_empty() {
+            return Err(ParseError::EmptyOptionValue(key.to_string()));
+        }
+        if slot.is_some() {
+            return Err(ParseError::RepeatedOption(key.to_string()));
+        }
+        *slot = Some(value.to_string());
+    }
+
+    if scan.eat(b'/') {
+        let name = scan.take_until(b"");
+        if name.contains(',') || name.contains(':') {
+            return Err(ParseError::MisplacedOption(name.to_string()));
+        }
+    }
+
+    let encoding = match encoding {
+        Some(label) => resolve_encoding(&label).ok_or(ParseError::MalformedEncoding(label))?,
+        None => DEFAULT_ENCODING.to_string(),
+    };
+
+    Ok(ParsedUrl { dataset: name.to_string(), path, encoding, format, extension })
+}
+
+struct Scan<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl<'a> Scan<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.text.as_bytes().get(self.at).copied()
+    }
+
+    fn eat(&mut self, byte: u8) -> bool {
+        if self.peek() == Some(byte) {
+            self.at += 1;
+            return true;
+        }
+        false
+    }
+
+    fn take_until(&mut self, stops: &[u8]) -> &'a str {
+        let from = self.at;
+        while let Some(byte) = self.peek() {
+            if stops.contains(&byte) {
+                break;
+            }
+            self.at += 1;
+        }
+        &self.text[from..self.at]
+    }
+}
+
+fn trim_filename(path: &str) -> &str {
+    let mut at = 0;
+    let mut readable = None;
+    for part in path.split('/') {
+        let end = at + part.len();
+        if crate::dataset::looks_like_source(&path[at..end]) {
+            readable = Some(end);
+        }
+        at = end + 1;
+    }
+    readable.map_or(path, |end| &path[..end])
+}
+
+fn resolve_encoding(label: &str) -> Option<String> {
+    if let Some((_, name)) = crate::encodings::ALIASES.iter().find(|(alias, _)| alias.eq_ignore_ascii_case(label)) {
+        return Some(name.to_string());
+    }
+    let safe = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':');
+    (!label.is_empty() && label.chars().all(safe)).then(|| label.to_string())
 }
 
 pub fn is_valid_name(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 #[cfg(test)]
@@ -87,33 +185,83 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case("/@dataset:plz-5stellig/output.json", "plz-5stellig", "json")]
-    #[case("/@dataset:cities/output.geojson", "cities", "geojson")]
-    #[case("/@dataset:cities/anything.geojson", "cities", "geojson")]
-    #[case("/@dataset:cities/.geojson", "cities", "geojson")]
-    #[case("/@dataset:cities/output.GeoJSON", "cities", "geojson")]
-    fn parses_dataset_and_format(#[case] path: &str, #[case] dataset: &str, #[case] format: &str) {
-        let p = parse(path).unwrap();
+    #[case("/@dataset:plz-5stellig.json", "plz-5stellig", "json")]
+    #[case("/@dataset:cities.GeoJSON", "cities", "geojson")]
+    #[case("/@dataset:my.data.geojson", "my.data", "geojson")]
+    fn parses_dataset_and_format(#[case] url: &str, #[case] dataset: &str, #[case] format: &str) {
+        let p = parse(url).unwrap();
         assert_eq!(p.dataset, dataset);
-        assert_eq!(p.format, format);
+        assert_eq!(p.extension, format);
+    }
+
+    #[rstest]
+    #[case("/@dataset:x.geojson", "UTF-8", None)]
+    #[case("/@dataset:x,enc:csISOLatin1.geojson", "ISO-8859-1", None)]
+    #[case("/@dataset:x,enc:KOI8-R.geojson", "KOI8-R", None)]
+    #[case("/@dataset:x:a/b/c.shp,encoding:utf-8.geojson", "UTF-8", Some("a/b/c.shp"))]
+    #[case("/@dataset:uk:gb.geojson.geojson", "UTF-8", Some("gb.geojson"))]
+    fn parses_path_and_options(#[case] url: &str, #[case] encoding: &str, #[case] path: Option<&str>) {
+        let p = parse(url).unwrap();
+        assert_eq!(p.encoding, encoding);
+        assert_eq!(p.path.as_deref(), path);
+    }
+
+    #[rstest]
+    #[case("/@dataset:plz-5stellig/output.geojson", "plz-5stellig", None, "UTF-8")]
+    #[case("/@dataset:plz-5stellig/map.geojson", "plz-5stellig", None, "UTF-8")]
+    #[case("/@dataset:plz-5stellig.geojson", "plz-5stellig", None, "UTF-8")]
+    #[case("/@dataset:a/b/c.json", "a", None, "UTF-8")]
+    #[case("/@dataset:a/.json", "a", None, "UTF-8")]
+    #[case("/@dataset:a/b.c.d.json", "a", None, "UTF-8")]
+    #[case("/@dataset:x,enc:iso-8859-1/output.geojson", "x", None, "ISO-8859-1")]
+    #[case("/@dataset:x:a/b/c.shp,enc:iso-8859-1/output.geojson", "x", Some("a/b/c.shp"), "ISO-8859-1")]
+    #[case("/@dataset:uk:gb.geojson/download.geojson", "uk", Some("gb.geojson"), "UTF-8")]
+    #[case("/@dataset:uk:gb.geojson,enc:utf-8/download.geojson", "uk", Some("gb.geojson"), "UTF-8")]
+    #[case("/@dataset:uk:ds/ds.gdb/download.geojson", "uk", Some("ds/ds.gdb"), "UTF-8")]
+    #[case("/@dataset:uk:a/b.geojson/c.shp/name.geojson", "uk", Some("a/b.geojson/c.shp"), "UTF-8")]
+    #[case("/@dataset:uk:layer.shp/report.geojson", "uk", Some("layer.shp"), "UTF-8")]
+    #[case("/@dataset:uk:layer.shp/report.json.geojson", "uk", Some("layer.shp/report.json"), "UTF-8")]
+    #[case("/@dataset:uk:nothing/readable.geojson", "uk", Some("nothing/readable"), "UTF-8")]
+    fn the_filename_segment_is_discarded(
+        #[case] url: &str,
+        #[case] dataset: &str,
+        #[case] path: Option<&str>,
+        #[case] encoding: &str,
+    ) {
+        let p = parse(url).unwrap();
+        assert_eq!(p.dataset, dataset);
+        assert_eq!(p.path.as_deref(), path);
+        assert_eq!(p.encoding, encoding);
+    }
+
+    #[rstest]
+    #[case("/@ds:cities.geojson", "/@dataset:cities.geojson")]
+    #[case("/@ds:plz-5stellig/output.json", "/@dataset:plz-5stellig/output.json")]
+    #[case("/@ds:x,enc:iso-8859-1/out.geojson", "/@dataset:x,enc:iso-8859-1/out.geojson")]
+    #[case("/@ds:uk:gb.geojson/download.geojson", "/@dataset:uk:gb.geojson/download.geojson")]
+    fn the_short_source_prefix_parses_the_same(#[case] short: &str, #[case] long: &str) {
+        assert_eq!(parse(short).unwrap(), parse(long).unwrap());
     }
 
     #[rstest]
     #[case("/", ParseError::Empty)]
     #[case("/@dataset:cities", ParseError::MissingOutputSegment)]
-    #[case("/@dataset:cities/output.xml", ParseError::UnknownFormat("xml".to_string()))]
-    fn rejects(#[case] path: &str, #[case] expected: ParseError) {
-        assert_eq!(parse(path), Err(expected));
-    }
-
-    #[rstest]
-    #[case("/@dataset:cities/noextension")]
-    #[case("/@elsewhere:thing/output.json")]
-    #[case("/@dataset:../etc/output.json")]
-    #[case("/@dataset:/output.json")]
-    #[case("/dataset:cities/output.json")]
-    #[case("/@dataset:cities,id:UK/output.json")]
-    fn rejects_malformed_paths(#[case] path: &str) {
-        assert!(parse(path).is_err(), "expected {path} to be rejected");
+    #[case("/@dataset:cities.xml", ParseError::UnknownFormat("xml".to_string()))]
+    #[case("/@elsewhere:thing.json", ParseError::UnknownSource("elsewhere".to_string()))]
+    #[case("/@d:thing.json", ParseError::UnknownSource("d".to_string()))]
+    #[case("/@datasets:thing.json", ParseError::UnknownSource("datasets".to_string()))]
+    #[case("/dataset:cities.json", ParseError::MissingSourcePrefix)]
+    #[case("/@dataset:.json", ParseError::EmptySourceValue)]
+    #[case("/@dataset.geojson", ParseError::EmptySourceValue)]
+    #[case("/@dataset:x,enc:KOI8@8.geojson", ParseError::MalformedEncoding("KOI8@8".to_string()))]
+    #[case("/@dataset:pts/export,enc:iso-8859-1.geojson", ParseError::MisplacedOption("export,enc:iso-8859-1".to_string()))]
+    #[case("/@dataset:x,enc:.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
+    #[case("/@dataset:x,enc.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
+    #[case("/@dataset:x,encoding/out.geojson", ParseError::EmptyOptionValue("encoding".to_string()))]
+    #[case("/@dataset:x,enc:utf-8,encoding:latin1.geojson", ParseError::RepeatedOption("encoding".to_string()))]
+    #[case("/@dataset:x,zzz:1.geojson", ParseError::UnknownOption("zzz".to_string()))]
+    #[case("/@dataset:x,prop:state:CA.geojson", ParseError::UnknownOption("prop".to_string()))]
+    fn rejects(#[case] url: &str, #[case] expected: ParseError) {
+        assert_eq!(parse(url), Err(expected));
     }
 }
