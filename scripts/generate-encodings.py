@@ -63,8 +63,9 @@ def main():
             lines.append(f'    ("{spelling}", {konst}),')
     lines += ["];", ""]
 
-    Path("src/encodings.rs").write_text("\n".join(lines))
-    print(f"wrote src/encodings.rs: {len(seen)} spellings from {len(by_name)} registry records")
+    out_path = Path(__file__).resolve().parent.parent / "src" / "encodings.rs"
+    out_path.write_text("\n".join(lines))
+    print(f"wrote {out_path}: {len(seen)} spellings from {len(by_name)} registry records")
 
 
 if __name__ == "__main__":

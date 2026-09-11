@@ -82,6 +82,8 @@ mod tests {
     #[case("/@dataset:pts.geojson")]
     #[case("/@dataset:pts.json")]
     #[case("/@dataset:pts,enc:utf-8.geojson")]
+    #[case("/@ds:pts.geojson")]
+    #[case("/@ds:pts/output.geojson")]
     #[tokio::test]
     async fn a_signed_request_is_served(#[case] path: &str) {
         let s = state("ok", false);

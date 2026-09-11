@@ -33,20 +33,23 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
         }
     };
 
-    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), (StatusCode, String)>>();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(CHANNEL_DEPTH);
 
     tokio::task::spawn_blocking(move || {
         if tx.blocking_send(Ok(Bytes::from_static(format.header().as_bytes()))).is_err() {
             return;
         }
+        let mut ready = Some(ready_tx);
         let sent = query::run(
             &source,
             &encoding,
             format,
             |geometry| build_sql(&source, &encoding, format, geometry),
             || {
-                let _ = ready_tx.send(());
+                if let Some(ready_tx) = ready.take() {
+                    let _ = ready_tx.send(Ok(()));
+                }
             },
             &mut |chunk| tx.blocking_send(Ok(Bytes::from(chunk))).is_ok(),
         );
@@ -56,14 +59,23 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
             }
             Err(e) => {
                 tracing::error!(dataset, error = ?e, "query failed");
-                let _ = tx.blocking_send(Err(std::io::Error::other(format!("{e:#}"))));
+                match ready.take() {
+                    Some(ready_tx) => {
+                        let _ = ready_tx.send(Err(error_status(&e, &encoding)));
+                    }
+                    None => {
+                        let _ = tx.blocking_send(Err(std::io::Error::other(format!("{e:#}"))));
+                    }
+                }
             }
         }
     });
 
     // status is committed before the first byte, so wait for a successful prepare
-    if ready_rx.await.is_err() {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "query failed");
+    match ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err((status, message))) => return error(status, message),
+        Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "query failed"),
     }
 
     (
@@ -74,6 +86,22 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
         Body::from_stream(ReceiverStream::new(rx)),
     )
         .into_response()
+}
+
+const GEOMETRY_FAILURES: [&str; 3] = ["TopologyException", "IllegalArgumentException", "AssertionFailedException"];
+
+fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
+    if let Some(no_geometry) = e.downcast_ref::<query::NoGeometry>() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, no_geometry.to_string());
+    }
+    let reported = e.chain().map(|cause| cause.to_string()).collect::<Vec<_>>().join("; ");
+    if GEOMETRY_FAILURES.iter().any(|marker| reported.contains(marker)) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "source geometry could not be processed".to_string());
+    }
+    if reported.contains("Invalid Input Error") {
+        return (StatusCode::UNPROCESSABLE_ENTITY, format!("source could not be read with encoding {encoding}"));
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, "query failed".to_string())
 }
 
 pub fn build_sql(source: &str, encoding: &str, format: Format, geometry: &str) -> String {
@@ -118,5 +146,44 @@ pub fn build_sql(source: &str, encoding: &str, format: Format, geometry: &str) -
             .to_owned()
             .with(ctes)
             .to_string(PostgresQueryBuilder),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_geometry_column_is_a_client_error() {
+        let (status, message) = error_status(&anyhow::Error::new(query::NoGeometry), "UTF-8");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "source has no geometry column");
+    }
+
+    #[test]
+    fn an_unreadable_source_names_the_encoding_and_leaks_no_path() {
+        let raw = anyhow::anyhow!(
+            "Invalid Input Error: Malformed JSON at byte 0 of input. Input: /vsizip//srv/data/secret.zip/x.shp"
+        );
+        let (status, message) = error_status(&raw, "ISO-8859-1");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "source could not be read with encoding ISO-8859-1");
+        assert!(!message.contains("/srv/data"), "the data root leaked: {message}");
+    }
+
+    #[test]
+    fn a_geometry_failure_is_not_blamed_on_the_encoding() {
+        let raw = anyhow::anyhow!("Invalid Input Error: TopologyException: side location conflict at 0.5 0.5");
+        let (status, message) = error_status(&raw, "ISO-8859-1");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "source geometry could not be processed");
+        assert!(!message.contains("encoding"), "a geometry failure blamed the encoding: {message}");
+    }
+
+    #[test]
+    fn any_other_query_failure_stays_a_server_error() {
+        let (status, message) = error_status(&anyhow::anyhow!("disk on fire"), "UTF-8");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "query failed");
     }
 }

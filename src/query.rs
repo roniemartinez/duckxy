@@ -2,56 +2,93 @@ use crate::formats::Format;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use sea_query::{Expr, Func, FunctionCall, PostgresQueryBuilder, Query};
-use std::cell::OnceCell;
+use std::cell::RefCell;
 
 const CHUNK_BYTES: usize = 64 * 1024;
-const DEFAULT_GEOMETRY: &str = "geom";
-const DEFAULT_MEMORY_LIMIT: &str = "1GB";
-const DEFAULT_THREADS: &str = "2";
 
 thread_local! {
-    static CONNECTION: OnceCell<Connection> = const { OnceCell::new() };
+    static CONNECTION: RefCell<Option<Connection>> = const { RefCell::new(None) };
 }
+
+#[derive(Debug)]
+pub struct NoGeometry;
+
+impl std::fmt::Display for NoGeometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "source has no geometry column")
+    }
+}
+
+impl std::error::Error for NoGeometry {}
 
 pub fn install_extensions() -> Result<()> {
     let conn = Connection::open_in_memory().context("open duckdb")?;
-    conn.execute_batch("INSTALL spatial; LOAD spatial;").context("install the spatial extension")
+    conn.execute_batch("INSTALL spatial; LOAD spatial;").context("install the spatial extension")?;
+    match tuning() {
+        "" => Ok(()),
+        limits => conn.execute_batch(limits).context("apply the duckdb limits"),
+    }
 }
 
 fn with_connection<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     CONNECTION.with(|cell| {
-        if cell.get().is_none() {
+        if cell.borrow().is_none() {
             let conn = Connection::open_in_memory().context("open duckdb")?;
             conn.execute_batch(&format!("LOAD spatial; {}", tuning())).context("load the spatial extension")?;
-            let _ = cell.set(conn);
+            *cell.borrow_mut() = Some(conn);
         }
-        f(cell.get().expect("just initialised"))
+        let outcome = {
+            let held = cell.borrow();
+            f(held.as_ref().expect("just opened"))
+        };
+        if outcome.as_ref().is_err_and(database_is_invalidated) {
+            tracing::warn!("discarding a duckdb connection whose database was invalidated");
+            *cell.borrow_mut() = None;
+        }
+        outcome
+    })
+}
+
+fn database_is_invalidated(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("database has been invalidated")
+            || text.contains("FATAL Error")
+            || text.contains("INTERNAL Error")
     })
 }
 
 fn tuning() -> &'static str {
     static TUNING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TUNING.get_or_init(|| {
-        let memory = setting("DUCKXY_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT, valid_memory_limit);
-        let threads = setting("DUCKXY_THREADS", DEFAULT_THREADS, |v| v.parse::<u16>().is_ok_and(|n| n > 0));
-        format!("SET memory_limit = '{memory}'; SET threads = {threads};")
+        let mut sql = String::new();
+        if let Some(memory) = setting("DUCKXY_MEMORY_LIMIT", valid_memory_limit) {
+            sql.push_str(&format!("SET memory_limit = '{memory}';"));
+        }
+        if let Some(threads) = setting("DUCKXY_THREADS", |v| v.parse::<u16>().is_ok_and(|n| n > 0)) {
+            sql.push_str(&format!("SET threads = {threads};"));
+        }
+        sql
     })
 }
 
-fn valid_memory_limit(value: &str) -> bool {
-    value.starts_with(|c: char| c.is_ascii_digit())
-        && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '%'))
+fn setting(key: &str, valid: impl Fn(&str) -> bool) -> Option<String> {
+    let value = std::env::var(key).ok()?;
+    let value = value.trim();
+    if valid(value) {
+        return Some(value.to_string());
+    }
+    tracing::warn!(key, value, "ignoring unusable setting, keeping the duckdb default");
+    None
 }
 
-fn setting(key: &str, fallback: &str, valid: impl Fn(&str) -> bool) -> String {
-    match std::env::var(key) {
-        Ok(value) if valid(value.trim()) => value.trim().to_string(),
-        Ok(value) => {
-            tracing::warn!(key, value, fallback, "ignoring unusable setting");
-            fallback.to_string()
-        }
-        Err(_) => fallback.to_string(),
-    }
+fn valid_memory_limit(value: &str) -> bool {
+    let size = value.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '%');
+    let unit = value[size.len()..].to_ascii_uppercase();
+    !size.is_empty()
+        && size.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && size.parse::<f64>().is_ok()
+        && matches!(unit.as_str(), "" | "%" | "KB" | "MB" | "GB" | "TB" | "KIB" | "MIB" | "GIB" | "TIB")
 }
 
 pub fn read_source(source: &str, encoding: &str) -> FunctionCall {
@@ -69,7 +106,7 @@ pub fn run(
     sink: &mut dyn FnMut(String) -> bool,
 ) -> Result<()> {
     with_connection(|conn| {
-        let geometry = geometry_column(conn, source, encoding)?.unwrap_or_else(|| DEFAULT_GEOMETRY.to_string());
+        let geometry = geometry_column(conn, source, encoding)?.ok_or(NoGeometry)?;
         let sql = sql_for(&geometry);
 
         let mut stmt = conn.prepare(&sql).context("prepare query")?;
@@ -208,6 +245,13 @@ mod tests {
     #[case("1GB", true)]
     #[case("512MB", true)]
     #[case("1.5GB", true)]
+    #[case("512MiB", true)]
+    #[case("1073741824", true)]
+    #[case("9ZZ", false)]
+    #[case("1.5.5GB", false)]
+    #[case("1..GB", false)]
+    #[case("1GBB", false)]
+    #[case("GB", false)]
     #[case("80%", true)]
     #[case("", false)]
     #[case("   ", false)]
@@ -216,6 +260,82 @@ mod tests {
     #[case("-1GB", false)]
     fn only_a_number_with_a_unit_is_a_usable_memory_limit(#[case] value: &str, #[case] usable: bool) {
         assert_eq!(valid_memory_limit(value.trim()), usable);
+    }
+
+    #[test]
+    fn a_source_without_a_geometry_column_is_reported_as_such() {
+        crate::ensure_spatial();
+        let dir = std::env::temp_dir().join(format!("duckxy-nogeom-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("attrs.csv");
+        fs::write(&path, "id,name\n1,alpha\n2,beta\n").unwrap();
+        let src = path.to_str().unwrap().to_string();
+
+        let err = run(
+            &src,
+            crate::url::DEFAULT_ENCODING,
+            Format::GeoJson,
+            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, Format::GeoJson, g),
+            || panic!("a source with no geometry must not reach the ready signal"),
+            &mut |_| true,
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<NoGeometry>().is_some(), "{err:#}");
+    }
+
+    fn marker_exists(conn: &Connection) -> bool {
+        conn.prepare("SELECT 1 FROM duckdb_tables() WHERE table_name = 'marker'")
+            .and_then(|mut s| s.query([]).and_then(|mut r| r.next().map(|row| row.is_some())))
+            .unwrap_or(false)
+    }
+
+    #[rstest::rstest]
+    #[case("FATAL Error: Failed: database has been invalidated because of a previous fatal error.", true)]
+    #[case("FATAL Error: Failed to create checkpoint because of error: Checkpoint aborted before truncate", true)]
+    #[case("INTERNAL Error: Attempted to dereference unique_ptr that is NULL", true)]
+    #[case("Invalid Input Error: TopologyException: side location conflict at 0.5 0.5", false)]
+    #[case("Invalid Input Error: AssertionFailedException: Should never reach here", false)]
+    #[case("Out of Memory Error: failed to allocate data of size 128.0 MiB", false)]
+    #[case("Conversion Error: Could not convert string to double", false)]
+    fn only_an_invalidated_database_is_detected(#[case] message: &str, #[case] expected: bool) {
+        assert_eq!(database_is_invalidated(&anyhow::anyhow!(message.to_string())), expected);
+    }
+
+    #[test]
+    fn an_invalidated_database_is_replaced_on_the_next_query() {
+        crate::ensure_spatial();
+        with_connection(|c| c.execute_batch("CREATE TABLE marker (x INTEGER)").context("marker")).unwrap();
+        assert!(
+            with_connection(|c| Ok(marker_exists(c))).unwrap(),
+            "marker should be visible on the cached connection"
+        );
+
+        let err = with_connection(|_| -> Result<()> {
+            Err(anyhow::anyhow!(
+                "FATAL Error: Failed: database has been invalidated because of a previous fatal error."
+            ))
+        })
+        .unwrap_err();
+        assert!(database_is_invalidated(&err));
+
+        assert!(!with_connection(|c| Ok(marker_exists(c))).unwrap(), "the invalidated database was reused");
+    }
+
+    #[test]
+    fn an_ordinary_error_keeps_the_connection() {
+        crate::ensure_spatial();
+        with_connection(|c| c.execute_batch("CREATE TABLE keeper (x INTEGER)").context("keeper")).unwrap();
+        let err = with_connection(|_| -> Result<()> { Err(anyhow::anyhow!("Invalid Input Error: TopologyException")) })
+            .unwrap_err();
+        assert!(!database_is_invalidated(&err));
+        let kept = with_connection(|c| {
+            Ok(c.prepare("SELECT 1 FROM duckdb_tables() WHERE table_name = 'keeper'")
+                .and_then(|mut s| s.query([]).and_then(|mut r| r.next().map(|row| row.is_some())))
+                .unwrap_or(false))
+        })
+        .unwrap();
+        assert!(kept, "an ordinary error must not discard the connection");
     }
 
     #[test]

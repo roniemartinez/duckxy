@@ -17,6 +17,7 @@ pub enum ParseError {
     EmptyOptionValue(String),
     EmptySourceValue,
     InvalidName(String),
+    MisplacedOption(String),
     MissingOutputSegment,
     MissingSourcePrefix,
     RepeatedOption(String),
@@ -33,6 +34,7 @@ impl fmt::Display for ParseError {
             ParseError::EmptyOptionValue(s) => write!(f, "option has no value: {s}"),
             ParseError::EmptySourceValue => write!(f, "source value is empty"),
             ParseError::InvalidName(n) => write!(f, "invalid name: {n}"),
+            ParseError::MisplacedOption(s) => write!(f, "options must come before the output name: {s}"),
             ParseError::MissingOutputSegment => write!(f, "missing .<format> suffix"),
             ParseError::MissingSourcePrefix => write!(f, "path must start with @"),
             ParseError::RepeatedOption(s) => write!(f, "option given more than once: {s}"),
@@ -59,12 +61,16 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
     };
 
     let mut scan = Scan { text: source, at: 0 };
-    scan.expect(b'@')?;
+    if !scan.eat(b'@') {
+        return Err(ParseError::MissingSourcePrefix);
+    }
     let kind = scan.take_until(b":");
-    if kind != "dataset" {
+    if !matches!(kind, "dataset" | "ds") {
         return Err(ParseError::UnknownSource(kind.to_string()));
     }
-    scan.expect(b':')?;
+    if !scan.eat(b':') {
+        return Err(ParseError::EmptySourceValue);
+    }
 
     let name = scan.take_until(b":,/");
     if name.is_empty() {
@@ -86,14 +92,14 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
     let mut encoding = None;
     while scan.eat(b',') {
         let key = scan.take_until(b":,/");
-        if !scan.eat(b':') {
-            return Err(ParseError::UnknownOption(key.to_string()));
-        }
-        let value = scan.take_until(b",/");
         let slot = match key {
             "enc" | "encoding" => &mut encoding,
             _ => return Err(ParseError::UnknownOption(key.to_string())),
         };
+        if !scan.eat(b':') {
+            return Err(ParseError::EmptyOptionValue(key.to_string()));
+        }
+        let value = scan.take_until(b",/");
         if value.is_empty() {
             return Err(ParseError::EmptyOptionValue(key.to_string()));
         }
@@ -101,6 +107,13 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
             return Err(ParseError::RepeatedOption(key.to_string()));
         }
         *slot = Some(value.to_string());
+    }
+
+    if scan.eat(b'/') {
+        let name = scan.take_until(b"");
+        if name.contains(',') || name.contains(':') {
+            return Err(ParseError::MisplacedOption(name.to_string()));
+        }
     }
 
     let encoding = match encoding {
@@ -119,16 +132,6 @@ struct Scan<'a> {
 impl<'a> Scan<'a> {
     fn peek(&self) -> Option<u8> {
         self.text.as_bytes().get(self.at).copied()
-    }
-
-    fn expect(&mut self, byte: u8) -> Result<(), ParseError> {
-        if self.eat(byte) {
-            Ok(())
-        } else if byte == b'@' {
-            Err(ParseError::MissingSourcePrefix)
-        } else {
-            Err(ParseError::UnknownSource(self.text.to_string()))
-        }
     }
 
     fn eat(&mut self, byte: u8) -> bool {
@@ -208,14 +211,16 @@ mod tests {
     #[case("/@dataset:plz-5stellig/map.geojson", "plz-5stellig", None, "UTF-8")]
     #[case("/@dataset:plz-5stellig.geojson", "plz-5stellig", None, "UTF-8")]
     #[case("/@dataset:a/b/c.json", "a", None, "UTF-8")]
-    #[case("/@dataset:a/b,enc:iso-8859-1.json", "a", None, "UTF-8")]
     #[case("/@dataset:a/.json", "a", None, "UTF-8")]
+    #[case("/@dataset:a/b.c.d.json", "a", None, "UTF-8")]
     #[case("/@dataset:x,enc:iso-8859-1/output.geojson", "x", None, "ISO-8859-1")]
     #[case("/@dataset:x:a/b/c.shp,enc:iso-8859-1/output.geojson", "x", Some("a/b/c.shp"), "ISO-8859-1")]
     #[case("/@dataset:uk:gb.geojson/download.geojson", "uk", Some("gb.geojson"), "UTF-8")]
     #[case("/@dataset:uk:gb.geojson,enc:utf-8/download.geojson", "uk", Some("gb.geojson"), "UTF-8")]
     #[case("/@dataset:uk:ds/ds.gdb/download.geojson", "uk", Some("ds/ds.gdb"), "UTF-8")]
     #[case("/@dataset:uk:a/b.geojson/c.shp/name.geojson", "uk", Some("a/b.geojson/c.shp"), "UTF-8")]
+    #[case("/@dataset:uk:layer.shp/report.geojson", "uk", Some("layer.shp"), "UTF-8")]
+    #[case("/@dataset:uk:layer.shp/report.json.geojson", "uk", Some("layer.shp/report.json"), "UTF-8")]
     #[case("/@dataset:uk:nothing/readable.geojson", "uk", Some("nothing/readable"), "UTF-8")]
     fn the_filename_segment_is_discarded(
         #[case] url: &str,
@@ -230,14 +235,29 @@ mod tests {
     }
 
     #[rstest]
+    #[case("/@ds:cities.geojson", "/@dataset:cities.geojson")]
+    #[case("/@ds:plz-5stellig/output.json", "/@dataset:plz-5stellig/output.json")]
+    #[case("/@ds:x,enc:iso-8859-1/out.geojson", "/@dataset:x,enc:iso-8859-1/out.geojson")]
+    #[case("/@ds:uk:gb.geojson/download.geojson", "/@dataset:uk:gb.geojson/download.geojson")]
+    fn the_short_source_prefix_parses_the_same(#[case] short: &str, #[case] long: &str) {
+        assert_eq!(parse(short).unwrap(), parse(long).unwrap());
+    }
+
+    #[rstest]
     #[case("/", ParseError::Empty)]
     #[case("/@dataset:cities", ParseError::MissingOutputSegment)]
     #[case("/@dataset:cities.xml", ParseError::UnknownFormat("xml".to_string()))]
     #[case("/@elsewhere:thing.json", ParseError::UnknownSource("elsewhere".to_string()))]
+    #[case("/@d:thing.json", ParseError::UnknownSource("d".to_string()))]
+    #[case("/@datasets:thing.json", ParseError::UnknownSource("datasets".to_string()))]
     #[case("/dataset:cities.json", ParseError::MissingSourcePrefix)]
     #[case("/@dataset:.json", ParseError::EmptySourceValue)]
+    #[case("/@dataset.geojson", ParseError::EmptySourceValue)]
     #[case("/@dataset:x,enc:KOI8@8.geojson", ParseError::MalformedEncoding("KOI8@8".to_string()))]
+    #[case("/@dataset:pts/export,enc:iso-8859-1.geojson", ParseError::MisplacedOption("export,enc:iso-8859-1".to_string()))]
     #[case("/@dataset:x,enc:.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
+    #[case("/@dataset:x,enc.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
+    #[case("/@dataset:x,encoding/out.geojson", ParseError::EmptyOptionValue("encoding".to_string()))]
     #[case("/@dataset:x,enc:utf-8,encoding:latin1.geojson", ParseError::RepeatedOption("encoding".to_string()))]
     #[case("/@dataset:x,zzz:1.geojson", ParseError::UnknownOption("zzz".to_string()))]
     #[case("/@dataset:x,prop:state:CA.geojson", ParseError::UnknownOption("prop".to_string()))]

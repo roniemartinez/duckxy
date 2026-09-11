@@ -82,6 +82,7 @@ pub enum ResolveError {
     NotFound(String),
     InvalidRoot(PathBuf),
     EmptyArchive(String),
+    UnreadableArchive(String),
     PathNotFound { path: String, candidates: Vec<String> },
     NotAnArchive(String),
 }
@@ -92,6 +93,7 @@ impl std::fmt::Display for ResolveError {
             ResolveError::NotFound(n) => write!(f, "dataset not found: {n}"),
             ResolveError::InvalidRoot(p) => write!(f, "data root is not a directory: {}", p.display()),
             ResolveError::EmptyArchive(n) => write!(f, "{n} contains nothing duckxy can read"),
+            ResolveError::UnreadableArchive(n) => write!(f, "{n} could not be read"),
             ResolveError::PathNotFound { path, candidates } => {
                 write!(f, "no such path in archive: {path}. available: {}", candidates.join(", "))
             }
@@ -175,7 +177,7 @@ fn gdal_path(file: &Path, archive: bool, wanted: Option<&str>) -> Result<String,
         };
     }
 
-    let paths = archive_paths(file);
+    let paths = archive_paths(file)?;
     let chosen = match wanted {
         Some(want) => paths.iter().find(|(_, name)| name.eq_ignore_ascii_case(want)).ok_or_else(|| {
             ResolveError::PathNotFound {
@@ -196,22 +198,18 @@ fn gdal_path(file: &Path, archive: bool, wanted: Option<&str>) -> Result<String,
     Ok(format!("/vsizip/{abs}/{}", chosen.1))
 }
 
-fn archive_paths(file: &Path) -> Vec<(Source, String)> {
-    let handle = match std::fs::File::open(file) {
-        Ok(handle) => handle,
-        Err(e) => {
-            tracing::warn!(archive = %file.display(), error = %e, "cannot open archive");
-            return Vec::new();
-        }
-    };
-    let mut zip = match zip::ZipArchive::new(handle) {
-        Ok(zip) => zip,
-        Err(e) => {
-            tracing::warn!(archive = %file.display(), error = %e, "cannot read archive");
-            return Vec::new();
-        }
-    };
+fn archive_paths(file: &Path) -> Result<Vec<(Source, String)>, ResolveError> {
+    let label = || file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let handle = std::fs::File::open(file).map_err(|e| {
+        tracing::warn!(archive = %file.display(), error = %e, "cannot open archive");
+        ResolveError::UnreadableArchive(label())
+    })?;
+    let mut zip = zip::ZipArchive::new(handle).map_err(|e| {
+        tracing::warn!(archive = %file.display(), error = %e, "cannot read archive");
+        ResolveError::UnreadableArchive(label())
+    })?;
     let mut out: Vec<(Source, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for i in 0..zip.len() {
         let Ok(entry) = zip.by_index_raw(i) else { continue };
         let name = entry.name();
@@ -219,14 +217,17 @@ fn archive_paths(file: &Path) -> Vec<(Source, String)> {
             continue;
         }
         let name = name.trim_end_matches('/');
+        if name.rsplit('/').next().is_some_and(|base| base.starts_with("._")) {
+            continue;
+        }
         let Some((source, found)) = Source::of(name).map(|s| (s, name)).or_else(|| directory_prefix(name)) else {
             continue;
         };
-        if !out.iter().any(|(_, seen)| seen == found) {
+        if seen.insert(found.to_string()) {
             out.push((source, found.to_string()));
         }
     }
-    out
+    Ok(out)
 }
 
 fn directory_prefix(name: &str) -> Option<(Source, &str)> {
@@ -320,6 +321,8 @@ mod tests {
     #[rstest]
     #[case("ds.zip", &["thing.geojson"], "thing.geojson")]
     #[case("ds.kml.zip", &["__MACOSX/._thing.geojson", "meta.json", "a/b/c/thing.geojson"], "a/b/c/thing.geojson")]
+    #[case("ds.fgb.zip", &["._thing.geojson", "thing.geojson"], "thing.geojson")]
+    #[case("ds.gml.zip", &["a/._thing.geojson", "a/thing.geojson"], "a/thing.geojson")]
     fn resolves_and_opens_a_path_inside_an_archive(
         #[case] archive: &str,
         #[case] entries: &[&str],
@@ -339,6 +342,14 @@ mod tests {
         zip_named(&dir, "ds.zip", &["zebra.geojson", "alpha.geojson", "deep/aaa.geojson"]);
         let resolved = DatasetRoot::new(dir).resolve("ds", None).expect("resolve");
         assert!(resolved.ends_with("/alpha.geojson"), "{resolved}");
+    }
+
+    #[test]
+    fn an_unreadable_archive_is_not_reported_as_empty() {
+        let dir = archive_tempdir("corrupt");
+        fs::write(dir.join("ds.zip"), b"this is not a zip file at all").unwrap();
+        let err = DatasetRoot::new(dir).resolve("ds", None).unwrap_err();
+        assert!(matches!(err, ResolveError::UnreadableArchive(_)), "{err:?}");
     }
 
     #[test]
@@ -408,7 +419,7 @@ mod tests {
     #[rstest]
     #[case("DS.GeoJSON")]
     #[case("ds.GEOJSON")]
-    fn the_extension_case_does_not_have_to_match(#[case] filename: &str) {
+    fn the_filename_case_does_not_have_to_match(#[case] filename: &str) {
         let dir = archive_tempdir(filename);
         std::fs::write(dir.join(filename), ARCHIVE_POINTS).unwrap();
         let resolved = DatasetRoot::new(dir).resolve("ds", None).expect(filename);
