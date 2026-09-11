@@ -179,11 +179,9 @@ fn gdal_path(file: &Path, archive: bool, wanted: Option<&str>) -> Result<String,
 
     let paths = archive_paths(file)?;
     let chosen = match wanted {
-        Some(want) => paths.iter().find(|(_, name)| name.eq_ignore_ascii_case(want)).ok_or_else(|| {
-            ResolveError::PathNotFound {
-                path: want.to_string(),
-                candidates: paths.iter().take(MAX_CANDIDATES).map(|(_, name)| name.clone()).collect(),
-            }
+        Some(want) => pick_member(&paths, want).ok_or_else(|| ResolveError::PathNotFound {
+            path: want.to_string(),
+            candidates: paths.iter().take(MAX_CANDIDATES).map(|(_, name)| name.clone()).collect(),
         })?,
         None => paths
             .iter()
@@ -196,6 +194,13 @@ fn gdal_path(file: &Path, archive: bool, wanted: Option<&str>) -> Result<String,
             .ok_or(ResolveError::EmptyArchive(label))?,
     };
     Ok(format!("/vsizip/{abs}/{}", chosen.1))
+}
+
+fn pick_member<'a>(paths: &'a [(Source, String)], wanted: &str) -> Option<&'a (Source, String)> {
+    paths
+        .iter()
+        .find(|(_, name)| name == wanted)
+        .or_else(|| paths.iter().filter(|(_, name)| name.eq_ignore_ascii_case(wanted)).min_by_key(|(_, name)| name))
 }
 
 fn archive_paths(file: &Path) -> Result<Vec<(Source, String)>, ResolveError> {
@@ -366,6 +371,17 @@ mod tests {
         let dir = archive_tempdir(&format!("pick-{}", want.unwrap_or("none").replace('/', "_")));
         zip_named(&dir, "ds.zip", &["one.geojson", "a/b/two.geojson"]);
         let resolved = DatasetRoot::new(dir).resolve("ds", want).expect("resolve");
+        assert!(resolved.ends_with(&format!("/{expected}")), "{resolved}");
+    }
+
+    #[rstest]
+    #[case("a.geojson", "a.geojson")]
+    #[case("A.geojson", "A.geojson")]
+    #[case("A.GEOJSON", "A.geojson")]
+    fn an_exact_archive_member_wins_over_a_case_variant(#[case] want: &str, #[case] expected: &str) {
+        let dir = archive_tempdir(&format!("member-{want}"));
+        zip_named(&dir, "ds.zip", &["A.geojson", "a.geojson"]);
+        let resolved = DatasetRoot::new(dir).resolve("ds", Some(want)).expect(want);
         assert!(resolved.ends_with(&format!("/{expected}")), "{resolved}");
     }
 

@@ -11,6 +11,8 @@ use crate::formats::Format;
 use crate::{CHANNEL_DEPTH, error, query, resolve_error, url};
 use sea_query::{Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, WithClause};
 
+const GEOMETRY_FAILURES: [&str; 3] = ["TopologyException", "IllegalArgumentException", "AssertionFailedException"];
+
 pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPath) -> Response {
     let parsed = match url::parse(&path) {
         Ok(p) => p,
@@ -87,8 +89,6 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
     )
         .into_response()
 }
-
-const GEOMETRY_FAILURES: [&str; 3] = ["TopologyException", "IllegalArgumentException", "AssertionFailedException"];
 
 fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
     if let Some(no_geometry) = e.downcast_ref::<query::NoGeometry>() {
