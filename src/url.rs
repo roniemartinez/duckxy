@@ -3,10 +3,17 @@ use std::fmt;
 pub const DEFAULT_ENCODING: &str = crate::encodings::UTF8;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Segment {
+    pub name: String,
+    pub params: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedUrl {
     pub dataset: String,
     pub path: Option<String>,
     pub encoding: String,
+    pub filters: Vec<Segment>,
     pub format: crate::formats::Format,
     pub extension: &'static str,
 }
@@ -25,6 +32,9 @@ pub enum ParseError {
     UnknownOption(String),
     UnknownSource(String),
     MalformedEncoding(String),
+    MisplacedSourceOption(String),
+    OptionTakesOneValue(String),
+    UnbalancedValue(String),
 }
 
 impl fmt::Display for ParseError {
@@ -42,6 +52,9 @@ impl fmt::Display for ParseError {
             ParseError::UnknownOption(s) => write!(f, "unknown option: {s}"),
             ParseError::UnknownSource(s) => write!(f, "unknown source type: {s}"),
             ParseError::MalformedEncoding(s) => write!(f, "encoding has characters that are not allowed: {s}"),
+            ParseError::MisplacedSourceOption(s) => write!(f, "source options must come before any filter: {s}"),
+            ParseError::OptionTakesOneValue(s) => write!(f, "option takes exactly one value: {s}"),
+            ParseError::UnbalancedValue(s) => write!(f, "value has an unclosed ~ or (: {s}"),
         }
     }
 }
@@ -89,25 +102,7 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
         path = Some(trim_filename(value).to_string());
     }
 
-    let mut encoding = None;
-    while scan.eat(b',') {
-        let key = scan.take_until(b":,/");
-        let slot = match key {
-            "enc" | "encoding" => &mut encoding,
-            _ => return Err(ParseError::UnknownOption(key.to_string())),
-        };
-        if !scan.eat(b':') {
-            return Err(ParseError::EmptyOptionValue(key.to_string()));
-        }
-        let value = scan.take_until(b",/");
-        if value.is_empty() {
-            return Err(ParseError::EmptyOptionValue(key.to_string()));
-        }
-        if slot.is_some() {
-            return Err(ParseError::RepeatedOption(key.to_string()));
-        }
-        *slot = Some(value.to_string());
-    }
+    let (encoding, filters) = read_options(&mut scan)?;
 
     if scan.eat(b'/') {
         let name = scan.take_until(b"");
@@ -121,7 +116,48 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
         None => DEFAULT_ENCODING.to_string(),
     };
 
-    Ok(ParsedUrl { dataset: name.to_string(), path, encoding, format, extension })
+    Ok(ParsedUrl { dataset: name.to_string(), path, encoding, filters, format, extension })
+}
+
+fn read_options<'a>(scan: &mut Scan<'a>) -> Result<(Option<String>, Vec<Segment>), ParseError> {
+    let mut encoding = None;
+    let mut filters: Vec<Segment> = Vec::new();
+    while scan.eat(b',') {
+        let key = scan.take_until(b":,/");
+        if !matches!(key, "enc" | "encoding" | "id") {
+            return Err(ParseError::UnknownOption(key.to_string()));
+        }
+        let mut params: Vec<String> = Vec::new();
+        while scan.eat(b':') {
+            params.push(scan.take_until(b":,/").to_string());
+        }
+        let value = match params.as_slice() {
+            [only] if !only.is_empty() => params.swap_remove(0),
+            [] | [_] => return Err(ParseError::EmptyOptionValue(key.to_string())),
+            _ => return Err(ParseError::OptionTakesOneValue(key.to_string())),
+        };
+        if !is_balanced(&value) {
+            return Err(ParseError::UnbalancedValue(value));
+        }
+        match key {
+            "enc" | "encoding" => {
+                if !filters.is_empty() {
+                    return Err(ParseError::MisplacedSourceOption(key.to_string()));
+                }
+                if encoding.is_some() {
+                    return Err(ParseError::RepeatedOption(key.to_string()));
+                }
+                encoding = Some(value);
+            }
+            _ => {
+                if filters.iter().any(|f| f.name == key) {
+                    return Err(ParseError::RepeatedOption(key.to_string()));
+                }
+                filters.push(Segment { name: key.to_string(), params: vec![value] });
+            }
+        }
+    }
+    Ok((encoding, filters))
 }
 
 struct Scan<'a> {
@@ -144,14 +180,37 @@ impl<'a> Scan<'a> {
 
     fn take_until(&mut self, stops: &[u8]) -> &'a str {
         let from = self.at;
+        let mut depth = 0usize;
+        let mut in_tilde = false;
         while let Some(byte) = self.peek() {
-            if stops.contains(&byte) {
-                break;
+            match byte {
+                b'~' => in_tilde = !in_tilde,
+                b'(' if !in_tilde => depth += 1,
+                b')' if !in_tilde => depth = depth.saturating_sub(1),
+                _ if depth == 0 && !in_tilde && stops.contains(&byte) => break,
+                _ => {}
             }
             self.at += 1;
         }
         &self.text[from..self.at]
     }
+}
+
+fn is_balanced(value: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_tilde = false;
+    for byte in value.bytes() {
+        match byte {
+            b'~' => in_tilde = !in_tilde,
+            b'(' if !in_tilde => depth += 1,
+            b')' if !in_tilde => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0 && !in_tilde
 }
 
 fn trim_filename(path: &str) -> &str {
@@ -258,10 +317,55 @@ mod tests {
     #[case("/@dataset:x,enc:.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
     #[case("/@dataset:x,enc.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
     #[case("/@dataset:x,encoding/out.geojson", ParseError::EmptyOptionValue("encoding".to_string()))]
-    #[case("/@dataset:x,enc:utf-8,encoding:latin1.geojson", ParseError::RepeatedOption("encoding".to_string()))]
+    #[case("/@dataset:x,enc:utf-8:extra.geojson", ParseError::OptionTakesOneValue("enc".to_string()))]
+    #[case("/@dataset:x,id:a:b.geojson", ParseError::OptionTakesOneValue("id".to_string()))]
+    #[case("/@dataset:x,id:a:b:c.geojson", ParseError::OptionTakesOneValue("id".to_string()))]
+    #[case("/@dataset:x,id:.geojson", ParseError::EmptyOptionValue("id".to_string()))]
+    #[case("/@ds:pts,id:~2/export.geojson", ParseError::UnbalancedValue("~2/export".to_string()))]
+    #[case("/@dataset:pts,id:~1,enc:latin1.geojson", ParseError::UnbalancedValue("~1,enc:latin1".to_string()))]
+    #[case("/@dataset:pts,id:(a~b).geojson", ParseError::UnbalancedValue("(a~b)".to_string()))]
+    #[case("/@dataset:pts,id:(1,2.geojson", ParseError::UnbalancedValue("(1,2".to_string()))]
+    #[case("/@dataset:pts,id:a)b.geojson", ParseError::UnbalancedValue("a)b".to_string()))]
+    #[case("/@dataset:x,id.geojson", ParseError::EmptyOptionValue("id".to_string()))]
     #[case("/@dataset:x,zzz:1.geojson", ParseError::UnknownOption("zzz".to_string()))]
     #[case("/@dataset:x,prop:state:CA.geojson", ParseError::UnknownOption("prop".to_string()))]
     fn rejects(#[case] url: &str, #[case] expected: ParseError) {
         assert_eq!(parse(url), Err(expected));
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,id:(~A, B~,C).geojson", "id", vec!["(~A, B~,C)"])]
+    #[case("/@dataset:x,id:~Armagh City, Banbridge~.geojson", "id", vec!["~Armagh City, Banbridge~"])]
+    #[case("/@dataset:x,id:(1..100).geojson", "id", vec!["(1..100)"])]
+    #[case("/@dataset:x,id:~key:value~.geojson", "id", vec!["~key:value~"])]
+    #[case("/@dataset:x,id:((1,2),(3,4)).geojson", "id", vec!["((1,2),(3,4))"])]
+    #[case("/@dataset:x,id:file-(1..3).txt.geojson", "id", vec!["file-(1..3).txt"])]
+    fn a_filter_is_one_segment(#[case] url: &str, #[case] name: &str, #[case] params: Vec<&str>) {
+        let p = parse(url).unwrap();
+        assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
+        assert_eq!(p.filters[0].name, name);
+        assert_eq!(p.filters[0].params, params);
+    }
+
+    #[test]
+    fn an_encoding_comes_before_a_filter_and_not_after() {
+        let p = parse("/@dataset:plz,enc:utf-8,id:2257.geojson").unwrap();
+        assert_eq!(p.encoding, "UTF-8");
+        assert_eq!(p.filters.len(), 1, "encoding was collected as a filter: {:?}", p.filters);
+        assert_eq!(p.filters[0].name, "id");
+        assert_eq!(p.filters[0].params, ["2257"]);
+
+        assert_eq!(
+            parse("/@dataset:plz,id:2257,enc:utf-8.geojson"),
+            Err(ParseError::MisplacedSourceOption("enc".to_string()))
+        );
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,id:1,id:2.geojson", "id")]
+    #[case("/@dataset:x,enc:utf-8,enc:latin1.geojson", "enc")]
+    #[case("/@dataset:x,enc:utf-8,encoding:latin1.geojson", "encoding")]
+    fn an_option_or_filter_may_appear_only_once(#[case] url: &str, #[case] name: &str) {
+        assert_eq!(parse(url), Err(ParseError::RepeatedOption(name.to_string())));
     }
 }

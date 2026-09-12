@@ -25,6 +25,7 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
     let encoding = parsed.encoding;
 
     let name = dataset.clone();
+    let filters = parsed.filters;
     let selected = parsed.path;
     let source = match tokio::task::spawn_blocking(move || root.resolve(&name, selected.as_deref())).await {
         Ok(Ok(source)) => source,
@@ -47,7 +48,7 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
             &source,
             &encoding,
             format,
-            |geometry| build_sql(&source, &encoding, format, geometry),
+            |columns| build_sql(&source, &encoding, &filters, format, columns),
             || {
                 if let Some(ready_tx) = ready.take() {
                     let _ = ready_tx.send(Ok(()));
@@ -94,6 +95,13 @@ fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
     if let Some(no_geometry) = e.downcast_ref::<query::NoGeometry>() {
         return (StatusCode::UNPROCESSABLE_ENTITY, no_geometry.to_string());
     }
+    if let Some(filter_error) = e.downcast_ref::<crate::filters::FilterError>() {
+        let status = match filter_error {
+            crate::filters::FilterError::NoIdColumn => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        return (status, filter_error.to_string());
+    }
     let reported = e.chain().map(|cause| cause.to_string()).collect::<Vec<_>>().join("; ");
     if GEOMETRY_FAILURES.iter().any(|marker| reported.contains(marker)) {
         return (StatusCode::UNPROCESSABLE_ENTITY, "source geometry could not be processed".to_string());
@@ -104,7 +112,14 @@ fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".to_string())
 }
 
-pub fn build_sql(source: &str, encoding: &str, format: Format, geometry: &str) -> String {
+pub fn build_sql(
+    source: &str,
+    encoding: &str,
+    filters: &[url::Segment],
+    format: Format,
+    columns: &[(String, String)],
+) -> anyhow::Result<String> {
+    let geometry = query::geometry_of(columns).expect("checked by run");
     let mut ctes = WithClause::new();
     let mut input = Alias::new("source");
     ctes.cte(
@@ -116,17 +131,23 @@ pub fn build_sql(source: &str, encoding: &str, format: Format, geometry: &str) -
             .to_owned(),
     );
 
+    if let Some(predicate) = crate::filters::condition(filters, columns)? {
+        let filtered = Query::select().expr(Expr::cust("*")).from(input.clone()).and_where(predicate).take();
+        input = Alias::new("filtered");
+        ctes.cte(CommonTableExpression::new().query(filtered).table_name(input.clone()).to_owned());
+    }
+
     let replaced = Query::select()
         .expr(Expr::cust_with_exprs(
             "* REPLACE ($1 AS $2)",
             [Func::cust("ST_AsGeoJSON").arg(Expr::col(Alias::new(geometry))).into(), Expr::col(Alias::new(geometry))],
         ))
-        .from(input)
+        .from(input.clone())
         .take();
     input = Alias::new("step_1");
     ctes.cte(CommonTableExpression::new().query(replaced).table_name(input.clone()).to_owned());
 
-    match format {
+    Ok(match format {
         Format::GeoJson => Query::select()
             .expr(Func::cast_as(
                 Func::cust("json_object").args([
@@ -146,7 +167,7 @@ pub fn build_sql(source: &str, encoding: &str, format: Format, geometry: &str) -
             .to_owned()
             .with(ctes)
             .to_string(PostgresQueryBuilder),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -185,5 +206,37 @@ mod tests {
         let (status, message) = error_status(&anyhow::anyhow!("disk on fire"), "UTF-8");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "query failed");
+    }
+
+    #[test]
+    fn a_malformed_filter_is_a_client_error() {
+        let raw = anyhow::Error::new(crate::filters::FilterError::BadParams("id".to_string()));
+        let (status, message) = error_status(&raw, "UTF-8");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(message, "filter takes exactly one value: id");
+    }
+
+    #[test]
+    fn a_missing_id_column_is_unprocessable() {
+        let raw = anyhow::Error::new(crate::filters::FilterError::NoIdColumn);
+        let (status, message) = error_status(&raw, "UTF-8");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(message.contains("id column"), "{message}");
+    }
+
+    #[test]
+    fn an_unfiltered_request_adds_no_cte() {
+        let columns = vec![("name".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let out = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns).unwrap();
+        assert!(!out.contains("filtered"), "an empty filter list added a cte: {out}");
+    }
+
+    #[test]
+    fn a_filtered_request_adds_one_cte() {
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let filters = vec![url::Segment { name: "id".to_string(), params: vec!["7".to_string()] }];
+        let out = build_sql("/x.geojson", "UTF-8", &filters, Format::GeoJson, &columns).unwrap();
+        assert!(out.contains("\"filtered\""), "{out}");
+        assert!(out.contains("CAST(\"id\" AS VARCHAR) = '7'"), "{out}");
     }
 }
