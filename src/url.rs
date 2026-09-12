@@ -55,7 +55,7 @@ impl fmt::Display for ParseError {
             ParseError::MalformedEncoding(s) => write!(f, "encoding has characters that are not allowed: {s}"),
             ParseError::MisplacedSourceOption(s) => write!(f, "source options must come before any filter: {s}"),
             ParseError::OptionTakesOneValue(s) => write!(f, "option takes exactly one value: {s}"),
-            ParseError::UnbalancedValue(s) => write!(f, "value has an unclosed ~ or (: {s}"),
+            ParseError::UnbalancedValue(s) => write!(f, "value has unbalanced ~ or (): {s}"),
             ParseError::ValueTooDeep(s) => {
                 write!(f, "value nests groups more than {} deep: {s}", crate::parexp::MAX_DEPTH)
             }

@@ -121,32 +121,42 @@ fn expand_inner(s: &str, allow_range: bool, depth: usize) -> Vec<String> {
     if depth >= MAX_DEPTH {
         return expand_leaf(s);
     }
-    let Some((head, parts, tail)) = split_group(s) else {
-        return if allow_range { expand_literal(s) } else { expand_leaf(s) };
-    };
-    let allow_child = parts.len() == 1;
-    let mut group: Vec<String> = Vec::new();
-    for part in parts {
-        if group.len() >= MAX_EXPANSION {
-            break;
+    let mut done: Vec<String> = vec![String::new()];
+    let mut rest = s;
+    let mut ranged = allow_range;
+    loop {
+        let Some((head, parts, tail)) = split_group(rest) else {
+            let leaf = if ranged { expand_literal(rest) } else { expand_leaf(rest) };
+            return cross(done, leaf);
+        };
+        let allow_child = parts.len() == 1;
+        let mut group: Vec<String> = Vec::new();
+        for part in parts {
+            if group.len() >= MAX_EXPANSION {
+                break;
+            }
+            group.extend(expand_inner(part, allow_child, depth + 1));
         }
-        group.extend(expand_inner(part, allow_child, depth + 1));
+        done = cross(cross(done, expand_literal(head)), group);
+        rest = tail;
+        ranged = true;
     }
+}
 
-    let before = expand_inner(head, true, depth + 1);
-    let after = expand_inner(tail, true, depth + 1);
-    if before == [""] && after == [""] {
-        return group;
+fn cross(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    if left.len() == 1 && left[0].is_empty() {
+        return right;
+    }
+    if right.len() == 1 && right[0].is_empty() {
+        return left;
     }
     let mut out = Vec::new();
-    for b in &before {
-        for g in &group {
-            for a in &after {
-                if out.len() >= MAX_EXPANSION {
-                    return out;
-                }
-                out.push(format!("{b}{g}{a}"));
+    for l in &left {
+        for r in &right {
+            if out.len() >= MAX_EXPANSION {
+                return out;
             }
+            out.push(format!("{l}{r}"));
         }
     }
     out
@@ -183,12 +193,21 @@ fn count_inner(s: &str, allow_range: bool, depth: usize) -> usize {
     if depth >= MAX_DEPTH {
         return 1;
     }
-    let Some((head, parts, tail)) = split_group(s) else {
-        return if allow_range { count_literal(s) } else { 1 };
-    };
-    let allow_child = parts.len() == 1;
-    let group = parts.iter().map(|part| count_inner(part, allow_child, depth + 1)).fold(0usize, usize::saturating_add);
-    count_inner(head, true, depth + 1).saturating_mul(group).saturating_mul(count_inner(tail, true, depth + 1))
+    let mut total = 1usize;
+    let mut rest = s;
+    let mut ranged = allow_range;
+    loop {
+        let Some((head, parts, tail)) = split_group(rest) else {
+            let leaf = if ranged { count_literal(rest) } else { 1 };
+            return total.saturating_mul(leaf);
+        };
+        let allow_child = parts.len() == 1;
+        let group =
+            parts.iter().map(|part| count_inner(part, allow_child, depth + 1)).fold(0usize, usize::saturating_add);
+        total = total.saturating_mul(count_literal(head)).saturating_mul(group);
+        rest = tail;
+        ranged = true;
+    }
 }
 
 fn count_literal(s: &str) -> usize {
@@ -380,6 +399,32 @@ mod tests {
         let huge = "(0..9223372036854775807)";
         let pattern = format!("({huge},{huge})");
         assert_eq!(count(&pattern), usize::MAX, "the sum wrapped and bypassed the cap");
+    }
+
+    #[rstest]
+    #[case(4)]
+    #[case(31)]
+    #[case(40)]
+    #[case(200)]
+    fn sequential_groups_do_not_exhaust_the_nesting_budget(#[case] leading: usize) {
+        let pattern = format!("{}(b,c)", "(a)".repeat(leading));
+        let expected = vec![format!("{}b", "a".repeat(leading)), format!("{}c", "a".repeat(leading))];
+        assert_eq!(count(&pattern), 2, "count wrong after {leading} sequential groups");
+        assert_eq!(expand(&pattern), expected, "expand wrong after {leading} sequential groups");
+    }
+
+    #[test]
+    fn sequential_groups_cost_no_stack() {
+        let pattern = format!("{}(b,c)", "(a)".repeat(20_000));
+        assert_eq!(count(&pattern), 2);
+        assert_eq!(expand(&pattern).len(), 2);
+    }
+
+    #[test]
+    fn nesting_past_the_limit_degrades_to_a_literal_rather_than_overflowing() {
+        let deep = format!("{}x{}", "(".repeat(5_000), ")".repeat(5_000));
+        assert_eq!(count(&deep), 1);
+        assert_eq!(expand(&deep).len(), 1);
     }
 
     #[test]
