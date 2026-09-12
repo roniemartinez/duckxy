@@ -54,6 +54,12 @@ mod tests {
 
     const KEY: &str = "00112233445566778899aabbccddeeff";
     const POINTS: &str = r#"{"type":"FeatureCollection","features":[
+        {"type":"Feature","properties":{"id":1,"name":"alpha","pop":100,"code":"a_1"},
+         "geometry":{"type":"Point","coordinates":[1,2]}},
+        {"type":"Feature","properties":{"id":2,"name":"beta","pop":900,"code":"aX1"},
+         "geometry":{"type":"Point","coordinates":[3,4]}}]}"#;
+
+    const NO_ID: &str = r#"{"type":"FeatureCollection","features":[
         {"type":"Feature","properties":{"name":"alpha"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
 
     fn state(tag: &str, allow_insecure: bool) -> AppState {
@@ -64,6 +70,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("pts.geojson"), POINTS).unwrap();
+        fs::write(dir.join("noid.geojson"), NO_ID).unwrap();
         AppState { root: DatasetRoot::new(dir), auth: Auth::new(Some(KEY), allow_insecure).unwrap() }
     }
 
@@ -147,5 +154,53 @@ mod tests {
         let (status, body) = get(state("health", false), "/health").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok");
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts,id:1.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,id:2.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,id:99.geojson", vec![])]
+    #[case("/@ds:pts,id:2/export.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,enc:utf-8,id:1.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts.geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,id:~1~.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,id:inf.geojson", vec![])]
+    #[case("/@dataset:pts,id:NaN.geojson", vec![])]
+    #[case("/@dataset:pts,id:1e400.geojson", vec![])]
+    #[case("/@dataset:pts,id:01.geojson", vec![])]
+    #[tokio::test]
+    async fn an_id_filter_returns_exactly_the_matching_features(#[case] path: &str, #[case] expected: Vec<&str>) {
+        let s = state("filter", false);
+        let (status, body) = get(s.clone(), &signed(&s, path)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{body} ({e})"));
+        let names: Vec<&str> =
+            parsed["features"].as_array().unwrap().iter().map(|f| f["properties"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, expected, "{body}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts,zzz:1.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,id:(1,2).geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,id:(1..100).geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,id:1,id:2.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,enc:utf-8,enc:latin1.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,id:1:2.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,id:~1,enc:latin1.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,id:file-(1..3).txt.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,id:1,enc:utf-8.geojson", StatusCode::BAD_REQUEST)]
+    #[tokio::test]
+    async fn bad_filters_are_client_errors(#[case] path: &str, #[case] expected: StatusCode) {
+        let s = state("filter-err", false);
+        let (status, body) = get(s.clone(), &signed(&s, path)).await;
+        assert_eq!(status, expected, "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_id_filter_without_an_id_column_is_unprocessable() {
+        let s = state("noid", false);
+        let (status, body) = get(s.clone(), &signed(&s, "/@dataset:noid,id:1.geojson")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body.contains("id column"), "{body}");
     }
 }

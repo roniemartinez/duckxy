@@ -101,13 +101,14 @@ pub fn run(
     source: &str,
     encoding: &str,
     format: Format,
-    sql_for: impl FnOnce(&str) -> String,
+    sql_for: impl FnOnce(&[(String, String)]) -> Result<String>,
     on_ready: impl FnOnce(),
     sink: &mut dyn FnMut(String) -> bool,
 ) -> Result<()> {
     with_connection(|conn| {
-        let geometry = geometry_column(conn, source, encoding)?.ok_or(NoGeometry)?;
-        let sql = sql_for(&geometry);
+        let columns = describe(conn, source, encoding)?;
+        geometry_of(&columns).ok_or(NoGeometry)?;
+        let sql = sql_for(&columns)?;
 
         let mut stmt = conn.prepare(&sql).context("prepare query")?;
         let mut rows = stmt.query([]).context("run query")?;
@@ -135,18 +136,27 @@ pub fn run(
     })
 }
 
-fn geometry_column(conn: &Connection, source: &str, encoding: &str) -> Result<Option<String>> {
+pub fn describe(conn: &Connection, source: &str, encoding: &str) -> Result<Vec<(String, String)>> {
     let relation = Query::select()
         .expr(Expr::cust("*"))
         .from_function(read_source(source, encoding), "src")
         .to_string(PostgresQueryBuilder);
-    let sql = format!("SELECT column_name FROM (DESCRIBE {relation}) WHERE column_type LIKE 'GEOMETRY%' LIMIT 1");
+    let sql = format!("SELECT column_name, column_type FROM (DESCRIBE {relation})");
     let mut stmt = conn.prepare(&sql).context("describe source")?;
     let mut rows = stmt.query([]).context("describe source")?;
-    match rows.next().context("describe source")? {
-        Some(row) => Ok(row.get::<_, Option<String>>(0).context("describe source")?),
-        None => Ok(None),
+    let mut columns = Vec::new();
+    while let Some(row) = rows.next().context("describe source")? {
+        let name: Option<String> = row.get(0).context("describe source")?;
+        let kind: Option<String> = row.get(1).context("describe source")?;
+        if let (Some(name), Some(kind)) = (name, kind) {
+            columns.push((name, kind));
+        }
     }
+    Ok(columns)
+}
+
+pub fn geometry_of(columns: &[(String, String)]) -> Option<&str> {
+    columns.iter().find(|(_, kind)| kind.starts_with("GEOMETRY")).map(|(name, _)| name.as_str())
 }
 
 #[cfg(test)]
@@ -182,7 +192,7 @@ mod tests {
             source,
             crate::url::DEFAULT_ENCODING,
             f,
-            |g| crate::handler::build_sql(source, crate::url::DEFAULT_ENCODING, f, g),
+            |c| crate::handler::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -217,7 +227,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             Format::GeoJson,
-            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, Format::GeoJson, g),
+            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -276,7 +286,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             Format::GeoJson,
-            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, Format::GeoJson, g),
+            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
             || panic!("a source with no geometry must not reach the ready signal"),
             &mut |_| true,
         )
@@ -387,7 +397,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f,
-            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g),
+            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
             || {},
             &mut |_| {
                 stopped_after += 1;
@@ -402,7 +412,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f,
-            |g| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, f, g),
+            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
             || {},
             &mut |_| {
                 chunks += 1;
@@ -424,5 +434,21 @@ mod tests {
         let f = &v["features"][0];
         assert_eq!(f["geometry"]["type"], "Point", "geometry slot hijacked: {f}");
         assert_eq!(f["properties"]["geometry_json"], "KEEPME", "source attribute lost: {f}");
+    }
+
+    #[test]
+    fn describe_returns_every_column_with_its_type() {
+        crate::ensure_spatial();
+        let src = fixture("describe", TWO);
+        let columns = with_connection(|conn| describe(conn, &src, crate::url::DEFAULT_ENCODING)).unwrap();
+        let names: Vec<&str> = columns.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"name"), "{names:?}");
+        assert_eq!(geometry_of(&columns), Some("geom"));
+    }
+
+    #[test]
+    fn geometry_of_returns_none_without_a_geometry_column() {
+        let columns = vec![("id".to_string(), "BIGINT".to_string())];
+        assert_eq!(geometry_of(&columns), None);
     }
 }

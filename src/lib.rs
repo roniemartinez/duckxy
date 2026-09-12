@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod dataset;
 mod encodings;
+pub mod filters;
 pub mod formats;
 pub mod handler;
 pub mod query;
