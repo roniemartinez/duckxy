@@ -119,7 +119,7 @@ pub fn build_sql(
     format: Format,
     columns: &[(String, String)],
 ) -> anyhow::Result<String> {
-    let geometry = query::geometry_of(columns).expect("checked by run");
+    let geometry = query::geometry_of(columns).ok_or(query::NoGeometry)?;
     let mut ctes = WithClause::new();
     let mut input = Alias::new("source");
     ctes.cte(
@@ -222,6 +222,13 @@ mod tests {
         let (status, message) = error_status(&raw, "UTF-8");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(message.contains("id column"), "{message}");
+    }
+
+    #[test]
+    fn build_sql_without_a_geometry_column_errors_rather_than_panics() {
+        let columns = vec![("id".to_string(), "BIGINT".to_string())];
+        let err = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns).unwrap_err();
+        assert!(err.downcast_ref::<query::NoGeometry>().is_some(), "{err:#}");
     }
 
     #[test]
