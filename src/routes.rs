@@ -168,6 +168,17 @@ mod tests {
     #[case("/@dataset:pts,id:NaN.geojson", vec![])]
     #[case("/@dataset:pts,id:1e400.geojson", vec![])]
     #[case("/@dataset:pts,id:01.geojson", vec![])]
+    #[case("/@dataset:pts,id:(1,2).geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,id:(1,2,5,7).geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,id:(5,7,2).geojson", vec!["beta"])]
+    #[case("/@dataset:pts,id:(5,7,11).geojson", vec![])]
+    #[case("/@dataset:pts,id:(1..2).geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,id:(1..1).geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,id:(2..9).geojson", vec!["beta"])]
+    #[case("/@dataset:pts,id:(90..99).geojson", vec![])]
+    #[case("/@dataset:pts,id:(a,b).geojson", vec![])]
+    #[case("/@dataset:pts,id:file-(1..3).txt.geojson", vec![])]
+    #[case("/@dataset:pts,id:(1..1000000).geojson", vec!["alpha", "beta"])]
     #[tokio::test]
     async fn an_id_filter_returns_exactly_the_matching_features(#[case] path: &str, #[case] expected: Vec<&str>) {
         let s = state("filter", false);
@@ -181,13 +192,10 @@ mod tests {
 
     #[rstest]
     #[case("/@dataset:pts,zzz:1.geojson", StatusCode::BAD_REQUEST)]
-    #[case("/@dataset:pts,id:(1,2).geojson", StatusCode::BAD_REQUEST)]
-    #[case("/@dataset:pts,id:(1..100).geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:1,id:2.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,enc:utf-8,enc:latin1.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:1:2.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:~1,enc:latin1.geojson", StatusCode::BAD_REQUEST)]
-    #[case("/@dataset:pts,id:file-(1..3).txt.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:1,enc:utf-8.geojson", StatusCode::BAD_REQUEST)]
     #[tokio::test]
     async fn bad_filters_are_client_errors(#[case] path: &str, #[case] expected: StatusCode) {
