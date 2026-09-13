@@ -10,6 +10,7 @@ use crate::dataset::DatasetRoot;
 use crate::{CHANNEL_DEPTH, error, query, resolve_error, url};
 
 const GEOMETRY_FAILURES: [&str; 3] = ["TopologyException", "IllegalArgumentException", "AssertionFailedException"];
+const UNREADABLE_SOURCE: &str = "Could not open GDAL dataset";
 
 pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPath) -> Response {
     let parsed = match url::parse(&path) {
@@ -46,7 +47,7 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
             &source,
             &encoding,
             format,
-            |columns| crate::sql::build_sql(&source, &encoding, &filters, format, columns),
+            |columns, crs| crate::sql::build_sql(&source, &encoding, &filters, format, columns, crs),
             || {
                 if let Some(ready_tx) = ready.take() {
                     let _ = ready_tx.send(Ok(()));
@@ -104,6 +105,9 @@ fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
     if GEOMETRY_FAILURES.iter().any(|marker| reported.contains(marker)) {
         return (StatusCode::UNPROCESSABLE_ENTITY, "source geometry could not be processed".to_string());
     }
+    if reported.contains(UNREADABLE_SOURCE) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "source could not be opened as a geospatial dataset".to_string());
+    }
     if reported.contains("Invalid Input Error") {
         return (StatusCode::UNPROCESSABLE_ENTITY, format!("source could not be read with encoding {encoding}"));
     }
@@ -139,6 +143,17 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(message, "source geometry could not be processed");
         assert!(!message.contains("encoding"), "a geometry failure blamed the encoding: {message}");
+    }
+
+    #[test]
+    fn a_source_gdal_cannot_open_is_a_client_error() {
+        let raw = anyhow::anyhow!(
+            "IO Error: Could not open GDAL dataset at: /vsizip//srv/data/gbr.zip/geoBoundaries-GBR-ADM2-metaData.json"
+        );
+        let (status, message) = error_status(&raw, "UTF-8");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "source could not be opened as a geospatial dataset");
+        assert!(!message.contains("/srv/data"), "the data root leaked: {message}");
     }
 
     #[test]

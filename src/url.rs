@@ -24,6 +24,7 @@ pub enum ParseError {
     EmptyOptionValue(String),
     EmptySourceValue,
     InvalidName(String),
+    InvalidPath(String),
     MisplacedOption(String),
     MissingOutputSegment,
     MissingSourcePrefix,
@@ -45,6 +46,7 @@ impl fmt::Display for ParseError {
             ParseError::EmptyOptionValue(s) => write!(f, "option has no value: {s}"),
             ParseError::EmptySourceValue => write!(f, "source value is empty"),
             ParseError::InvalidName(n) => write!(f, "invalid name: {n}"),
+            ParseError::InvalidPath(p) => write!(f, "path has characters that are not allowed: {p}"),
             ParseError::MisplacedOption(s) => write!(f, "options must come before the output name: {s}"),
             ParseError::MissingOutputSegment => write!(f, "missing .<format> suffix"),
             ParseError::MissingSourcePrefix => write!(f, "path must start with @"),
@@ -102,6 +104,9 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
         let value = scan.take_until(b",");
         if value.is_empty() {
             return Err(ParseError::EmptySourceValue);
+        }
+        if !is_valid_path(value) {
+            return Err(ParseError::InvalidPath(value.to_string()));
         }
         path = Some(trim_filename(value).to_string());
     }
@@ -242,6 +247,10 @@ fn resolve_encoding(label: &str) -> Option<String> {
     (!label.is_empty() && label.chars().all(safe)).then(|| label.to_string())
 }
 
+pub fn is_valid_path(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+}
+
 pub fn is_valid_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
@@ -340,6 +349,14 @@ mod tests {
     )]
     #[case("/@dataset:x,id.geojson", ParseError::EmptyOptionValue("id".to_string()))]
     #[case("/@dataset:x,zzz:1.geojson", ParseError::UnknownOption("zzz".to_string()))]
+    #[case(
+        "/@dataset:gbr:a~b.shp,enc:iso-8859-1.geojson",
+        ParseError::InvalidPath("a~b.shp,enc:iso-8859-1".to_string())
+    )]
+    #[case(
+        "/@dataset:gbr:Zones(final.shp,enc:iso-8859-1.geojson",
+        ParseError::InvalidPath("Zones(final.shp,enc:iso-8859-1".to_string())
+    )]
     #[case("/@dataset:x,prop:state:CA.geojson", ParseError::UnknownOption("prop".to_string()))]
     fn rejects(#[case] url: &str, #[case] expected: ParseError) {
         assert_eq!(parse(url), Err(expected));
