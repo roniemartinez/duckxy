@@ -6,6 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub const MAX_EXPANSION: usize = 10_000;
 pub const MAX_DEPTH: usize = 32;
 
+enum Range<'a> {
+    Numeric { lo: i64, hi: i64, step: i64, lo_raw: &'a str, hi_raw: &'a str },
+    Alpha { from: u8, to: u8 },
+}
+
 pub fn expand(pattern: &str) -> Vec<String> {
     let mut out = expand_inner(pattern, true, 0);
     out.truncate(MAX_EXPANSION);
@@ -27,11 +32,6 @@ pub fn as_integer_range(pattern: &str) -> Option<(i64, i64)> {
         }
         _ => None,
     }
-}
-
-enum Range<'a> {
-    Numeric { lo: i64, hi: i64, step: i64, lo_raw: &'a str, hi_raw: &'a str },
-    Alpha { from: u8, to: u8 },
 }
 
 fn expand_leaf(s: &str) -> Vec<String> {

@@ -1,6 +1,9 @@
 use std::fmt;
 
 pub const DEFAULT_ENCODING: &str = crate::encodings::UTF8;
+pub const MAX_FILTERS: usize = 50;
+
+const FILTERS: [(&str, usize, usize); 2] = [("id", 1, 2), ("prop", 2, 3)];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
@@ -35,6 +38,8 @@ pub enum ParseError {
     MalformedEncoding(String),
     MisplacedSourceOption(String),
     OptionTakesOneValue(String),
+    WrongParameterCount(String),
+    TooManyFilters,
     UnbalancedValue(String),
     ValueTooDeep(String),
 }
@@ -57,6 +62,8 @@ impl fmt::Display for ParseError {
             ParseError::MalformedEncoding(s) => write!(f, "encoding has characters that are not allowed: {s}"),
             ParseError::MisplacedSourceOption(s) => write!(f, "source options must come before any filter: {s}"),
             ParseError::OptionTakesOneValue(s) => write!(f, "option takes exactly one value: {s}"),
+            ParseError::WrongParameterCount(s) => write!(f, "filter has the wrong number of parameters: {s}"),
+            ParseError::TooManyFilters => write!(f, "at most {MAX_FILTERS} filters are allowed"),
             ParseError::UnbalancedValue(s) => write!(f, "value has unbalanced ~ or (): {s}"),
             ParseError::ValueTooDeep(s) => {
                 write!(f, "value nests groups more than {} deep: {s}", crate::parexp::MAX_DEPTH)
@@ -133,34 +140,40 @@ fn read_options<'a>(scan: &mut Scan<'a>) -> Result<(Option<String>, Vec<Segment>
     let mut filters: Vec<Segment> = Vec::new();
     while scan.eat(b',') {
         let key = scan.take_until(b":,/");
-        if !matches!(key, "enc" | "encoding" | "id") {
+        let spec = FILTERS.iter().find(|(name, _, _)| *name == key);
+        if spec.is_none() && !matches!(key, "enc" | "encoding") {
             return Err(ParseError::UnknownOption(key.to_string()));
         }
         let mut params: Vec<String> = Vec::new();
         while scan.eat(b':') {
-            params.push(scan.take_until(b":,/").to_string());
+            params.push(scan.take_value(b":,/").to_string());
         }
-        let value = match params.as_slice() {
-            [only] if !only.is_empty() => params.swap_remove(0),
-            [] | [_] => return Err(ParseError::EmptyOptionValue(key.to_string())),
-            _ => return Err(ParseError::OptionTakesOneValue(key.to_string())),
-        };
-        validate_value(&value)?;
+        if params.is_empty() || params.iter().any(String::is_empty) {
+            return Err(ParseError::EmptyOptionValue(key.to_string()));
+        }
+        for value in &params {
+            validate_value(value)?;
+        }
         match key {
             "enc" | "encoding" => {
+                let [value] = params.as_slice() else { return Err(ParseError::OptionTakesOneValue(key.to_string())) };
                 if !filters.is_empty() {
                     return Err(ParseError::MisplacedSourceOption(key.to_string()));
                 }
                 if encoding.is_some() {
                     return Err(ParseError::RepeatedOption(key.to_string()));
                 }
-                encoding = Some(value);
+                encoding = Some(value.clone());
             }
             _ => {
-                if filters.iter().any(|f| f.name == key) {
-                    return Err(ParseError::RepeatedOption(key.to_string()));
+                let (_, least, most) = spec.expect("checked above");
+                if !(*least..=*most).contains(&params.len()) {
+                    return Err(ParseError::WrongParameterCount(key.to_string()));
                 }
-                filters.push(Segment { name: key.to_string(), params: vec![value] });
+                if filters.len() == MAX_FILTERS {
+                    return Err(ParseError::TooManyFilters);
+                }
+                filters.push(Segment { name: key.to_string(), params });
             }
         }
     }
@@ -186,6 +199,17 @@ impl<'a> Scan<'a> {
     }
 
     fn take_until(&mut self, stops: &[u8]) -> &'a str {
+        let from = self.at;
+        while let Some(byte) = self.peek() {
+            if stops.contains(&byte) {
+                break;
+            }
+            self.at += 1;
+        }
+        &self.text[from..self.at]
+    }
+
+    fn take_value(&mut self, stops: &[u8]) -> &'a str {
         let from = self.at;
         let mut depth = 0usize;
         let mut in_tilde = false;
@@ -248,7 +272,8 @@ fn resolve_encoding(label: &str) -> Option<String> {
 }
 
 pub fn is_valid_path(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~' | '(' | ')'))
 }
 
 pub fn is_valid_name(s: &str) -> bool {
@@ -335,8 +360,6 @@ mod tests {
     #[case("/@dataset:x,enc.geojson", ParseError::EmptyOptionValue("enc".to_string()))]
     #[case("/@dataset:x,encoding/out.geojson", ParseError::EmptyOptionValue("encoding".to_string()))]
     #[case("/@dataset:x,enc:utf-8:extra.geojson", ParseError::OptionTakesOneValue("enc".to_string()))]
-    #[case("/@dataset:x,id:a:b.geojson", ParseError::OptionTakesOneValue("id".to_string()))]
-    #[case("/@dataset:x,id:a:b:c.geojson", ParseError::OptionTakesOneValue("id".to_string()))]
     #[case("/@dataset:x,id:.geojson", ParseError::EmptyOptionValue("id".to_string()))]
     #[case("/@ds:pts,id:~2/export.geojson", ParseError::UnbalancedValue("~2/export".to_string()))]
     #[case("/@dataset:pts,id:~1,enc:latin1.geojson", ParseError::UnbalancedValue("~1,enc:latin1".to_string()))]
@@ -349,15 +372,8 @@ mod tests {
     )]
     #[case("/@dataset:x,id.geojson", ParseError::EmptyOptionValue("id".to_string()))]
     #[case("/@dataset:x,zzz:1.geojson", ParseError::UnknownOption("zzz".to_string()))]
-    #[case(
-        "/@dataset:gbr:a~b.shp,enc:iso-8859-1.geojson",
-        ParseError::InvalidPath("a~b.shp,enc:iso-8859-1".to_string())
-    )]
-    #[case(
-        "/@dataset:gbr:Zones(final.shp,enc:iso-8859-1.geojson",
-        ParseError::InvalidPath("Zones(final.shp,enc:iso-8859-1".to_string())
-    )]
-    #[case("/@dataset:x,prop:state:CA.geojson", ParseError::UnknownOption("prop".to_string()))]
+    #[case("/@dataset:gbr:a;b.shp.geojson", ParseError::InvalidPath("a;b.shp".to_string()))]
+    #[case("/@dataset:gbr:a b.shp.geojson", ParseError::InvalidPath("a b.shp".to_string()))]
     fn rejects(#[case] url: &str, #[case] expected: ParseError) {
         assert_eq!(parse(url), Err(expected));
     }
@@ -374,6 +390,64 @@ mod tests {
         assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
         assert_eq!(p.filters[0].name, name);
         assert_eq!(p.filters[0].params, params);
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,prop:state:CA.geojson", vec!["state", "CA"])]
+    #[case("/@dataset:x,prop:pop:gt:1000000.geojson", vec!["pop", "gt", "1000000"])]
+    #[case("/@dataset:x,prop:deleted:null.geojson", vec!["deleted", "null"])]
+    #[case("/@dataset:x,prop:name:in:(~A, B~,C).geojson", vec!["name", "in", "(~A, B~,C)"])]
+    fn a_prop_filter_keeps_its_parameters(#[case] url: &str, #[case] params: Vec<&str>) {
+        let p = parse(url).unwrap();
+        assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
+        assert_eq!(p.filters[0].name, "prop");
+        assert_eq!(p.filters[0].params, params);
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,prop:a:1,prop:b:2.geojson")]
+    #[case("/@dataset:x,id:gte:5,id:lte:10.geojson")]
+    #[case("/@dataset:x,id:1,prop:a:2.geojson")]
+    fn filters_may_repeat_and_mix(#[case] url: &str) {
+        assert_eq!(parse(url).unwrap().filters.len(), 2, "{url}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,id:gte:500.geojson", vec!["gte", "500"])]
+    #[case("/@dataset:x,id:lt:1000.geojson", vec!["lt", "1000"])]
+    #[case("/@dataset:x,id:in:(500..1000).geojson", vec!["in", "(500..1000)"])]
+    #[case("/@dataset:x,id:(50..100).geojson", vec!["(50..100)"])]
+    #[case("/@dataset:x,id:50.geojson", vec!["50"])]
+    fn an_id_filter_may_carry_an_operator(#[case] url: &str, #[case] params: Vec<&str>) {
+        let p = parse(url).unwrap();
+        assert_eq!(p.filters[0].name, "id");
+        assert_eq!(p.filters[0].params, params);
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,prop:only.geojson", ParseError::WrongParameterCount("prop".to_string()))]
+    #[case("/@dataset:x,prop:a:b:c:d.geojson", ParseError::WrongParameterCount("prop".to_string()))]
+    #[case("/@dataset:x,id:a:b:c.geojson", ParseError::WrongParameterCount("id".to_string()))]
+    #[case("/@dataset:x,prop.geojson", ParseError::EmptyOptionValue("prop".to_string()))]
+    fn a_filter_takes_the_parameter_count_its_spec_allows(#[case] url: &str, #[case] expected: ParseError) {
+        assert_eq!(parse(url), Err(expected));
+    }
+
+    #[test]
+    fn more_than_fifty_filters_is_rejected() {
+        let many: String = (0..51).map(|i| format!(",prop:k{i}:v")).collect();
+        assert_eq!(parse(&format!("/@dataset:x{many}.geojson")), Err(ParseError::TooManyFilters));
+        let fifty: String = (0..50).map(|i| format!(",prop:k{i}:v")).collect();
+        assert_eq!(parse(&format!("/@dataset:x{fifty}.geojson")).unwrap().filters.len(), 50);
+    }
+
+    #[rstest]
+    #[case("/@dataset:plz:report~final,enc:latin1.geojson")]
+    #[case("/@dataset:plz:file(1,enc:latin1.geojson")]
+    fn a_sub_path_does_not_swallow_the_options_after_it(#[case] url: &str) {
+        let p = parse(url).unwrap();
+        assert!(!p.path.as_deref().unwrap_or_default().contains("enc:"), "the encoding was swallowed: {p:?}");
+        assert_eq!(p.encoding, "ISO-8859-1", "{p:?}");
     }
 
     #[test]
@@ -403,7 +477,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case("/@dataset:x,id:1,id:2.geojson", "id")]
     #[case("/@dataset:x,enc:utf-8,enc:latin1.geojson", "enc")]
     #[case("/@dataset:x,enc:utf-8,encoding:latin1.geojson", "encoding")]
     fn an_option_or_filter_may_appear_only_once(#[case] url: &str, #[case] name: &str) {

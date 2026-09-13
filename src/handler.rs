@@ -168,7 +168,7 @@ mod tests {
         let raw = anyhow::Error::new(crate::filters::FilterError::BadParams("id".to_string()));
         let (status, message) = error_status(&raw, "UTF-8");
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(message, "filter takes exactly one value: id");
+        assert_eq!(message, "filter has the wrong number of parameters: id");
     }
 
     #[test]
