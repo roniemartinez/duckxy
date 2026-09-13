@@ -1,9 +1,9 @@
 use std::fmt;
 
+use crate::grammar::Grammar;
+
 pub const DEFAULT_ENCODING: &str = crate::encodings::UTF8;
 pub const MAX_FILTERS: usize = 50;
-
-const FILTERS: [(&str, usize, usize); 2] = [("id", 1, 2), ("prop", 2, 3)];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
@@ -74,7 +74,7 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
+pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
     let url = url.trim_start_matches('/');
     if url.is_empty() {
         return Err(ParseError::Empty);
@@ -118,7 +118,7 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
         path = Some(trim_filename(value).to_string());
     }
 
-    let (encoding, filters) = read_options(&mut scan)?;
+    let (encoding, filters) = read_options(&mut scan, grammar)?;
 
     if scan.eat(b'/') {
         let name = scan.take_until(b"");
@@ -135,13 +135,13 @@ pub fn parse(url: &str) -> Result<ParsedUrl, ParseError> {
     Ok(ParsedUrl { dataset: name.to_string(), path, encoding, filters, format, extension })
 }
 
-fn read_options<'a>(scan: &mut Scan<'a>) -> Result<(Option<String>, Vec<Segment>), ParseError> {
+fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<String>, Vec<Segment>), ParseError> {
     let mut encoding = None;
     let mut filters: Vec<Segment> = Vec::new();
     while scan.eat(b',') {
         let key = scan.take_until(b":,/");
-        let spec = FILTERS.iter().find(|(name, _, _)| *name == key);
-        if spec.is_none() && !matches!(key, "enc" | "encoding") {
+        let spec = grammar.filter_for(key);
+        if spec.is_none() && !Grammar::RESERVED.contains(&key) {
             return Err(ParseError::UnknownOption(key.to_string()));
         }
         let mut params: Vec<String> = Vec::new();
@@ -155,7 +155,7 @@ fn read_options<'a>(scan: &mut Scan<'a>) -> Result<(Option<String>, Vec<Segment>
             validate_value(value)?;
         }
         match key {
-            "enc" | "encoding" => {
+            _ if Grammar::RESERVED.contains(&key) => {
                 let [value] = params.as_slice() else { return Err(ParseError::OptionTakesOneValue(key.to_string())) };
                 if !filters.is_empty() {
                     return Err(ParseError::MisplacedSourceOption(key.to_string()));
@@ -166,14 +166,14 @@ fn read_options<'a>(scan: &mut Scan<'a>) -> Result<(Option<String>, Vec<Segment>
                 encoding = Some(value.clone());
             }
             _ => {
-                let (_, least, most) = spec.expect("checked above");
-                if !(*least..=*most).contains(&params.len()) {
+                let spec = spec.expect("checked above");
+                if !spec.accepts(params.len()) {
                     return Err(ParseError::WrongParameterCount(key.to_string()));
                 }
                 if filters.len() == MAX_FILTERS {
                     return Err(ParseError::TooManyFilters);
                 }
-                filters.push(Segment { name: key.to_string(), params });
+                filters.push(Segment { name: spec.canonical().to_string(), params });
             }
         }
     }
@@ -290,7 +290,7 @@ mod tests {
     #[case("/@dataset:cities.GeoJSON", "cities", "geojson")]
     #[case("/@dataset:my.data.geojson", "my.data", "geojson")]
     fn parses_dataset_and_format(#[case] url: &str, #[case] dataset: &str, #[case] format: &str) {
-        let p = parse(url).unwrap();
+        let p = parse(url, &Grammar::core()).unwrap();
         assert_eq!(p.dataset, dataset);
         assert_eq!(p.extension, format);
     }
@@ -302,7 +302,7 @@ mod tests {
     #[case("/@dataset:x:a/b/c.shp,encoding:utf-8.geojson", "UTF-8", Some("a/b/c.shp"))]
     #[case("/@dataset:uk:gb.geojson.geojson", "UTF-8", Some("gb.geojson"))]
     fn parses_path_and_options(#[case] url: &str, #[case] encoding: &str, #[case] path: Option<&str>) {
-        let p = parse(url).unwrap();
+        let p = parse(url, &Grammar::core()).unwrap();
         assert_eq!(p.encoding, encoding);
         assert_eq!(p.path.as_deref(), path);
     }
@@ -329,7 +329,7 @@ mod tests {
         #[case] path: Option<&str>,
         #[case] encoding: &str,
     ) {
-        let p = parse(url).unwrap();
+        let p = parse(url, &Grammar::core()).unwrap();
         assert_eq!(p.dataset, dataset);
         assert_eq!(p.path.as_deref(), path);
         assert_eq!(p.encoding, encoding);
@@ -341,7 +341,7 @@ mod tests {
     #[case("/@ds:x,enc:iso-8859-1/out.geojson", "/@dataset:x,enc:iso-8859-1/out.geojson")]
     #[case("/@ds:uk:gb.geojson/download.geojson", "/@dataset:uk:gb.geojson/download.geojson")]
     fn the_short_source_prefix_parses_the_same(#[case] short: &str, #[case] long: &str) {
-        assert_eq!(parse(short).unwrap(), parse(long).unwrap());
+        assert_eq!(parse(short, &Grammar::core()).unwrap(), parse(long, &Grammar::core()).unwrap());
     }
 
     #[rstest]
@@ -375,7 +375,7 @@ mod tests {
     #[case("/@dataset:gbr:a;b.shp.geojson", ParseError::InvalidPath("a;b.shp".to_string()))]
     #[case("/@dataset:gbr:a b.shp.geojson", ParseError::InvalidPath("a b.shp".to_string()))]
     fn rejects(#[case] url: &str, #[case] expected: ParseError) {
-        assert_eq!(parse(url), Err(expected));
+        assert_eq!(parse(url, &Grammar::core()), Err(expected));
     }
 
     #[rstest]
@@ -386,7 +386,7 @@ mod tests {
     #[case("/@dataset:x,id:((1,2),(3,4)).geojson", "id", vec!["((1,2),(3,4))"])]
     #[case("/@dataset:x,id:file-(1..3).txt.geojson", "id", vec!["file-(1..3).txt"])]
     fn a_filter_is_one_segment(#[case] url: &str, #[case] name: &str, #[case] params: Vec<&str>) {
-        let p = parse(url).unwrap();
+        let p = parse(url, &Grammar::core()).unwrap();
         assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
         assert_eq!(p.filters[0].name, name);
         assert_eq!(p.filters[0].params, params);
@@ -398,7 +398,7 @@ mod tests {
     #[case("/@dataset:x,prop:deleted:null.geojson", vec!["deleted", "null"])]
     #[case("/@dataset:x,prop:name:in:(~A, B~,C).geojson", vec!["name", "in", "(~A, B~,C)"])]
     fn a_prop_filter_keeps_its_parameters(#[case] url: &str, #[case] params: Vec<&str>) {
-        let p = parse(url).unwrap();
+        let p = parse(url, &Grammar::core()).unwrap();
         assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
         assert_eq!(p.filters[0].name, "prop");
         assert_eq!(p.filters[0].params, params);
@@ -409,7 +409,7 @@ mod tests {
     #[case("/@dataset:x,id:gte:5,id:lte:10.geojson")]
     #[case("/@dataset:x,id:1,prop:a:2.geojson")]
     fn filters_may_repeat_and_mix(#[case] url: &str) {
-        assert_eq!(parse(url).unwrap().filters.len(), 2, "{url}");
+        assert_eq!(parse(url, &Grammar::core()).unwrap().filters.len(), 2, "{url}");
     }
 
     #[rstest]
@@ -419,7 +419,7 @@ mod tests {
     #[case("/@dataset:x,id:(50..100).geojson", vec!["(50..100)"])]
     #[case("/@dataset:x,id:50.geojson", vec!["50"])]
     fn an_id_filter_may_carry_an_operator(#[case] url: &str, #[case] params: Vec<&str>) {
-        let p = parse(url).unwrap();
+        let p = parse(url, &Grammar::core()).unwrap();
         assert_eq!(p.filters[0].name, "id");
         assert_eq!(p.filters[0].params, params);
     }
@@ -430,22 +430,22 @@ mod tests {
     #[case("/@dataset:x,id:a:b:c.geojson", ParseError::WrongParameterCount("id".to_string()))]
     #[case("/@dataset:x,prop.geojson", ParseError::EmptyOptionValue("prop".to_string()))]
     fn a_filter_takes_the_parameter_count_its_spec_allows(#[case] url: &str, #[case] expected: ParseError) {
-        assert_eq!(parse(url), Err(expected));
+        assert_eq!(parse(url, &Grammar::core()), Err(expected));
     }
 
     #[test]
     fn more_than_fifty_filters_is_rejected() {
         let many: String = (0..51).map(|i| format!(",prop:k{i}:v")).collect();
-        assert_eq!(parse(&format!("/@dataset:x{many}.geojson")), Err(ParseError::TooManyFilters));
+        assert_eq!(parse(&format!("/@dataset:x{many}.geojson"), &Grammar::core()), Err(ParseError::TooManyFilters));
         let fifty: String = (0..50).map(|i| format!(",prop:k{i}:v")).collect();
-        assert_eq!(parse(&format!("/@dataset:x{fifty}.geojson")).unwrap().filters.len(), 50);
+        assert_eq!(parse(&format!("/@dataset:x{fifty}.geojson"), &Grammar::core()).unwrap().filters.len(), 50);
     }
 
     #[rstest]
     #[case("/@dataset:plz:report~final,enc:latin1.geojson")]
     #[case("/@dataset:plz:file(1,enc:latin1.geojson")]
     fn a_sub_path_does_not_swallow_the_options_after_it(#[case] url: &str) {
-        let p = parse(url).unwrap();
+        let p = parse(url, &Grammar::core()).unwrap();
         assert!(!p.path.as_deref().unwrap_or_default().contains("enc:"), "the encoding was swallowed: {p:?}");
         assert_eq!(p.encoding, "ISO-8859-1", "{p:?}");
     }
@@ -453,25 +453,29 @@ mod tests {
     #[test]
     fn a_deeply_nested_value_is_refused_before_anything_recurses() {
         let deep = format!("/@dataset:x,id:{}x{}.geojson", "(".repeat(5000), ")".repeat(5000));
-        assert!(matches!(parse(&deep), Err(ParseError::ValueTooDeep(_))), "{:?}", parse(&deep));
+        assert!(
+            matches!(parse(&deep, &Grammar::core()), Err(ParseError::ValueTooDeep(_))),
+            "{:?}",
+            parse(&deep, &Grammar::core())
+        );
     }
 
     #[test]
     fn nesting_up_to_the_limit_is_accepted() {
         let ok = format!("/@dataset:x,id:{}a,b{}.geojson", "(".repeat(32), ")".repeat(32));
-        assert!(parse(&ok).is_ok(), "{:?}", parse(&ok));
+        assert!(parse(&ok, &Grammar::core()).is_ok(), "{:?}", parse(&ok, &Grammar::core()));
     }
 
     #[test]
     fn an_encoding_comes_before_a_filter_and_not_after() {
-        let p = parse("/@dataset:plz,enc:utf-8,id:2257.geojson").unwrap();
+        let p = parse("/@dataset:plz,enc:utf-8,id:2257.geojson", &Grammar::core()).unwrap();
         assert_eq!(p.encoding, "UTF-8");
         assert_eq!(p.filters.len(), 1, "encoding was collected as a filter: {:?}", p.filters);
         assert_eq!(p.filters[0].name, "id");
         assert_eq!(p.filters[0].params, ["2257"]);
 
         assert_eq!(
-            parse("/@dataset:plz,id:2257,enc:utf-8.geojson"),
+            parse("/@dataset:plz,id:2257,enc:utf-8.geojson", &Grammar::core()),
             Err(ParseError::MisplacedSourceOption("enc".to_string()))
         );
     }
@@ -480,6 +484,6 @@ mod tests {
     #[case("/@dataset:x,enc:utf-8,enc:latin1.geojson", "enc")]
     #[case("/@dataset:x,enc:utf-8,encoding:latin1.geojson", "encoding")]
     fn an_option_or_filter_may_appear_only_once(#[case] url: &str, #[case] name: &str) {
-        assert_eq!(parse(url), Err(ParseError::RepeatedOption(name.to_string())));
+        assert_eq!(parse(url, &Grammar::core()), Err(ParseError::RepeatedOption(name.to_string())));
     }
 }

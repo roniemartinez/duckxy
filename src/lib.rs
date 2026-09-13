@@ -3,6 +3,7 @@ pub mod dataset;
 mod encodings;
 pub mod filters;
 pub mod formats;
+pub mod grammar;
 pub mod handler;
 pub mod parexp;
 pub mod query;
@@ -12,6 +13,7 @@ pub mod sql;
 pub mod url;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::FromRef;
@@ -83,12 +85,7 @@ pub fn resolve_error(e: ResolveError) -> Response {
 pub struct AppState {
     pub root: DatasetRoot,
     pub auth: Auth,
-}
-
-impl FromRef<AppState> for DatasetRoot {
-    fn from_ref(state: &AppState) -> Self {
-        state.root.clone()
-    }
+    pub grammar: Arc<grammar::Grammar>,
 }
 
 impl FromRef<AppState> for Auth {

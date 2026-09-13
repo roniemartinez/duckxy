@@ -6,18 +6,18 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::SignedPath;
-use crate::dataset::DatasetRoot;
-use crate::{CHANNEL_DEPTH, error, query, resolve_error, url};
+use crate::{AppState, CHANNEL_DEPTH, error, query, resolve_error, url};
 
 const GEOMETRY_FAILURES: [&str; 3] = ["TopologyException", "IllegalArgumentException", "AssertionFailedException"];
 const UNREADABLE_SOURCE: &str = "Could not open GDAL dataset";
 
-pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPath) -> Response {
-    let parsed = match url::parse(&path) {
+pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath) -> Response {
+    let parsed = match url::parse(&path, &state.grammar) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
     };
 
+    let root = state.root;
     let format = parsed.format;
     let render = crate::render::Render::of(format);
     let download = format!("{}.{}", parsed.dataset, parsed.extension);
