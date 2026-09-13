@@ -30,7 +30,7 @@ impl fmt::Display for FilterError {
                 write!(f, "source has no id column, expected one of: {}", ID_CANDIDATES.join(", "))
             }
             FilterError::UnknownFilter(name) => write!(f, "unknown filter: {name}"),
-            FilterError::BadParams(name) => write!(f, "filter takes exactly one value: {name}"),
+            FilterError::BadParams(name) => write!(f, "filter has the wrong number of parameters: {name}"),
             FilterError::ExpansionTooLarge(pattern) => {
                 write!(f, "pattern expands past the limit of {} values: {pattern}", parexp::MAX_EXPANSION)
             }
@@ -63,7 +63,11 @@ pub fn condition(filters: &[Segment], columns: &[(String, String)]) -> Result<Op
 }
 
 fn numeric_kind(kind: &str) -> Option<NumericKind> {
-    match kind.split('(').next().unwrap_or(kind) {
+    let (name, width) = kind.split_once('(').unwrap_or((kind, ""));
+    if !width.is_empty() && !width.ends_with(')') {
+        return None;
+    }
+    match name {
         "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT" | "UINTEGER"
         | "UBIGINT" | "UHUGEINT" => Some(NumericKind::Integer),
         "DECIMAL" | "NUMERIC" => Some(NumericKind::Exact),
@@ -127,22 +131,37 @@ fn compare((name, kind): &(String, String), params: &[String], filter: &str) -> 
 }
 
 fn value_set(column: impl Fn() -> SimpleExpr, kind: &str, pattern: &str) -> Result<SimpleExpr, FilterError> {
-    if numeric_kind(kind).is_some()
-        && let Some((lo, hi)) = parexp::as_integer_range(pattern)
-    {
+    let numeric = numeric_kind(kind).is_some();
+    if numeric && let Some((lo, hi)) = parexp::as_integer_range(pattern) {
         return Ok(column().between(lo, hi));
     }
     if parexp::count(pattern) > parexp::MAX_EXPANSION {
         return Err(FilterError::ExpansionTooLarge(pattern.to_string()));
     }
-    if let [only] = parexp::expand(pattern).as_slice() {
-        return Ok(text(column()).eq(only.as_str()));
+    let values = parexp::expand(pattern);
+    if numeric && let Some(bad) = values.iter().find(|value| numeral(value).is_none()) {
+        return Err(FilterError::NotANumber(bad.clone()));
     }
+    let compared = || match numeric {
+        true => column(),
+        false => text(column()),
+    };
+    if let [only] = values.as_slice() {
+        return Ok(match numeric {
+            true => compared().eq(Expr::cust(only.to_string())),
+            false => compared().eq(only.as_str()),
+        });
+    }
+    let member = || match numeric {
+        true => Expr::cust_with_exprs(format!("TRY_CAST($1 AS {kind})"), [Expr::col(Alias::new("v"))]),
+        false => Expr::col(Alias::new("v")),
+    };
     let expansion = Query::select()
-        .column(Alias::new("v"))
+        .expr(member())
         .from_function(Func::cust("parexp").arg(pattern), Alias::new("expanded"))
+        .and_where_option(numeric.then(|| member().is_not_null()))
         .take();
-    Ok(text(column()).in_subquery(expansion))
+    Ok(compared().in_subquery(expansion))
 }
 
 fn ordering(
@@ -200,6 +219,11 @@ mod tests {
 
     fn sql(filters: &[Segment]) -> String {
         render(filters, &columns())
+    }
+
+    fn text_sql(filters: &[Segment]) -> String {
+        let cols = vec![("id".to_string(), "VARCHAR".to_string())];
+        render(filters, &cols)
     }
 
     fn executes(params: &[&str], kind: &str, row: &str) -> Result<bool, String> {
@@ -277,10 +301,82 @@ mod tests {
     #[case("1e400", "'1e400'")]
     #[case("9007199254740993", "'9007199254740993'")]
     fn every_value_is_compared_as_exact_text(#[case] value: &str, #[case] literal: &str) {
-        let out = sql(&[seg(&[value])]);
+        let out = text_sql(&[seg(&[value])]);
         assert!(out.contains(&format!("CAST(\"id\" AS VARCHAR) = {literal}")), "{out}");
         assert!(!out.contains("TRY_CAST"), "a value took a numeric path: {out}");
         assert!(!out.contains(" OR "), "an id lookup must match one spelling only: {out}");
+    }
+
+    #[rstest]
+    #[case("BIGINT", "1::BIGINT AS v", &["v", "eq", "01"], true)]
+    #[case("BIGINT", "1::BIGINT AS v", &["v", "ne", "01"], false)]
+    #[case("BIGINT", "1::BIGINT AS v", &["v", "in", "(01,99)"], true)]
+    #[case("BIGINT", "1::BIGINT AS v", &["v", "nin", "(01,99)"], false)]
+    #[case("BIGINT", "1::BIGINT AS v", &["v", "nin", "(2,99)"], true)]
+    #[case("UBIGINT", "18446744073709551615::UBIGINT AS v", &["v", "eq", "18446744073709551615"], true)]
+    #[case("DECIMAL(18,3)", "1.5::DECIMAL(18,3) AS v", &["v", "eq", "1.5"], true)]
+    #[case("DECIMAL(18,3)", "1.5::DECIMAL(18,3) AS v", &["v", "eq", "1.500"], true)]
+    #[case("DECIMAL(18,3)", "1.5::DECIMAL(18,3) AS v", &["v", "in", "(1.5,9)"], true)]
+    #[case("DOUBLE", "1.5::DOUBLE AS v", &["v", "eq", "1.50"], true)]
+    #[case("BIGINT", "1::BIGINT AS v", &["v", "eq", "2"], false)]
+    #[case("BIGINT", "1::BIGINT AS v", &["v", "in", "(2,99)"], false)]
+    fn a_numeric_column_compares_by_value_not_by_spelling(
+        #[case] kind: &str,
+        #[case] row: &str,
+        #[case] params: &[&str],
+        #[case] expected: bool,
+    ) {
+        match executes(params, kind, row) {
+            Ok(matched) => assert_eq!(matched, expected, "{kind} {params:?}"),
+            Err(e) => panic!("{kind} {params:?} produced invalid sql: {e}"),
+        }
+    }
+
+    #[rstest]
+    #[case("DECIMAL(18,3)[]", "[1.5]::DECIMAL(18,3)[] AS v", &["v", "eq", "1.5"])]
+    #[case("DECIMAL(18,3)[]", "[1.5]::DECIMAL(18,3)[] AS v", &["v", "gt", "1"])]
+    #[case("DECIMAL(18,3)[]", "[1.5]::DECIMAL(18,3)[] AS v", &["v", "in", "(1..3)"])]
+    #[case("BIGINT[]", "[1]::BIGINT[] AS v", &["v", "eq", "1"])]
+    #[case("STRUCT(a DECIMAL(18,3))", "{'a': 1.5}::STRUCT(a DECIMAL(18,3)) AS v", &["v", "eq", "1.5"])]
+    fn a_column_that_merely_contains_a_number_is_not_numeric(
+        #[case] kind: &str,
+        #[case] row: &str,
+        #[case] p: &[&str],
+    ) {
+        match executes(p, kind, row) {
+            Ok(_) => {}
+            Err(e) => panic!("{kind} {p:?} produced invalid sql: {e}"),
+        }
+    }
+
+    #[rstest]
+    #[case(&["v", "null"], true)]
+    #[case(&["v", "notnull"], false)]
+    #[case(&["v", "eq", "alpha"], false)]
+    #[case(&["v", "ne", "alpha"], false)]
+    #[case(&["v", "in", "(alpha,beta)"], false)]
+    #[case(&["v", "nin", "(alpha,beta)"], false)]
+    fn a_null_never_matches_a_comparison(#[case] params: &[&str], #[case] expected: bool) {
+        match executes(params, "VARCHAR", "NULL::VARCHAR AS v") {
+            Ok(matched) => assert_eq!(matched, expected, "{params:?}"),
+            Err(e) => panic!("{params:?} produced invalid sql: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_value_past_the_column_range_is_no_match_not_an_error() {
+        let too_big = &["v", "nin", "(999999999999999999999999,2)"];
+        assert_eq!(executes(too_big, "BIGINT", "1::BIGINT AS v"), Ok(true));
+    }
+
+    #[rstest]
+    #[case("CA")]
+    #[case("' OR 1=1 --")]
+    #[case("1e400")]
+    #[case("(a,b)")]
+    fn a_numeric_column_refuses_a_value_that_is_not_a_number(#[case] value: &str) {
+        let outcome = condition(&[seg(&[value])], &columns());
+        assert!(matches!(outcome, Err(FilterError::NotANumber(_))), "{outcome:?}");
     }
 
     #[rstest]
@@ -288,7 +384,7 @@ mod tests {
     #[case("~a:b~", "'a:b'")]
     #[case("plain", "'plain'")]
     fn tilde_quoting_is_stripped(#[case] value: &str, #[case] needle: &str) {
-        assert!(sql(&[seg(&[value])]).contains(needle));
+        assert!(text_sql(&[seg(&[value])]).contains(needle));
     }
 
     #[rstest]
@@ -297,7 +393,7 @@ mod tests {
     #[case(vec![("ObjectID".to_string(), "BIGINT".to_string())], true)]
     #[case(vec![("name".to_string(), "VARCHAR".to_string())], false)]
     fn id_finds_its_column_case_insensitively(#[case] cols: Vec<(String, String)>, #[case] found: bool) {
-        let outcome = condition(&[seg(&["A"])], &cols);
+        let outcome = condition(&[seg(&["1"])], &cols);
         assert_eq!(outcome.is_ok(), found, "{outcome:?}");
         if !found {
             assert_eq!(outcome.unwrap_err(), FilterError::NoIdColumn);
@@ -307,7 +403,7 @@ mod tests {
     #[test]
     fn id_prefers_id_over_the_other_candidates() {
         let cols = vec![("fid".to_string(), "BIGINT".to_string()), ("id".to_string(), "BIGINT".to_string())];
-        let out = render(&[seg(&["A"])], &cols);
+        let out = render(&[seg(&["1"])], &cols);
         assert!(out.contains("\"id\""), "{out}");
         assert!(!out.contains("\"fid\""), "{out}");
     }
@@ -344,7 +440,7 @@ mod tests {
     #[case("(a..d)")]
     #[case("(1..10..2)")]
     fn a_group_expands_through_the_table_function(#[case] value: &str) {
-        let out = sql(&[seg(&[value])]);
+        let out = text_sql(&[seg(&[value])]);
         assert!(out.contains("parexp("), "{out}");
         assert!(!out.contains("BETWEEN"), "{out}");
         assert!(out.len() < 400, "the expansion leaked into sql text, {} bytes", out.len());
@@ -370,8 +466,14 @@ mod tests {
     #[case("(-5..10)")]
     #[case("(+5..10)")]
     fn a_padded_signed_or_fractional_range_does_not_take_the_numeric_path(#[case] value: &str) {
-        let out = sql(&[seg(&[value])]);
-        assert!(!out.contains("BETWEEN"), "{out}");
+        match condition(&[seg(&[value])], &columns()) {
+            Ok(expr) => {
+                let out =
+                    Query::select().expr(Expr::cust("1")).and_where(expr.unwrap()).to_string(PostgresQueryBuilder);
+                assert!(!out.contains("BETWEEN"), "{out}");
+            }
+            Err(e) => assert!(matches!(e, FilterError::NotANumber(_)), "{e:?}"),
+        }
     }
 
     #[rstest]
@@ -401,10 +503,11 @@ mod tests {
     #[case("x'); DROP TABLE t; --")]
     #[case("1' UNION SELECT 'x")]
     fn duckdb_executes_a_hostile_value_as_data(#[case] value: &str) {
-        let expr = condition(&[seg(&[value])], &columns()).unwrap().unwrap();
+        let cols = vec![("id".to_string(), "VARCHAR".to_string())];
+        let expr = condition(&[seg(&[value])], &cols).unwrap().unwrap();
         let out = Query::select()
             .expr(Expr::cust("1"))
-            .from_subquery(Query::select().expr(Expr::cust("42 AS id")).take(), Alias::new("t"))
+            .from_subquery(Query::select().expr(Expr::cust("'42' AS id")).take(), Alias::new("t"))
             .and_where(expr)
             .to_string(PostgresQueryBuilder);
         let conn = duckdb::Connection::open_in_memory().unwrap();

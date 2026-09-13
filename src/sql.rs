@@ -85,6 +85,6 @@ mod tests {
         let filters = vec![Segment { name: "id".to_string(), params: vec!["7".to_string()] }];
         let out = build_sql("/x.geojson", "UTF-8", &filters, Format::GeoJson, &columns).unwrap();
         assert!(out.contains("\"filtered\""), "{out}");
-        assert!(out.contains("CAST(\"id\" AS VARCHAR) = '7'"), "{out}");
+        assert!(out.contains("WHERE \"id\" = (7)"), "{out}");
     }
 }
