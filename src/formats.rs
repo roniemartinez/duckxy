@@ -1,9 +1,10 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Format {
     GeoJson,
+    Json,
 }
 
-const EXTENSIONS: &[(&str, Format)] = &[("geojson", Format::GeoJson), ("json", Format::GeoJson)];
+const EXTENSIONS: &[(&str, Format)] = &[("geojson", Format::GeoJson), ("json", Format::Json)];
 
 impl Format {
     pub fn from_extension(ext: &str) -> Option<Self> {
@@ -20,27 +21,31 @@ impl Format {
             .map(|(ext, format)| (&segment[..segment.len() - ext.len() - 1], *ext, *format))
     }
 
+    pub fn requires_wgs84(self) -> bool {
+        matches!(self, Self::GeoJson | Self::Json)
+    }
+
     pub fn content_type(self) -> &'static str {
         match self {
-            Self::GeoJson => "application/geo+json",
+            Self::GeoJson | Self::Json => "application/geo+json",
         }
     }
 
     pub fn header(self) -> &'static str {
         match self {
-            Self::GeoJson => r#"{"type":"FeatureCollection","features":["#,
+            Self::GeoJson | Self::Json => r#"{"type":"FeatureCollection","features":["#,
         }
     }
 
     pub fn footer(self) -> &'static str {
         match self {
-            Self::GeoJson => "]}",
+            Self::GeoJson | Self::Json => "]}",
         }
     }
 
     pub fn separator(self) -> &'static str {
         match self {
-            Self::GeoJson => ",",
+            Self::GeoJson | Self::Json => ",",
         }
     }
 }
@@ -51,10 +56,11 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    #[case("json")]
-    #[case("geojson")]
-    fn both_extensions_produce_geojson(#[case] ext: &str) {
-        assert_eq!(Format::from_extension(ext), Some(Format::GeoJson));
+    #[case("geojson", Format::GeoJson)]
+    #[case("json", Format::Json)]
+    fn each_json_suffix_is_its_own_format_but_serves_geojson(#[case] ext: &str, #[case] expected: Format) {
+        assert_eq!(Format::from_extension(ext), Some(expected));
+        assert_eq!(expected.content_type(), "application/geo+json");
     }
 
     #[rstest]

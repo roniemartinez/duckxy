@@ -1,7 +1,14 @@
 use crate::formats::Format;
 use crate::url::Segment;
 use crate::{filters, query};
-use sea_query::{Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, WithClause};
+use sea_query::{Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, SelectStatement, WithClause};
+
+fn add_step(ctes: &mut WithClause, steps: &mut usize, query: SelectStatement) -> Alias {
+    *steps += 1;
+    let name = Alias::new(format!("step_{steps}"));
+    ctes.cte(CommonTableExpression::new().query(query).table_name(name.clone()).to_owned());
+    name
+}
 
 pub fn build_sql(
     source: &str,
@@ -9,10 +16,12 @@ pub fn build_sql(
     filters: &[Segment],
     format: Format,
     columns: &[(String, String)],
+    crs: Option<&str>,
 ) -> anyhow::Result<String> {
     let geometry = query::geometry_of(columns).ok_or(query::NoGeometry)?;
     let mut ctes = WithClause::new();
     let mut input = Alias::new("source");
+    let mut steps = 0;
     ctes.cte(
         CommonTableExpression::new()
             .query(
@@ -24,8 +33,26 @@ pub fn build_sql(
 
     if let Some(predicate) = filters::condition(filters, columns)? {
         let filtered = Query::select().expr(Expr::cust("*")).from(input.clone()).and_where(predicate).take();
-        input = Alias::new("filtered");
-        ctes.cte(CommonTableExpression::new().query(filtered).table_name(input.clone()).to_owned());
+        input = add_step(&mut ctes, &mut steps, filtered);
+    }
+
+    if let Some(from) = crs.filter(|c| format.requires_wgs84() && !matches!(*c, "EPSG:4326" | "OGC:CRS84")) {
+        let reprojected = Query::select()
+            .expr(Expr::cust_with_exprs(
+                "* REPLACE ($1 AS $2)",
+                [
+                    Func::cust("ST_Transform")
+                        .arg(Expr::col(Alias::new(geometry)))
+                        .arg(from)
+                        .arg("EPSG:4326")
+                        .arg(Expr::cust("always_xy := true"))
+                        .into(),
+                    Expr::col(Alias::new(geometry)),
+                ],
+            ))
+            .from(input.clone())
+            .take();
+        input = add_step(&mut ctes, &mut steps, reprojected);
     }
 
     let replaced = Query::select()
@@ -35,11 +62,10 @@ pub fn build_sql(
         ))
         .from(input.clone())
         .take();
-    input = Alias::new("step_1");
-    ctes.cte(CommonTableExpression::new().query(replaced).table_name(input.clone()).to_owned());
+    input = add_step(&mut ctes, &mut steps, replaced);
 
     Ok(match format {
-        Format::GeoJson => Query::select()
+        Format::GeoJson | Format::Json => Query::select()
             .expr(Func::cast_as(
                 Func::cust("json_object").args([
                     Expr::val("type"),
@@ -68,23 +94,23 @@ mod tests {
     #[test]
     fn build_sql_without_a_geometry_column_errors_rather_than_panics() {
         let columns = vec![("id".to_string(), "BIGINT".to_string())];
-        let err = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns).unwrap_err();
+        let err = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None).unwrap_err();
         assert!(err.downcast_ref::<query::NoGeometry>().is_some(), "{err:#}");
     }
 
     #[test]
-    fn an_unfiltered_request_adds_no_cte() {
+    fn an_unfiltered_request_adds_no_filter_step() {
         let columns = vec![("name".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let out = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns).unwrap();
-        assert!(!out.contains("filtered"), "an empty filter list added a cte: {out}");
+        let out = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None).unwrap();
+        assert!(!out.contains("WHERE"), "an empty filter list added a predicate: {out}");
     }
 
     #[test]
-    fn a_filtered_request_adds_one_cte() {
+    fn a_filtered_request_is_the_first_numbered_step() {
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let filters = vec![Segment { name: "id".to_string(), params: vec!["7".to_string()] }];
-        let out = build_sql("/x.geojson", "UTF-8", &filters, Format::GeoJson, &columns).unwrap();
-        assert!(out.contains("\"filtered\""), "{out}");
-        assert!(out.contains("WHERE \"id\" = (7)"), "{out}");
+        let out = build_sql("/x.geojson", "UTF-8", &filters, Format::GeoJson, &columns, None).unwrap();
+        assert!(out.contains("\"step_1\" AS (SELECT * FROM \"source\" WHERE"), "{out}");
+        assert!(out.contains("\"id\" = (7)"), "{out}");
     }
 }

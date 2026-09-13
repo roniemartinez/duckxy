@@ -1,7 +1,7 @@
 use crate::formats::Format;
 use anyhow::{Context, Result};
 use duckdb::Connection;
-use sea_query::{Expr, Func, FunctionCall, PostgresQueryBuilder, Query};
+use sea_query::{Alias, Expr, Func, FunctionCall, PostgresQueryBuilder, Query};
 use std::cell::RefCell;
 
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -102,14 +102,18 @@ pub fn run(
     source: &str,
     encoding: &str,
     format: Format,
-    sql_for: impl FnOnce(&[(String, String)]) -> Result<String>,
+    sql_for: impl FnOnce(&[(String, String)], Option<&str>) -> Result<String>,
     on_ready: impl FnOnce(),
     sink: &mut dyn FnMut(String) -> bool,
 ) -> Result<()> {
     with_connection(|conn| {
         let columns = describe(conn, source, encoding)?;
         geometry_of(&columns).ok_or(NoGeometry)?;
-        let sql = sql_for(&columns)?;
+        let crs = source_crs(conn, source).unwrap_or_else(|e| {
+            tracing::warn!(error = ?e, "could not read the source crs, serving it unprojected");
+            None
+        });
+        let sql = sql_for(&columns, crs.as_deref())?;
 
         let mut stmt = conn.prepare(&sql).context("prepare query")?;
         let mut rows = stmt.query([]).context("run query")?;
@@ -135,6 +139,32 @@ pub fn run(
         }
         Ok(())
     })
+}
+
+fn source_crs(conn: &Connection, source: &str) -> Result<Option<String>> {
+    let fields = Query::select()
+        .expr_as(Expr::cust("unnest(layers).geometry_fields[1].crs"), Alias::new("crs"))
+        .from_function(Func::cust("ST_Read_Meta").arg(source), "meta")
+        .take();
+    let authority = Expr::cust_with_exprs(
+        "$1 || ':' || $2",
+        [
+            Func::cust("nullif").arg(Expr::cust("crs.auth_name")).arg("").into(),
+            Func::cust("nullif").arg(Expr::cust("crs.auth_code")).arg("").into(),
+        ],
+    );
+    let sql = Query::select()
+        .expr(Func::coalesce([authority, Func::cust("nullif").arg(Expr::cust("crs.wkt")).arg("").into()]))
+        .from_subquery(fields, "meta_crs")
+        .limit(1)
+        .to_string(PostgresQueryBuilder);
+
+    let mut stmt = conn.prepare(&sql).context("read source crs")?;
+    let mut rows = stmt.query([]).context("read source crs")?;
+    match rows.next().context("read source crs")? {
+        Some(row) => row.get::<_, Option<String>>(0).context("read source crs"),
+        None => Ok(None),
+    }
 }
 
 pub fn describe(conn: &Connection, source: &str, encoding: &str) -> Result<Vec<(String, String)>> {
@@ -193,7 +223,7 @@ mod tests {
             source,
             crate::url::DEFAULT_ENCODING,
             f,
-            |c| crate::sql::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c),
+            |c, crs| crate::sql::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -228,7 +258,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             Format::GeoJson,
-            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -287,7 +317,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             Format::GeoJson,
-            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs),
             || panic!("a source with no geometry must not reach the ready signal"),
             &mut |_| true,
         )
@@ -398,7 +428,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f,
-            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
             || {},
             &mut |_| {
                 stopped_after += 1;
@@ -413,7 +443,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f,
-            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
             || {},
             &mut |_| {
                 chunks += 1;
@@ -451,5 +481,63 @@ mod tests {
     fn geometry_of_returns_none_without_a_geometry_column() {
         let columns = vec![("id".to_string(), "BIGINT".to_string())];
         assert_eq!(geometry_of(&columns), None);
+    }
+
+    fn shapefile(tag: &str, srs: Option<&str>) -> String {
+        crate::ensure_spatial();
+        let dir = std::env::temp_dir().join(format!("duckxy-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let shp = dir.join("f.shp");
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("LOAD spatial;").unwrap();
+        let projection = srs.map(|s| format!(", SRS '{s}'")).unwrap_or_default();
+        conn.execute_batch(&format!(
+            "COPY (SELECT ST_Point(500000, 5761038.212466577) AS geom, 1 AS id) TO '{}' \
+             WITH (FORMAT GDAL, DRIVER 'ESRI Shapefile'{projection})",
+            shp.display()
+        ))
+        .unwrap();
+        if srs.is_none() {
+            let _ = fs::remove_file(dir.join("f.prj"));
+        }
+        shp.to_str().unwrap().to_string()
+    }
+
+    #[rstest::rstest]
+    #[case("projected", Some("EPSG:25832"), 9.0, 52.0)]
+    #[case("nocrs", None, 500000.0, 5761038.212466577)]
+    fn a_source_reaches_geojson_in_wgs84_only_when_its_crs_is_known(
+        #[case] tag: &str,
+        #[case] srs: Option<&str>,
+        #[case] lon: f64,
+        #[case] lat: f64,
+    ) {
+        let body = collect(&shapefile(tag, srs), "geojson");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{body} ({e})"));
+        let c = &v["features"][0]["geometry"]["coordinates"];
+        assert!((c[0].as_f64().unwrap() - lon).abs() < 1e-6, "x is {c}, expected {lon}");
+        assert!((c[1].as_f64().unwrap() - lat).abs() < 1e-6, "y is {c}, expected {lat}");
+    }
+
+    #[test]
+    fn a_crs_without_an_authority_code_is_still_reprojected() {
+        let src = shapefile("customprj", None);
+        let prj = std::path::Path::new(&src).with_extension("prj");
+        fs::write(
+            &prj,
+            "PROJCS[\"custom\",GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],\
+             PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]],PROJECTION[\"Transverse_Mercator\"],\
+             PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",9],PARAMETER[\"scale_factor\",0.9996],\
+             PARAMETER[\"false_easting\",500000],PARAMETER[\"false_northing\",0],UNIT[\"metre\",1]]",
+        )
+        .unwrap();
+
+        let body = collect(&src, "geojson");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{body} ({e})"));
+        let c = &v["features"][0]["geometry"]["coordinates"];
+        assert!((c[0].as_f64().unwrap() - 9.0).abs() < 1e-6, "not reprojected, x is {c}");
+        assert!((c[1].as_f64().unwrap() - 52.0).abs() < 1e-6, "not reprojected, y is {c}");
     }
 }
