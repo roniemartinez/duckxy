@@ -1,4 +1,3 @@
-use crate::formats::Format;
 use anyhow::{Context, Result};
 use duckdb::Connection;
 use sea_query::{Alias, Expr, Func, FunctionCall, PostgresQueryBuilder, Query};
@@ -101,7 +100,7 @@ pub fn read_source(source: &str, encoding: &str) -> FunctionCall {
 pub fn run(
     source: &str,
     encoding: &str,
-    format: Format,
+    separator: &str,
     sql_for: impl FnOnce(&[(String, String)], Option<&str>) -> Result<String>,
     on_ready: impl FnOnce(),
     sink: &mut dyn FnMut(String) -> bool,
@@ -125,7 +124,7 @@ pub fn run(
         while let Some(row) = rows.next().context("read row")? {
             let Some(text) = row.get::<_, Option<String>>(0).context("read row")? else { continue };
             if !first {
-                buf.push_str(format.separator());
+                buf.push_str(separator);
             }
             first = false;
             buf.push_str(&text);
@@ -218,11 +217,12 @@ mod tests {
     fn collect(source: &str, ext: &str) -> String {
         crate::ensure_spatial();
         let f = Format::from_extension(ext).unwrap();
-        let mut out = String::from(f.header());
+        let r = crate::render::Render::of(f);
+        let mut out = String::from(r.header);
         run(
             source,
             crate::url::DEFAULT_ENCODING,
-            f,
+            r.separator,
             |c, crs| crate::sql::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
             || {},
             &mut |chunk| {
@@ -231,7 +231,7 @@ mod tests {
             },
         )
         .unwrap();
-        out.push_str(f.footer());
+        out.push_str(r.footer);
         out
     }
 
@@ -253,11 +253,12 @@ mod tests {
         .unwrap();
 
         let src = crate::dataset::DatasetRoot::new(dir).resolve("ds", None).unwrap();
-        let mut out = String::from(Format::GeoJson.header());
+        let r = crate::render::Render::of(Format::GeoJson);
+        let mut out = String::from(r.header);
         run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            Format::GeoJson,
+            r.separator,
             |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs),
             || {},
             &mut |chunk| {
@@ -266,7 +267,7 @@ mod tests {
             },
         )
         .unwrap();
-        out.push_str(Format::GeoJson.footer());
+        out.push_str(r.footer);
 
         assert!(out.contains(r#""coordinates":[1.0,2.0]"#), "{out}");
         assert!(!out.contains("SHAPE"), "the geometry column leaked into properties: {out}");
@@ -316,7 +317,7 @@ mod tests {
         let err = run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            Format::GeoJson,
+            crate::render::Render::of(Format::GeoJson).separator,
             |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs),
             || panic!("a source with no geometry must not reach the ready signal"),
             &mut |_| true,
@@ -427,7 +428,7 @@ mod tests {
         run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            f,
+            crate::render::Render::of(f).separator,
             |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
             || {},
             &mut |_| {
@@ -442,7 +443,7 @@ mod tests {
         run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            f,
+            crate::render::Render::of(f).separator,
             |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
             || {},
             &mut |_| {

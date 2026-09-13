@@ -19,6 +19,7 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
     };
 
     let format = parsed.format;
+    let render = crate::render::Render::of(format);
     let download = format!("{}.{}", parsed.dataset, parsed.extension);
     let dataset = parsed.dataset;
     let encoding = parsed.encoding;
@@ -39,14 +40,14 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(CHANNEL_DEPTH);
 
     tokio::task::spawn_blocking(move || {
-        if tx.blocking_send(Ok(Bytes::from_static(format.header().as_bytes()))).is_err() {
+        if tx.blocking_send(Ok(Bytes::from_static(render.header.as_bytes()))).is_err() {
             return;
         }
         let mut ready = Some(ready_tx);
         let sent = query::run(
             &source,
             &encoding,
-            format,
+            render.separator,
             |columns, crs| crate::sql::build_sql(&source, &encoding, &filters, format, columns, crs),
             || {
                 if let Some(ready_tx) = ready.take() {
@@ -57,7 +58,7 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
         );
         match sent {
             Ok(()) => {
-                let _ = tx.blocking_send(Ok(Bytes::from_static(format.footer().as_bytes())));
+                let _ = tx.blocking_send(Ok(Bytes::from_static(render.footer.as_bytes())));
             }
             Err(e) => {
                 tracing::error!(dataset, error = ?e, "query failed");
@@ -82,7 +83,7 @@ pub async fn dataset(State(root): State<DatasetRoot>, SignedPath(path): SignedPa
 
     (
         [
-            (header::CONTENT_TYPE, format.content_type().to_string()),
+            (header::CONTENT_TYPE, render.content_type.to_string()),
             (header::CONTENT_DISPOSITION, format!("inline; filename=\"{download}\"")),
         ],
         Body::from_stream(ReceiverStream::new(rx)),
