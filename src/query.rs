@@ -193,7 +193,7 @@ mod tests {
             source,
             crate::url::DEFAULT_ENCODING,
             f,
-            |c| crate::handler::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c),
+            |c| crate::sql::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -228,7 +228,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             Format::GeoJson,
-            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
+            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -287,7 +287,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             Format::GeoJson,
-            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
+            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c),
             || panic!("a source with no geometry must not reach the ready signal"),
             &mut |_| true,
         )
@@ -398,7 +398,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f,
-            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
+            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
             || {},
             &mut |_| {
                 stopped_after += 1;
@@ -413,7 +413,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f,
-            |c| crate::handler::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
+            |c| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c),
             || {},
             &mut |_| {
                 chunks += 1;
