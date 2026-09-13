@@ -10,7 +10,7 @@ repository = "https://github.com/roniemartinez/duckxy"
 anyhow = "1.0.104"
 axum = "0.8.9"
 base64 = "0.23.1"
-duckdb = { version = "1.10505.0", features = ["bundled"] }
+duckdb = { version = "1.10505.0", features = ["bundled", "vtab"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 sea-query = "1.0.2"

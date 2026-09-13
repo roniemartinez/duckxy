@@ -4,6 +4,7 @@ mod encodings;
 pub mod filters;
 pub mod formats;
 pub mod handler;
+pub mod parexp;
 pub mod query;
 pub mod routes;
 pub mod url;

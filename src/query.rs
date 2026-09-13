@@ -30,11 +30,12 @@ pub fn install_extensions() -> Result<()> {
     }
 }
 
-fn with_connection<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+pub(crate) fn with_connection<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     CONNECTION.with(|cell| {
         if cell.borrow().is_none() {
             let conn = Connection::open_in_memory().context("open duckdb")?;
             conn.execute_batch(&format!("LOAD spatial; {}", tuning())).context("load the spatial extension")?;
+            conn.register_table_function::<crate::parexp::Parexp>("parexp").context("register parexp")?;
             *cell.borrow_mut() = Some(conn);
         }
         let outcome = {

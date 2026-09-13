@@ -1,3 +1,4 @@
+use crate::parexp;
 use crate::url::Segment;
 use sea_query::{Alias, Expr, ExprTrait, SimpleExpr};
 use std::fmt;
@@ -9,7 +10,7 @@ pub enum FilterError {
     NoIdColumn,
     UnknownFilter(String),
     BadParams(String),
-    ExpansionUnsupported(String),
+    ExpansionTooLarge(String),
 }
 
 impl fmt::Display for FilterError {
@@ -20,8 +21,8 @@ impl fmt::Display for FilterError {
             }
             FilterError::UnknownFilter(name) => write!(f, "unknown filter: {name}"),
             FilterError::BadParams(name) => write!(f, "filter takes exactly one value: {name}"),
-            FilterError::ExpansionUnsupported(value) => {
-                write!(f, "pattern expansion is not supported yet, use a single value: {value}")
+            FilterError::ExpansionTooLarge(pattern) => {
+                write!(f, "pattern expands past the limit of {} values: {pattern}", parexp::MAX_EXPANSION)
             }
         }
     }
@@ -44,25 +45,43 @@ pub fn condition(filters: &[Segment], columns: &[(String, String)]) -> Result<Op
     Ok(combined)
 }
 
-fn id_condition(params: &[String], columns: &[(String, String)]) -> Result<SimpleExpr, FilterError> {
-    let column = ID_CANDIDATES
-        .iter()
-        .find_map(|want| columns.iter().find(|(name, _)| name.eq_ignore_ascii_case(want)))
-        .map(|(name, _)| name.as_str())
-        .ok_or(FilterError::NoIdColumn)?;
-    let [raw] = params else { return Err(FilterError::BadParams("id".to_string())) };
-    let value = unquote(raw);
-    if value.len() == raw.len() && value.contains('(') {
-        return Err(FilterError::ExpansionUnsupported(raw.clone()));
-    }
-    Ok(Expr::cust_with_exprs("CAST($1 AS VARCHAR) = $2", [Expr::col(Alias::new(column)), Expr::val(value)]))
+fn is_integer(kind: &str) -> bool {
+    matches!(
+        kind,
+        "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "BIGINT"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "UHUGEINT"
+    )
 }
 
-fn unquote(value: &str) -> &str {
-    match value.len() >= 2 && value.starts_with('~') && value.ends_with('~') {
-        true => &value[1..value.len() - 1],
-        false => value,
+fn id_condition(params: &[String], columns: &[(String, String)]) -> Result<SimpleExpr, FilterError> {
+    let (name, kind) = ID_CANDIDATES
+        .iter()
+        .find_map(|want| columns.iter().find(|(name, _)| name.eq_ignore_ascii_case(want)))
+        .ok_or(FilterError::NoIdColumn)?;
+    let [raw] = params else { return Err(FilterError::BadParams("id".to_string())) };
+    let column = || Expr::col(Alias::new(name.as_str()));
+
+    if is_integer(kind)
+        && let Some((lo, hi)) = parexp::as_integer_range(raw)
+    {
+        let bounds = [column(), Expr::val(lo), Expr::val(hi)];
+        return Ok(Expr::cust_with_exprs("TRY_CAST($1 AS BIGINT) BETWEEN $2 AND $3", bounds));
     }
+    if parexp::count(raw) > parexp::MAX_EXPANSION {
+        return Err(FilterError::ExpansionTooLarge(raw.clone()));
+    }
+    if let [only] = parexp::expand(raw).as_slice() {
+        return Ok(Expr::cust_with_exprs("CAST($1 AS VARCHAR) = $2", [column(), Expr::val(only)]));
+    }
+    Ok(Expr::cust_with_exprs("CAST($1 AS VARCHAR) IN (SELECT v FROM parexp($2))", [column(), Expr::val(raw)]))
 }
 
 #[cfg(test)]
@@ -154,16 +173,90 @@ mod tests {
         assert_eq!(condition(&[seg(params)], &columns()).unwrap_err(), FilterError::BadParams("id".to_string()));
     }
 
+    fn text_columns() -> Vec<(String, String)> {
+        vec![("id".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())]
+    }
+
     #[rstest]
     #[case("(1,2)")]
-    #[case("(1..100)")]
     #[case("(a,b)")]
     #[case("file-(1..3).txt")]
     #[case("prefix-(a,b)")]
-    fn a_value_containing_a_group_is_refused_with_a_clear_message(#[case] value: &str) {
-        let err = condition(&[seg(&[value])], &columns()).unwrap_err();
-        assert_eq!(err, FilterError::ExpansionUnsupported(value.to_string()));
-        assert!(err.to_string().contains("not supported yet"), "{err}");
+    #[case("(a..d)")]
+    #[case("(1..10..2)")]
+    fn a_group_expands_through_the_table_function(#[case] value: &str) {
+        let out = sql(&[seg(&[value])]);
+        assert!(out.contains("parexp("), "{out}");
+        assert!(!out.contains("BETWEEN"), "{out}");
+        assert!(out.len() < 400, "the expansion leaked into sql text, {} bytes", out.len());
+    }
+
+    #[test]
+    fn a_pure_range_on_a_numeric_column_becomes_between() {
+        let out = sql(&[seg(&["(1..100)"])]);
+        assert!(out.contains("TRY_CAST"), "{out}");
+        assert!(out.contains("BETWEEN"), "{out}");
+        assert!(!out.contains("parexp"), "a pure range on a numeric column must not expand: {out}");
+    }
+
+    #[test]
+    fn a_range_past_the_f64_mantissa_keeps_every_digit() {
+        let out = sql(&[seg(&["(9007199254740993..9007199254740993)"])]);
+        assert!(out.contains("9007199254740993"), "the bound was rounded: {out}");
+        assert!(out.contains("BIGINT"), "{out}");
+    }
+
+    #[rstest]
+    #[case("(01..01)")]
+    #[case("(0.5..1.5)")]
+    #[case("(-5..10)")]
+    #[case("(+5..10)")]
+    fn a_padded_signed_or_fractional_range_does_not_take_the_numeric_path(#[case] value: &str) {
+        let out = sql(&[seg(&[value])]);
+        assert!(!out.contains("BETWEEN"), "{out}");
+    }
+
+    #[rstest]
+    #[case("DOUBLE")]
+    #[case("FLOAT")]
+    #[case("REAL")]
+    #[case("DECIMAL(18,3)")]
+    fn a_range_against_a_fractional_column_expands_rather_than_rounding(#[case] kind: &str) {
+        let cols = vec![("id".to_string(), kind.to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let out = render(&[seg(&["(3..4)"])], &cols);
+        assert!(!out.contains("BETWEEN"), "casting to BIGINT would round 2.6 into this range: {out}");
+        assert!(out.contains("parexp("), "{out}");
+    }
+
+    #[test]
+    fn an_expansion_past_the_cap_is_refused_rather_than_truncated() {
+        let err = condition(&[seg(&["item-(1..1000000)"])], &columns()).unwrap_err();
+        assert!(matches!(err, FilterError::ExpansionTooLarge { .. }), "{err:?}");
+        assert!(err.to_string().contains("past the limit of 10000"), "{err}");
+    }
+
+    #[test]
+    fn a_huge_range_on_a_text_column_is_refused_rather_than_truncated() {
+        let err = condition(&[seg(&["(1..1000000)"])], &text_columns()).unwrap_err();
+        assert!(matches!(err, FilterError::ExpansionTooLarge { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_pure_range_on_a_text_column_expands_instead() {
+        let out = render(&[seg(&["(1..100)"])], &text_columns());
+        assert!(out.contains("parexp("), "{out}");
+        assert!(!out.contains("BETWEEN"), "a text column must not be matched numerically: {out}");
+        assert!(!out.contains("TRY_CAST"), "{out}");
+    }
+
+    #[rstest]
+    #[case("(1..1e400)", "'1..1e400'")]
+    #[case("(inf..100)", "'inf..100'")]
+    #[case("(1..nan)", "'1..nan'")]
+    fn a_non_finite_range_is_compared_as_a_literal(#[case] value: &str, #[case] literal: &str) {
+        let out = sql(&[seg(&[value])]);
+        assert!(!out.contains("BETWEEN"), "a non-finite bound reached the numeric path: {out}");
+        assert!(out.contains(literal), "{out}");
     }
 
     #[rstest]

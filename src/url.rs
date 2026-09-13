@@ -35,6 +35,7 @@ pub enum ParseError {
     MisplacedSourceOption(String),
     OptionTakesOneValue(String),
     UnbalancedValue(String),
+    ValueTooDeep(String),
 }
 
 impl fmt::Display for ParseError {
@@ -54,7 +55,10 @@ impl fmt::Display for ParseError {
             ParseError::MalformedEncoding(s) => write!(f, "encoding has characters that are not allowed: {s}"),
             ParseError::MisplacedSourceOption(s) => write!(f, "source options must come before any filter: {s}"),
             ParseError::OptionTakesOneValue(s) => write!(f, "option takes exactly one value: {s}"),
-            ParseError::UnbalancedValue(s) => write!(f, "value has an unclosed ~ or (: {s}"),
+            ParseError::UnbalancedValue(s) => write!(f, "value has unbalanced ~ or (): {s}"),
+            ParseError::ValueTooDeep(s) => {
+                write!(f, "value nests groups more than {} deep: {s}", crate::parexp::MAX_DEPTH)
+            }
         }
     }
 }
@@ -136,9 +140,7 @@ fn read_options<'a>(scan: &mut Scan<'a>) -> Result<(Option<String>, Vec<Segment>
             [] | [_] => return Err(ParseError::EmptyOptionValue(key.to_string())),
             _ => return Err(ParseError::OptionTakesOneValue(key.to_string())),
         };
-        if !is_balanced(&value) {
-            return Err(ParseError::UnbalancedValue(value));
-        }
+        validate_value(&value)?;
         match key {
             "enc" | "encoding" => {
                 if !filters.is_empty() {
@@ -196,7 +198,7 @@ impl<'a> Scan<'a> {
     }
 }
 
-fn is_balanced(value: &str) -> bool {
+fn validate_value(value: &str) -> Result<(), ParseError> {
     let mut depth = 0i32;
     let mut in_tilde = false;
     for byte in value.bytes() {
@@ -207,10 +209,16 @@ fn is_balanced(value: &str) -> bool {
             _ => {}
         }
         if depth < 0 {
-            return false;
+            return Err(ParseError::UnbalancedValue(value.to_string()));
+        }
+        if depth as usize > crate::parexp::MAX_DEPTH {
+            return Err(ParseError::ValueTooDeep(value.to_string()));
         }
     }
-    depth == 0 && !in_tilde
+    match depth == 0 && !in_tilde {
+        true => Ok(()),
+        false => Err(ParseError::UnbalancedValue(value.to_string())),
+    }
 }
 
 fn trim_filename(path: &str) -> &str {
@@ -326,6 +334,10 @@ mod tests {
     #[case("/@dataset:pts,id:(a~b).geojson", ParseError::UnbalancedValue("(a~b)".to_string()))]
     #[case("/@dataset:pts,id:(1,2.geojson", ParseError::UnbalancedValue("(1,2".to_string()))]
     #[case("/@dataset:pts,id:a)b.geojson", ParseError::UnbalancedValue("a)b".to_string()))]
+    #[case(
+        "/@dataset:pts,id:((((((((((((((((((((((((((((((((((x)))))))))))))))))))))))))))))))))).geojson",
+        ParseError::ValueTooDeep("((((((((((((((((((((((((((((((((((x))))))))))))))))))))))))))))))))))".to_string())
+    )]
     #[case("/@dataset:x,id.geojson", ParseError::EmptyOptionValue("id".to_string()))]
     #[case("/@dataset:x,zzz:1.geojson", ParseError::UnknownOption("zzz".to_string()))]
     #[case("/@dataset:x,prop:state:CA.geojson", ParseError::UnknownOption("prop".to_string()))]
@@ -345,6 +357,18 @@ mod tests {
         assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
         assert_eq!(p.filters[0].name, name);
         assert_eq!(p.filters[0].params, params);
+    }
+
+    #[test]
+    fn a_deeply_nested_value_is_refused_before_anything_recurses() {
+        let deep = format!("/@dataset:x,id:{}x{}.geojson", "(".repeat(5000), ")".repeat(5000));
+        assert!(matches!(parse(&deep), Err(ParseError::ValueTooDeep(_))), "{:?}", parse(&deep));
+    }
+
+    #[test]
+    fn nesting_up_to_the_limit_is_accepted() {
+        let ok = format!("/@dataset:x,id:{}a,b{}.geojson", "(".repeat(32), ")".repeat(32));
+        assert!(parse(&ok).is_ok(), "{:?}", parse(&ok));
     }
 
     #[test]
