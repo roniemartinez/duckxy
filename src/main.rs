@@ -1,7 +1,7 @@
 use anyhow::Result;
 use duckxy::auth::Auth;
 use duckxy::dataset::DatasetRoot;
-use duckxy::{AppState, Config, VERSION, query, routes};
+use duckxy::{AppState, Config, VERSION, grammar, query, routes};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::info;
@@ -67,6 +67,11 @@ async fn main() -> Result<()> {
         "duckxy starting"
     );
 
-    axum::serve(listener, routes::router(AppState { root, auth })).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(
+        listener,
+        routes::router(AppState { root, auth, grammar: std::sync::Arc::new(grammar::Grammar::core()) }),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }

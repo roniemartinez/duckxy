@@ -197,6 +197,23 @@ fn anchor(operator: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_filter_the_core_grammar_registers_is_executable() {
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("name".to_string(), "VARCHAR".to_string())];
+        for def in &crate::grammar::Grammar::core().filters {
+            for shape in &def.shapes {
+                let segment =
+                    Segment { name: def.canonical().to_string(), params: vec!["name".to_string(); shape.len()] };
+                let outcome = condition(&[segment], &columns);
+                assert!(
+                    !matches!(outcome, Err(FilterError::UnknownFilter(_))),
+                    "{:?} is registered but condition cannot execute it",
+                    def.canonical()
+                );
+            }
+        }
+    }
     use rstest::rstest;
     use sea_query::{PostgresQueryBuilder, Query};
 
