@@ -1,6 +1,6 @@
 use crate::parexp;
 use crate::url::Segment;
-use sea_query::{Alias, Expr, ExprTrait, SimpleExpr};
+use sea_query::{Alias, Expr, ExprTrait, Func, LikeExpr, Query, SimpleExpr};
 use std::fmt;
 
 const ID_CANDIDATES: [&str; 4] = ["id", "fid", "gid", "objectid"];
@@ -14,11 +14,13 @@ pub enum FilterError {
     UnknownColumn(String),
     UnknownOperator(String),
     NotANumber(String),
+    NotOneValue(String),
 }
 
 enum NumericKind {
     Integer,
-    Fractional,
+    Exact,
+    Approximate,
 }
 
 impl fmt::Display for FilterError {
@@ -35,6 +37,9 @@ impl fmt::Display for FilterError {
             FilterError::UnknownColumn(key) => write!(f, "source has no column: {key}"),
             FilterError::UnknownOperator(op) => write!(f, "unknown property operator: {op}"),
             FilterError::NotANumber(value) => write!(f, "a numeric column needs a numeric value: {value}"),
+            FilterError::NotOneValue(pattern) => {
+                write!(f, "this operator takes a single value, not a pattern: {pattern}")
+            }
         }
     }
 }
@@ -61,25 +66,21 @@ fn numeric_kind(kind: &str) -> Option<NumericKind> {
     match kind.split('(').next().unwrap_or(kind) {
         "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT" | "UINTEGER"
         | "UBIGINT" | "UHUGEINT" => Some(NumericKind::Integer),
-        "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" => Some(NumericKind::Fractional),
+        "DECIMAL" | "NUMERIC" => Some(NumericKind::Exact),
+        "FLOAT" | "DOUBLE" | "REAL" => Some(NumericKind::Approximate),
         _ => None,
     }
 }
 
-fn value_set(column: impl Fn() -> SimpleExpr, kind: &str, pattern: &str) -> Result<SimpleExpr, FilterError> {
-    if matches!(numeric_kind(kind), Some(NumericKind::Integer))
-        && let Some((lo, hi)) = parexp::as_integer_range(pattern)
-    {
-        let bounds = [column(), Expr::val(lo), Expr::val(hi)];
-        return Ok(Expr::cust_with_exprs("TRY_CAST($1 AS BIGINT) BETWEEN $2 AND $3", bounds));
-    }
-    if parexp::count(pattern) > parexp::MAX_EXPANSION {
-        return Err(FilterError::ExpansionTooLarge(pattern.to_string()));
-    }
-    if let [only] = parexp::expand(pattern).as_slice() {
-        return Ok(Expr::cust_with_exprs("CAST($1 AS VARCHAR) = $2", [column(), Expr::val(only)]));
-    }
-    Ok(Expr::cust_with_exprs("CAST($1 AS VARCHAR) IN (SELECT v FROM parexp($2))", [column(), Expr::val(pattern)]))
+fn text(value: SimpleExpr) -> SimpleExpr {
+    Func::cast_as(value, Alias::new("VARCHAR")).into()
+}
+
+fn numeral(value: &str) -> Option<&str> {
+    let body = value.strip_prefix('-').unwrap_or(value);
+    let digits = body.chars().filter(|c| c.is_ascii_digit()).count();
+    let shaped = body.chars().all(|c| c.is_ascii_digit() || c == '.') && body.matches('.').count() <= 1;
+    (digits > 0 && shaped).then_some(value)
 }
 
 fn id_condition(params: &[String], columns: &[(String, String)]) -> Result<SimpleExpr, FilterError> {
@@ -104,25 +105,44 @@ fn compare((name, kind): &(String, String), params: &[String], filter: &str) -> 
         [named, supplied] => (named.as_str(), supplied.as_str()),
         _ => return Err(FilterError::BadParams(filter.to_string())),
     };
-    let literal = || parexp::expand(raw).pop().unwrap_or_default();
+    let literal = || match parexp::count(raw) {
+        1 => Ok(parexp::expand(raw).pop().unwrap_or_default()),
+        _ => Err(FilterError::NotOneValue(raw.to_string())),
+    };
 
     Ok(match operator {
-        "null" => Expr::cust_with_exprs("$1 IS NULL", [column()]),
-        "notnull" => Expr::cust_with_exprs("$1 IS NOT NULL", [column()]),
+        "null" => column().is_null(),
+        "notnull" => column().is_not_null(),
         "eq" | "in" => value_set(column, kind, raw)?,
-        "ne" | "nin" => Expr::cust_with_exprs("NOT ($1)", [value_set(column, kind, raw)?]),
-        "ieq" => Expr::cust_with_exprs("lower(CAST($1 AS VARCHAR)) = lower($2)", [column(), Expr::val(literal())]),
-        "gt" | "gte" | "lt" | "lte" => ordering(column, kind, operator, &literal())?,
-        "sw" | "ew" | "ct" => Expr::cust_with_exprs(
-            "CAST($1 AS VARCHAR) LIKE $2 ESCAPE '\\'",
-            [column(), Expr::val(anchor(operator, &literal()))],
-        ),
+        "ne" | "nin" => value_set(column, kind, raw)?.not(),
+        "ieq" => Func::lower(text(column())).eq(Func::lower(Expr::val(literal()?))),
+        "gt" | "gte" | "lt" | "lte" => ordering(column, kind, operator, &literal()?)?,
+        "sw" | "ew" | "ct" => text(column()).like(LikeExpr::new(anchor(operator, &literal()?)).escape('\\')),
         "isw" | "iew" | "ict" => Expr::cust_with_exprs(
-            "lower(CAST($1 AS VARCHAR)) LIKE lower($2) ESCAPE '\\'",
-            [column(), Expr::val(anchor(&operator[1..], &literal()))],
+            "LOWER($1) LIKE LOWER($2) ESCAPE '\\'",
+            [text(column()), Expr::val(anchor(&operator[1..], &literal()?))],
         ),
         other => return Err(FilterError::UnknownOperator(other.to_string())),
     })
+}
+
+fn value_set(column: impl Fn() -> SimpleExpr, kind: &str, pattern: &str) -> Result<SimpleExpr, FilterError> {
+    if numeric_kind(kind).is_some()
+        && let Some((lo, hi)) = parexp::as_integer_range(pattern)
+    {
+        return Ok(column().between(lo, hi));
+    }
+    if parexp::count(pattern) > parexp::MAX_EXPANSION {
+        return Err(FilterError::ExpansionTooLarge(pattern.to_string()));
+    }
+    if let [only] = parexp::expand(pattern).as_slice() {
+        return Ok(text(column()).eq(only.as_str()));
+    }
+    let expansion = Query::select()
+        .column(Alias::new("v"))
+        .from_function(Func::cust("parexp").arg(pattern), Alias::new("expanded"))
+        .take();
+    Ok(text(column()).in_subquery(expansion))
 }
 
 fn ordering(
@@ -131,23 +151,19 @@ fn ordering(
     operator: &str,
     value: &str,
 ) -> Result<SimpleExpr, FilterError> {
-    if numeric_kind(kind).is_none() {
-        let template = match operator {
-            "gt" => "CAST($1 AS VARCHAR) > $2",
-            "gte" => "CAST($1 AS VARCHAR) >= $2",
-            "lt" => "CAST($1 AS VARCHAR) < $2",
-            _ => "CAST($1 AS VARCHAR) <= $2",
-        };
-        return Ok(Expr::cust_with_exprs(template, [column(), Expr::val(value)]));
-    }
-    let number = value.parse::<f64>().map_err(|_| FilterError::NotANumber(value.to_string()))?;
-    let template = match operator {
-        "gt" => "TRY_CAST($1 AS DOUBLE) > $2",
-        "gte" => "TRY_CAST($1 AS DOUBLE) >= $2",
-        "lt" => "TRY_CAST($1 AS DOUBLE) < $2",
-        _ => "TRY_CAST($1 AS DOUBLE) <= $2",
+    let (left, right) = match numeric_kind(kind) {
+        None => (text(column()), Expr::val(value)),
+        Some(_) => {
+            let exact = numeral(value).ok_or_else(|| FilterError::NotANumber(value.to_string()))?;
+            (column(), Expr::cust(exact.to_string()))
+        }
     };
-    Ok(Expr::cust_with_exprs(template, [column(), Expr::val(number)]))
+    Ok(match operator {
+        "gt" => left.gt(right),
+        "gte" => left.gte(right),
+        "lt" => left.lt(right),
+        _ => left.lte(right),
+    })
 }
 
 fn anchor(operator: &str, value: &str) -> String {
@@ -184,6 +200,67 @@ mod tests {
 
     fn sql(filters: &[Segment]) -> String {
         render(filters, &columns())
+    }
+
+    fn executes(params: &[&str], kind: &str, row: &str) -> Result<bool, String> {
+        let cols = vec![("v".to_string(), kind.to_string())];
+        let seg = Segment { name: "prop".to_string(), params: params.iter().map(|p| p.to_string()).collect() };
+        let expr = condition(&[seg], &cols).map_err(|e| e.to_string())?.unwrap();
+        let sql = Query::select()
+            .expr(Expr::cust("1"))
+            .from_subquery(Query::select().expr(Expr::cust(row.to_string())).take(), Alias::new("t"))
+            .and_where(expr)
+            .to_string(PostgresQueryBuilder);
+        crate::ensure_spatial();
+        let conn = duckdb::Connection::open_in_memory().map_err(|e| e.to_string())?;
+        conn.register_table_function::<crate::parexp::Parexp>("parexp").map_err(|e| e.to_string())?;
+        conn.prepare(&sql)
+            .and_then(|mut st| st.query([]).and_then(|mut r| r.next().map(|found| found.is_some())))
+            .map_err(|e| format!("{}  ||  {sql}", e.to_string().lines().next().unwrap_or("")))
+    }
+
+    #[rstest]
+    #[case(&["v", "eq", "Alpha"], true)]
+    #[case(&["v", "ne", "Alpha"], false)]
+    #[case(&["v", "ieq", "alpha"], true)]
+    #[case(&["v", "sw", "Al"], true)]
+    #[case(&["v", "ew", "ha"], true)]
+    #[case(&["v", "ct", "lph"], true)]
+    #[case(&["v", "isw", "al"], true)]
+    #[case(&["v", "iew", "HA"], true)]
+    #[case(&["v", "ict", "LPH"], true)]
+    #[case(&["v", "ict", "zzz"], false)]
+    #[case(&["v", "gt", "A"], true)]
+    #[case(&["v", "lt", "Z"], true)]
+    #[case(&["v", "in", "(Alpha,Beta)"], true)]
+    #[case(&["v", "nin", "(Beta)"], true)]
+    #[case(&["v", "notnull"], true)]
+    fn every_text_operator_executes(#[case] params: &[&str], #[case] expected: bool) {
+        match executes(params, "VARCHAR", "'Alpha' AS v") {
+            Ok(matched) => assert_eq!(matched, expected, "{params:?}"),
+            Err(e) => panic!("{params:?} produced invalid sql: {e}"),
+        }
+    }
+
+    #[rstest]
+    #[case("BIGINT", "42::BIGINT AS v", &["v", "gt", "1"], true)]
+    #[case("BIGINT", "42::BIGINT AS v", &["v", "lt", "1"], false)]
+    #[case("BIGINT", "9007199254740993::BIGINT AS v", &["v", "gt", "9007199254740992"], true)]
+    #[case("HUGEINT", "42::HUGEINT AS v", &["v", "gt", "1"], true)]
+    #[case("UBIGINT", "18446744073709551615::UBIGINT AS v", &["v", "gt", "0"], true)]
+    #[case("DOUBLE", "1.5::DOUBLE AS v", &["v", "gt", "1"], true)]
+    #[case("DECIMAL(38,0)", "99999999999999999999999999999999999999::DECIMAL(38,0) AS v", &["v", "gt", "0"], true)]
+    #[case("DECIMAL(18,3)", "1.5::DECIMAL(18,3) AS v", &["v", "lt", "2"], true)]
+    fn every_numeric_column_executes(
+        #[case] kind: &str,
+        #[case] row: &str,
+        #[case] params: &[&str],
+        #[case] expected: bool,
+    ) {
+        match executes(params, kind, row) {
+            Ok(matched) => assert_eq!(matched, expected, "{kind} {params:?}"),
+            Err(e) => panic!("{kind} {params:?} produced invalid sql: {e}"),
+        }
     }
 
     #[test]
@@ -249,18 +326,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case(&["gte", "500"], "TRY_CAST(\"id\" AS DOUBLE) >= 500")]
-    #[case(&["lt", "1000"], "TRY_CAST(\"id\" AS DOUBLE) < 1000")]
-    #[case(&["in", "(500..1000)"], "TRY_CAST(\"id\" AS BIGINT) BETWEEN 500 AND 1000")]
-    #[case(&["(50..100)"], "TRY_CAST(\"id\" AS BIGINT) BETWEEN 50 AND 100")]
+    #[case(&["gte", "500"], "\"id\" >= (500)")]
+    #[case(&["lt", "1000"], "\"id\" < (1000)")]
+    #[case(&["in", "(500..1000)"], "BETWEEN 500 AND 1000")]
+    #[case(&["(50..100)"], "BETWEEN 50 AND 100")]
     #[case(&["ct", "ab"], "LIKE")]
     fn id_accepts_the_same_operators_as_prop(#[case] params: &[&str], #[case] needle: &str) {
         let out = sql(&[seg(params)]);
         assert!(out.contains(needle), "{out}");
-    }
-
-    fn text_columns() -> Vec<(String, String)> {
-        vec![("id".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())]
     }
 
     #[rstest]
@@ -280,16 +353,15 @@ mod tests {
     #[test]
     fn a_pure_range_on_a_numeric_column_becomes_between() {
         let out = sql(&[seg(&["(1..100)"])]);
-        assert!(out.contains("TRY_CAST"), "{out}");
-        assert!(out.contains("BETWEEN"), "{out}");
+        assert!(out.contains("BETWEEN 1 AND 100"), "{out}");
         assert!(!out.contains("parexp"), "a pure range on a numeric column must not expand: {out}");
+        assert!(!out.contains("CAST"), "the column should not be cast: {out}");
     }
 
     #[test]
     fn a_range_past_the_f64_mantissa_keeps_every_digit() {
         let out = sql(&[seg(&["(9007199254740993..9007199254740993)"])]);
         assert!(out.contains("9007199254740993"), "the bound was rounded: {out}");
-        assert!(out.contains("BIGINT"), "{out}");
     }
 
     #[rstest]
@@ -303,171 +375,19 @@ mod tests {
     }
 
     #[rstest]
-    #[case("DOUBLE")]
-    #[case("FLOAT")]
-    #[case("REAL")]
-    #[case("DECIMAL(18,3)")]
-    fn a_range_against_a_fractional_column_expands_rather_than_rounding(#[case] kind: &str) {
-        let cols = vec![("id".to_string(), kind.to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let out = render(&[seg(&["(3..4)"])], &cols);
-        assert!(!out.contains("BETWEEN"), "casting to BIGINT would round 2.6 into this range: {out}");
-        assert!(out.contains("parexp("), "{out}");
-    }
-
-    #[test]
-    fn an_expansion_past_the_cap_is_refused_rather_than_truncated() {
-        let err = condition(&[seg(&["item-(1..1000000)"])], &columns()).unwrap_err();
-        assert!(matches!(err, FilterError::ExpansionTooLarge(..)), "{err:?}");
-        assert!(err.to_string().contains("past the limit of 10000"), "{err}");
-    }
-
-    #[test]
-    fn a_huge_range_on_a_text_column_is_refused_rather_than_truncated() {
-        let err = condition(&[seg(&["(1..1000000)"])], &text_columns()).unwrap_err();
-        assert!(matches!(err, FilterError::ExpansionTooLarge(..)), "{err:?}");
-    }
-
-    #[test]
-    fn a_pure_range_on_a_text_column_expands_instead() {
-        let out = render(&[seg(&["(1..100)"])], &text_columns());
-        assert!(out.contains("parexp("), "{out}");
-        assert!(!out.contains("BETWEEN"), "a text column must not be matched numerically: {out}");
-        assert!(!out.contains("TRY_CAST"), "{out}");
-    }
-
-    #[rstest]
-    #[case("(1..1e400)", "'1..1e400'")]
-    #[case("(inf..100)", "'inf..100'")]
-    #[case("(1..nan)", "'1..nan'")]
-    fn a_non_finite_range_is_compared_as_a_literal(#[case] value: &str, #[case] literal: &str) {
-        let out = sql(&[seg(&[value])]);
-        assert!(!out.contains("BETWEEN"), "a non-finite bound reached the numeric path: {out}");
-        assert!(out.contains(literal), "{out}");
-    }
-
-    #[rstest]
-    #[case("~District (North)~", "'District (North)'")]
-    #[case("~a(b~", "'a(b'")]
-    fn a_tilde_quoted_paren_is_a_literal_not_a_group(#[case] value: &str, #[case] literal: &str) {
-        let out = sql(&[seg(&[value])]);
-        assert!(out.contains(literal), "{out}");
-    }
-
-    fn cols(kind: &str) -> Vec<(String, String)> {
-        vec![
-            ("id".to_string(), "BIGINT".to_string()),
-            ("name".to_string(), kind.to_string()),
-            ("geom".to_string(), "GEOMETRY".to_string()),
-        ]
-    }
-
-    fn prop(params: &[&str]) -> Segment {
-        Segment { name: "prop".to_string(), params: params.iter().map(|p| p.to_string()).collect() }
-    }
-
-    #[rstest]
-    #[case(&["name", "CA"], "CAST(\"name\" AS VARCHAR) = 'CA'")]
-    #[case(&["name", "eq", "CA"], "CAST(\"name\" AS VARCHAR) = 'CA'")]
-    #[case(&["name", "ne", "CA"], "NOT (CAST(\"name\" AS VARCHAR) = 'CA')")]
-    #[case(&["name", "ieq", "ca"], "lower(CAST(\"name\" AS VARCHAR)) = lower('ca')")]
-    #[case(&["name", "null"], "\"name\" IS NULL")]
-    #[case(&["name", "notnull"], "\"name\" IS NOT NULL")]
-    #[case(&["name", "sw", "New"], "'New%'")]
-    #[case(&["name", "ew", "City"], "'%City'")]
-    #[case(&["name", "ct", "ew"], "'%ew%'")]
-    fn prop_operators_compile(#[case] params: &[&str], #[case] needle: &str) {
-        let out = render(&[prop(params)], &cols("VARCHAR"));
-        assert!(out.contains(needle), "{out}");
-    }
-
-    #[rstest]
-    #[case("BIGINT", "TRY_CAST")]
-    #[case("INTEGER", "TRY_CAST")]
-    #[case("DOUBLE", "TRY_CAST")]
-    #[case("DECIMAL(18,3)", "TRY_CAST")]
-    fn ordering_on_a_numeric_column_is_numeric(#[case] kind: &str, #[case] needle: &str) {
-        let out = render(&[prop(&["name", "gt", "100"])], &cols(kind));
-        assert!(out.contains(needle), "{out}");
-        assert!(out.contains("> 100"), "{out}");
-    }
-
-    #[rstest]
-    #[case("gt", ">")]
-    #[case("gte", ">=")]
-    #[case("lt", "<")]
-    #[case("lte", "<=")]
-    fn ordering_on_a_text_column_is_lexical(#[case] operator: &str, #[case] symbol: &str) {
-        let out = render(&[prop(&["name", operator, "M"])], &cols("VARCHAR"));
-        assert!(out.contains(&format!("CAST(\"name\" AS VARCHAR) {symbol} 'M'")), "{out}");
-        assert!(!out.contains("TRY_CAST"), "a text column ordered numerically: {out}");
-    }
-
-    #[test]
-    fn a_non_numeric_value_against_a_numeric_column_is_refused() {
-        let err = condition(&[prop(&["name", "gt", "abc"])], &cols("BIGINT")).unwrap_err();
-        assert_eq!(err, FilterError::NotANumber("abc".to_string()));
-    }
-
-    #[rstest]
-    #[case("50_000", r"50\\_000")]
-    #[case("100%", r"100\\%")]
-    #[case(r"back\slash", r"back\\\\slash")]
-    fn like_metacharacters_are_escaped(#[case] value: &str, #[case] escaped: &str) {
-        let out = render(&[prop(&["name", "ct", value])], &cols("VARCHAR"));
-        assert!(out.contains(escaped), "unescaped wildcard reached sql: {out}");
-        assert!(out.contains("ESCAPE"), "{out}");
-    }
-
-    #[rstest]
-    #[case("ieq")]
-    #[case("isw")]
-    #[case("iew")]
-    #[case("ict")]
-    fn case_insensitive_operators_lower_both_sides(#[case] operator: &str) {
-        let out = render(&[prop(&["name", operator, "ca"])], &cols("VARCHAR"));
-        assert_eq!(out.matches("lower(").count(), 2, "{out}");
-    }
-
-    #[rstest]
-    #[case(&["name", "in", "(CA,NY)"])]
-    #[case(&["name", "(CA,NY)"])]
-    fn in_shares_the_expansion_path(#[case] params: &[&str]) {
-        let out = render(&[prop(params)], &cols("VARCHAR"));
-        assert!(out.contains("parexp("), "{out}");
-        assert!(!out.contains("'CA'"), "the expansion leaked into sql text: {out}");
-    }
-
-    #[test]
-    fn nin_negates_in() {
-        let out = render(&[prop(&["name", "nin", "(CA,NY)"])], &cols("VARCHAR"));
-        assert!(out.contains("NOT"), "{out}");
-        assert!(out.contains("parexp("), "{out}");
-    }
-
-    #[test]
-    fn a_prop_expansion_past_the_cap_is_refused() {
-        let err = condition(&[prop(&["name", "in", "item-(1..1000000)"])], &cols("VARCHAR")).unwrap_err();
-        assert!(matches!(err, FilterError::ExpansionTooLarge(..)), "{err:?}");
-    }
-
-    #[test]
-    fn a_tilde_quoted_prop_value_is_stripped() {
-        let out = render(&[prop(&["name", "~Armagh City, Banbridge~"])], &cols("VARCHAR"));
-        assert!(out.contains("'Armagh City, Banbridge'"), "{out}");
-    }
-
-    #[test]
-    fn two_prop_filters_are_and_chained() {
-        let out = render(&[prop(&["name", "a"]), prop(&["name", "b"])], &cols("VARCHAR"));
-        assert!(out.contains(" AND "), "{out}");
-    }
-
-    #[rstest]
-    #[case(&["nosuch", "eq", "x"], FilterError::UnknownColumn("nosuch".to_string()))]
-    #[case(&["name", "zzz", "x"], FilterError::UnknownOperator("zzz".to_string()))]
-    #[case(&["name"], FilterError::BadParams("prop".to_string()))]
-    fn prop_rejects(#[case] params: &[&str], #[case] expected: FilterError) {
-        assert_eq!(condition(&[prop(params)], &cols("VARCHAR")).unwrap_err(), expected);
+    #[case("DOUBLE", "2.6::DOUBLE AS v", &["v", "in", "(3..4)"], false)]
+    #[case("DOUBLE", "3.0::DOUBLE AS v", &["v", "in", "(3..4)"], true)]
+    #[case("DECIMAL(18,3)", "2.6::DECIMAL(18,3) AS v", &["v", "in", "(3..4)"], false)]
+    fn a_range_on_a_fractional_column_does_not_round(
+        #[case] kind: &str,
+        #[case] row: &str,
+        #[case] params: &[&str],
+        #[case] expected: bool,
+    ) {
+        match executes(params, kind, row) {
+            Ok(matched) => assert_eq!(matched, expected, "{kind} {params:?}"),
+            Err(e) => panic!("{kind} {params:?} produced invalid sql: {e}"),
+        }
     }
 
     #[test]

@@ -141,7 +141,7 @@ fn read_options<'a>(scan: &mut Scan<'a>) -> Result<(Option<String>, Vec<Segment>
         }
         let mut params: Vec<String> = Vec::new();
         while scan.eat(b':') {
-            params.push(scan.take_until(b":,/").to_string());
+            params.push(scan.take_value(b":,/").to_string());
         }
         if params.is_empty() || params.iter().any(String::is_empty) {
             return Err(ParseError::EmptyOptionValue(key.to_string()));
@@ -194,6 +194,17 @@ impl<'a> Scan<'a> {
     }
 
     fn take_until(&mut self, stops: &[u8]) -> &'a str {
+        let from = self.at;
+        while let Some(byte) = self.peek() {
+            if stops.contains(&byte) {
+                break;
+            }
+            self.at += 1;
+        }
+        &self.text[from..self.at]
+    }
+
+    fn take_value(&mut self, stops: &[u8]) -> &'a str {
         let from = self.at;
         let mut depth = 0usize;
         let mut in_tilde = false;
@@ -416,6 +427,15 @@ mod tests {
         assert_eq!(parse(&format!("/@dataset:x{many}.geojson")), Err(ParseError::TooManyFilters));
         let fifty: String = (0..50).map(|i| format!(",prop:k{i}:v")).collect();
         assert_eq!(parse(&format!("/@dataset:x{fifty}.geojson")).unwrap().filters.len(), 50);
+    }
+
+    #[rstest]
+    #[case("/@dataset:plz:report~final,enc:latin1.geojson")]
+    #[case("/@dataset:plz:file(1,enc:latin1.geojson")]
+    fn a_sub_path_does_not_swallow_the_options_after_it(#[case] url: &str) {
+        let p = parse(url).unwrap();
+        assert!(!p.path.as_deref().unwrap_or_default().contains("enc:"), "the encoding was swallowed: {p:?}");
+        assert_eq!(p.encoding, "ISO-8859-1", "{p:?}");
     }
 
     #[test]
