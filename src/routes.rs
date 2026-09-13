@@ -179,6 +179,12 @@ mod tests {
     #[case("/@dataset:pts,id:(a,b).geojson", vec![])]
     #[case("/@dataset:pts,id:file-(1..3).txt.geojson", vec![])]
     #[case("/@dataset:pts,id:(1..1000000).geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,id:1,id:2.geojson", vec![])]
+    #[case("/@dataset:pts,id:gte:2.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,id:lt:2.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,id:in:(1..2).geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,id:gte:1,id:lte:1.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,id:ne:1.geojson", vec!["beta"])]
     #[tokio::test]
     async fn an_id_filter_returns_exactly_the_matching_features(#[case] path: &str, #[case] expected: Vec<&str>) {
         let s = state("filter", false);
@@ -191,8 +197,44 @@ mod tests {
     }
 
     #[rstest]
+    #[case("/@dataset:pts,prop:name:beta.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:name:eq:alpha.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:name:ne:alpha.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:name:ieq:ALPHA.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:pop:gt:500.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:pop:lt:500.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:pop:gte:900.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:pop:lte:100.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:name:gt:b.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:name:lt:b.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:name:sw:al.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:name:ew:ta.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:name:ct:et.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:code:ct:a_1.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:name:in:(alpha,beta).geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,prop:name:(alpha,beta).geojson", vec!["alpha", "beta"])]
+    #[case("/@dataset:pts,prop:name:nin:(alpha).geojson", vec!["beta"])]
+    #[case("/@dataset:pts,prop:pop:gt:500,prop:name:beta.geojson", vec!["beta"])]
+    #[case("/@dataset:pts,enc:utf-8,prop:name:alpha.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,id:1,prop:name:alpha.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:name:~alpha~.geojson", vec!["alpha"])]
+    #[tokio::test]
+    async fn a_prop_filter_returns_exactly_the_matching_features(#[case] path: &str, #[case] expected: Vec<&str>) {
+        let s = state("prop", false);
+        let (status, body) = get(s.clone(), &signed(&s, path)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{body} ({e})"));
+        let names: Vec<&str> =
+            parsed["features"].as_array().unwrap().iter().map(|f| f["properties"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, expected, "{body}");
+    }
+
+    #[rstest]
     #[case("/@dataset:pts,zzz:1.geojson", StatusCode::BAD_REQUEST)]
-    #[case("/@dataset:pts,id:1,id:2.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,prop:nosuch:1.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,prop:name:zzz:1.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,prop:pop:gt:abc.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,prop:only.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,enc:utf-8,enc:latin1.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:1:2.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:~1,enc:latin1.geojson", StatusCode::BAD_REQUEST)]
