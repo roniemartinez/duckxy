@@ -7,6 +7,7 @@ pub mod handler;
 pub mod parexp;
 pub mod query;
 pub mod routes;
+pub mod sql;
 pub mod url;
 
 use std::path::PathBuf;
