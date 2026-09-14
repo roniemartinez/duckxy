@@ -59,6 +59,15 @@ mod tests {
         {"type":"Feature","properties":{"id":2,"name":"beta","pop":900,"code":"aX1"},
          "geometry":{"type":"Point","coordinates":[3,4]}}]}"#;
 
+    const SHAPES: &str = r#"{"type":"FeatureCollection","features":[
+        {"type":"Feature","properties":{"name":"point"},"geometry":{"type":"Point","coordinates":[1,2]}},
+        {"type":"Feature","properties":{"name":"bowtie"},
+         "geometry":{"type":"Polygon","coordinates":[[[0,0],[1,1],[1,0],[0,1],[0,0]]]}},
+        {"type":"Feature","properties":{"name":"ring"},
+         "geometry":{"type":"LineString","coordinates":[[0,0],[1,0],[1,1],[0,0]]}},
+        {"type":"Feature","properties":{"name":"line"},
+         "geometry":{"type":"LineString","coordinates":[[0,0],[1,1]]}}]}"#;
+
     const NO_ID: &str = r#"{"type":"FeatureCollection","features":[
         {"type":"Feature","properties":{"name":"alpha"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
 
@@ -71,6 +80,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("pts.geojson"), POINTS).unwrap();
         fs::write(dir.join("noid.geojson"), NO_ID).unwrap();
+        fs::write(dir.join("shapes.geojson"), SHAPES).unwrap();
         AppState {
             root: DatasetRoot::new(dir),
             auth: Auth::new(Some(KEY), allow_insecure).unwrap(),
@@ -229,10 +239,43 @@ mod tests {
     }
 
     #[rstest]
+    #[case("/@dataset:shapes,type:Point.geojson", vec!["point"])]
+    #[case("/@dataset:shapes,type:point.geojson", vec!["point"])]
+    #[case("/@dataset:shapes,type:LineString.geojson", vec!["ring", "line"])]
+    #[case("/@dataset:shapes,type:Polygon.geojson", vec!["bowtie"])]
+    #[case("/@dataset:shapes,type:MultiPoint.geojson", vec![])]
+    #[case("/@dataset:shapes,valid:false.geojson", vec!["bowtie"])]
+    #[case("/@dataset:shapes,valid:true.geojson", vec!["point", "ring", "line"])]
+    #[case("/@dataset:shapes,simple:false.geojson", vec!["bowtie"])]
+    #[case("/@dataset:shapes,empty:false.geojson", vec!["point", "bowtie", "ring", "line"])]
+    #[case("/@dataset:shapes,empty:true.geojson", vec![])]
+    #[case("/@dataset:shapes,closed:true.geojson", vec!["ring"])]
+    #[case("/@dataset:shapes,closed:false.geojson", vec!["line"])]
+    #[case("/@dataset:shapes,closed:1.geojson", vec!["ring"])]
+    #[case("/@dataset:shapes,type:LineString,closed:false.geojson", vec!["line"])]
+    #[case("/@dataset:shapes,valid:true,prop:name:point.geojson", vec!["point"])]
+    #[tokio::test]
+    async fn a_geometry_predicate_returns_exactly_the_matching_features(
+        #[case] path: &str,
+        #[case] expected: Vec<&str>,
+    ) {
+        let s = state("shape", false);
+        let (status, body) = get(s.clone(), &signed(&s, path)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{body} ({e})"));
+        let names: Vec<&str> =
+            parsed["features"].as_array().unwrap().iter().map(|f| f["properties"]["name"].as_str().unwrap()).collect();
+        assert_eq!(names, expected, "{body}");
+    }
+
+    #[rstest]
     #[case("/@dataset:pts,zzz:1.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,prop:nosuch:1.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,prop:name:zzz:1.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,prop:pop:gt:abc.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,valid:yes.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,type:Banana.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,type:ST_Point.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,prop:pop:eq:abc.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:inf.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:NaN.geojson", StatusCode::BAD_REQUEST)]

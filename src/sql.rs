@@ -32,7 +32,7 @@ impl Pipeline {
     }
 
     pub fn filter(&mut self, filters: &[Segment], columns: &[(String, String)]) -> anyhow::Result<()> {
-        if let Some(predicate) = filters::condition(filters, columns)? {
+        if let Some(predicate) = filters::condition(filters, columns, &self.geometry)? {
             let filtered = Query::select().expr(Expr::cust("*")).from(self.input.clone()).and_where(predicate).take();
             self.step(filtered);
         }
@@ -71,14 +71,15 @@ impl Pipeline {
     }
 
     pub fn cte_once(&mut self, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
-        if let Some((_, _, full)) = self.side.iter().find(|(n, over, _)| n == name && over == &self.input_name) {
-            return Alias::new(full);
+        if let Some(alias) = self.cte(name) {
+            return alias;
         }
-        let seen = self.side.iter().filter(|(n, _, _)| n == name).count();
-        let full = match seen {
-            0 => format!("x_{name}"),
-            n => format!("x_{name}_{n}"),
-        };
+        let mut full = format!("x_{name}");
+        let mut seen = 0;
+        while self.side.iter().any(|(_, _, taken)| taken == &full) {
+            seen += 1;
+            full = format!("x_{name}_{seen}");
+        }
         let alias = Alias::new(&full);
         let select = build(&self.input);
         self.ctes.cte(CommonTableExpression::new().query(select).table_name(alias.clone()).to_owned());
@@ -86,8 +87,11 @@ impl Pipeline {
         alias
     }
 
-    pub fn has_cte(&self, name: &str) -> bool {
-        self.side.iter().any(|(n, _, _)| n == name)
+    pub fn cte(&self, name: &str) -> Option<Alias> {
+        self.side
+            .iter()
+            .find(|(registered, over, _)| registered == name && over == &self.input_name)
+            .map(|(_, _, full)| Alias::new(full))
     }
 
     pub fn input(&self) -> Alias {
@@ -157,6 +161,7 @@ pub fn build_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn geom_columns() -> Vec<(String, String)> {
         vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())]
@@ -182,13 +187,54 @@ mod tests {
     fn a_side_table_is_namespaced_shared_and_does_not_advance_the_input() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
-        assert!(!p.has_cte("extent"));
+        assert!(p.cte("extent").is_none());
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.cte_once("extent", |_| panic!("a repeated side table must not be rebuilt"));
-        assert!(p.has_cte("extent"));
+        assert!(p.cte("extent").is_some());
         let out = p.finish_raw();
         assert_eq!(out.matches("\"x_extent\" AS").count(), 1, "the side table was emitted twice: {out}");
         assert!(out.trim_end().ends_with("SELECT * FROM \"source\""), "a side table advanced the input: {out}");
+    }
+
+    #[test]
+    fn a_side_table_lookup_names_the_alias_built_over_the_current_input() {
+        let columns = geom_columns();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+        p.filter(&id_filter(), &columns).unwrap();
+        assert!(p.cte("extent").is_none(), "a side table from an earlier stage must not be reported as live");
+        p.cte_once("extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
+
+        let live = p.cte("extent").expect("a side table was built over the current input");
+        let out = Query::select().expr(Expr::cust("*")).from(live).to_owned().to_string(PostgresQueryBuilder);
+        assert!(out.ends_with("FROM \"x_extent_1\""), "the lookup named the stale alias: {out}");
+    }
+
+    #[rstest]
+    #[case(&["a", "a", "a_1"])]
+    #[case(&["a_1", "a", "a"])]
+    fn a_side_table_never_reuses_an_alias_another_one_took(#[case] names: &[&str]) {
+        let columns = geom_columns();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        for (at, name) in names.iter().enumerate() {
+            if at > 0 {
+                p.filter(&id_filter(), &columns).unwrap();
+            }
+            p.cte_once(name, |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+            assert!(p.cte(name).is_some(), "{name} was built but is not live");
+        }
+        let out = p.finish_raw();
+        let mut declared: Vec<&str> = out
+            .match_indices("\" AS (")
+            .map(|(at, _)| {
+                let open = out[..at].rfind('"').expect("a quoted cte name");
+                &out[open + 1..at]
+            })
+            .collect();
+        let total = declared.len();
+        declared.sort_unstable();
+        declared.dedup();
+        assert_eq!(declared.len(), total, "a cte name was declared twice: {out}");
     }
 
     #[test]

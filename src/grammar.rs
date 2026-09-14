@@ -3,6 +3,8 @@ pub enum Param {
     Column,
     Operator,
     Value,
+    Boolean,
+    GeometryType,
 }
 
 pub struct SegmentDef {
@@ -101,6 +103,11 @@ impl Grammar {
         let mut g = Grammar::default();
         g.filter(&["id"], &[&[Param::Value], &[Param::Operator, Param::Value]]);
         g.filter(&["prop"], &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]]);
+        g.filter(&["type"], &[&[Param::GeometryType]]);
+        g.filter(&["valid"], &[&[Param::Boolean]]);
+        g.filter(&["empty"], &[&[Param::Boolean]]);
+        g.filter(&["simple"], &[&[Param::Boolean]]);
+        g.filter(&["closed"], &[&[Param::Boolean]]);
         g
     }
 
@@ -152,7 +159,7 @@ mod tests {
     fn the_core_grammar_registers_the_built_in_filters() {
         let g = Grammar::core();
         let names: Vec<&str> = g.filters.iter().map(SegmentDef::canonical).collect();
-        assert_eq!(names, vec!["id", "prop"]);
+        assert_eq!(names, vec!["id", "prop", "type", "valid", "empty", "simple", "closed"]);
     }
 
     #[test]
@@ -166,6 +173,16 @@ mod tests {
     }
 
     #[rstest]
+    #[case("type", Param::GeometryType)]
+    #[case("valid", Param::Boolean)]
+    #[case("empty", Param::Boolean)]
+    #[case("simple", Param::Boolean)]
+    #[case("closed", Param::Boolean)]
+    fn a_geometry_predicate_takes_one_parameter_of_its_own_kind(#[case] name: &str, #[case] kind: Param) {
+        assert_eq!(Grammar::core().filter_for(name).unwrap().shapes, vec![vec![kind]]);
+    }
+
+    #[rstest]
     #[case("id", 1, true)]
     #[case("id", 2, true)]
     #[case("id", 3, false)]
@@ -173,6 +190,10 @@ mod tests {
     #[case("prop", 2, true)]
     #[case("prop", 3, true)]
     #[case("prop", 4, false)]
+    #[case("valid", 1, true)]
+    #[case("valid", 2, false)]
+    #[case("type", 1, true)]
+    #[case("type", 2, false)]
     fn a_filter_accepts_only_the_arities_it_registered(
         #[case] name: &str,
         #[case] params: usize,
