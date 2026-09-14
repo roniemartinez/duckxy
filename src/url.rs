@@ -131,7 +131,11 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
         if value.is_empty() {
             return Err(ParseError::EmptySourceValue);
         }
-        let trimmed = trim_filename(value);
+        let bounded = match action_at(value, grammar) {
+            Some(at) => &value[..at],
+            None => value,
+        };
+        let trimmed = trim_filename(bounded);
         scan.rewind(value.len() - trimmed.len());
         if !is_valid_path(trimmed) {
             return Err(ParseError::InvalidPath(trimmed.to_string()));
@@ -216,15 +220,21 @@ fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<St
     Ok((encoding, filters))
 }
 
-fn buried_action<'g>(name: &str, grammar: &'g Grammar) -> Option<&'g str> {
+fn action_at(name: &str, grammar: &Grammar) -> Option<usize> {
     name.match_indices("/@")
-        .filter_map(|(at, _)| {
+        .find(|(at, _)| {
             let rest = &name[at + 2..];
             let end = rest.find('/').unwrap_or(rest.len());
-            grammar.action_for(&rest[..end])
+            grammar.action_for(&rest[..end]).is_some()
         })
-        .map(|def| def.canonical())
-        .next()
+        .map(|(at, _)| at)
+}
+
+fn buried_action<'g>(name: &str, grammar: &'g Grammar) -> Option<&'g str> {
+    let at = action_at(name, grammar)?;
+    let rest = &name[at + 2..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    grammar.action_for(&rest[..end]).map(|def| def.canonical())
 }
 
 fn read_params(scan: &mut Scan<'_>) -> Vec<String> {
@@ -491,6 +501,18 @@ mod tests {
         let options: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS).copied().collect();
         let out = parse(&format!("/@dataset:x/@probe/{}.json", options.join(",")), &g).unwrap();
         assert_eq!(out.actions[0].segments.len(), MAX_OPTIONS);
+    }
+
+    #[rstest]
+    #[case("/@dataset:uk:gb.shp/@probe/aa/report.shp.json")]
+    #[case("/@dataset:uk:gb.shp/@probe/aa/report.json")]
+    #[case("/@dataset:uk:gb.shp/@probe/aa.json")]
+    #[case("/@dataset:uk:a/b.geojson/c.shp/@probe/aa/out.shp.json")]
+    fn a_download_name_that_looks_like_a_source_does_not_swallow_the_action(#[case] url: &str) {
+        let out = parse(url, &test_grammar()).unwrap();
+        assert!(out.path.as_deref().is_some_and(|p| !p.contains('@')), "the action leaked into the path: {out:?}");
+        assert_eq!(out.actions.len(), 1, "the action was lost: {out:?}");
+        assert_eq!(out.actions[0].segments[0].name, "aa");
     }
 
     #[test]
