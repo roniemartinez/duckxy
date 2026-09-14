@@ -135,6 +135,9 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
             Some(at) => &value[..at],
             None => value,
         };
+        if bounded.is_empty() {
+            return Err(ParseError::EmptySourceValue);
+        }
         let trimmed = trim_filename(bounded);
         scan.rewind(value.len() - trimmed.len());
         if !is_valid_path(trimmed) {
@@ -504,15 +507,28 @@ mod tests {
     }
 
     #[rstest]
-    #[case("/@dataset:uk:gb.shp/@probe/aa/report.shp.json")]
-    #[case("/@dataset:uk:gb.shp/@probe/aa/report.json")]
-    #[case("/@dataset:uk:gb.shp/@probe/aa.json")]
-    #[case("/@dataset:uk:a/b.geojson/c.shp/@probe/aa/out.shp.json")]
-    fn a_download_name_that_looks_like_a_source_does_not_swallow_the_action(#[case] url: &str) {
+    #[case("/@dataset:uk:gb.shp/@probe/aa/report.shp.json", "gb.shp")]
+    #[case("/@dataset:uk:gb.shp/@probe/aa/report.json", "gb.shp")]
+    #[case("/@dataset:uk:gb.shp/@probe/aa.json", "gb.shp")]
+    #[case("/@dataset:uk:a/b.geojson/c.shp/@probe/aa/out.shp.json", "a/b.geojson/c.shp")]
+    #[case("/@dataset:uk:member/@probe/aa.json", "member")]
+    fn a_download_name_that_looks_like_a_source_does_not_swallow_the_action(#[case] url: &str, #[case] path: &str) {
         let out = parse(url, &test_grammar()).unwrap();
-        assert!(out.path.as_deref().is_some_and(|p| !p.contains('@')), "the action leaked into the path: {out:?}");
+        assert_eq!(out.path.as_deref(), Some(path));
         assert_eq!(out.actions.len(), 1, "the action was lost: {out:?}");
         assert_eq!(out.actions[0].segments[0].name, "aa");
+    }
+
+    #[test]
+    fn the_sub_path_stops_at_the_first_action_not_the_last() {
+        let out = parse("/@dataset:uk:gb.shp/@probe/val:x.shp/@probe/bb/out.json", &test_grammar()).unwrap();
+        assert_eq!(out.path.as_deref(), Some("gb.shp"));
+        assert_eq!(out.actions.len(), 2, "an option value ending in .shp moved the boundary: {out:?}");
+    }
+
+    #[test]
+    fn a_sub_path_that_is_only_an_action_marker_is_an_empty_source_value() {
+        assert_eq!(parse("/@dataset:uk:/@probe/aa.json", &test_grammar()), Err(ParseError::EmptySourceValue));
     }
 
     #[test]
