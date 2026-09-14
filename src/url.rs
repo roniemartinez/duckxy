@@ -1,9 +1,11 @@
 use std::fmt;
 
-use crate::grammar::Grammar;
+use crate::grammar::{ActionDef, Grammar, SegmentDef};
 
 pub const DEFAULT_ENCODING: &str = crate::encodings::UTF8;
 pub const MAX_FILTERS: usize = 50;
+pub const MAX_ACTIONS: usize = 10;
+pub const MAX_OPTIONS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
@@ -12,11 +14,18 @@ pub struct Segment {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Action {
+    pub name: String,
+    pub segments: Vec<Segment>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedUrl {
     pub dataset: String,
     pub path: Option<String>,
     pub encoding: String,
     pub filters: Vec<Segment>,
+    pub actions: Vec<Action>,
     pub format: crate::formats::Format,
     pub extension: &'static str,
 }
@@ -35,6 +44,11 @@ pub enum ParseError {
     UnknownFormat(String),
     UnknownOption(String),
     UnknownSource(String),
+    UnknownAction(String),
+    ActionWithoutOptions(String),
+    MisplacedAction(String),
+    TooManyActions,
+    TooManyOptions,
     MalformedEncoding(String),
     MisplacedSourceOption(String),
     OptionTakesOneValue(String),
@@ -63,7 +77,12 @@ impl fmt::Display for ParseError {
             ParseError::MisplacedSourceOption(s) => write!(f, "source options must come before any filter: {s}"),
             ParseError::OptionTakesOneValue(s) => write!(f, "option takes exactly one value: {s}"),
             ParseError::WrongParameterCount(s) => write!(f, "filter has the wrong number of parameters: {s}"),
+            ParseError::UnknownAction(s) => write!(f, "unknown action: {s}"),
+            ParseError::ActionWithoutOptions(s) => write!(f, "action has no options: {s}"),
+            ParseError::MisplacedAction(s) => write!(f, "actions must come before the output name: {s}"),
             ParseError::TooManyFilters => write!(f, "at most {MAX_FILTERS} filters are allowed"),
+            ParseError::TooManyActions => write!(f, "at most {MAX_ACTIONS} actions are allowed"),
+            ParseError::TooManyOptions => write!(f, "at most {MAX_OPTIONS} options are allowed"),
             ParseError::UnbalancedValue(s) => write!(f, "value has unbalanced ~ or (): {s}"),
             ParseError::ValueTooDeep(s) => {
                 write!(f, "value nests groups more than {} deep: {s}", crate::parexp::MAX_DEPTH)
@@ -112,16 +131,46 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
         if value.is_empty() {
             return Err(ParseError::EmptySourceValue);
         }
-        if !is_valid_path(value) {
-            return Err(ParseError::InvalidPath(value.to_string()));
+        let bounded = match action_at(value, grammar) {
+            Some(at) => &value[..at],
+            None => value,
+        };
+        if bounded.is_empty() {
+            return Err(ParseError::EmptySourceValue);
         }
-        path = Some(trim_filename(value).to_string());
+        let trimmed = trim_filename(bounded);
+        scan.rewind(value.len() - trimmed.len());
+        if !is_valid_path(trimmed) {
+            return Err(ParseError::InvalidPath(trimmed.to_string()));
+        }
+        path = Some(trimmed.to_string());
     }
 
     let (encoding, filters) = read_options(&mut scan, grammar)?;
 
+    let mut actions: Vec<Action> = Vec::new();
+    while let Some(name) = scan.action_name() {
+        let Some(def) = grammar.action_for(name) else {
+            return Err(ParseError::UnknownAction(name.to_string()));
+        };
+        scan.advance(2 + name.len() + 1);
+        let segments = read_action_segments(&mut scan, def)?;
+        if actions.len() == MAX_ACTIONS {
+            return Err(ParseError::TooManyActions);
+        }
+        actions.push(Action { name: def.canonical().to_string(), segments });
+    }
+
     if scan.eat(b'/') {
         let name = scan.take_until(b"");
+        if let Some(bare) = name.strip_prefix('@')
+            && let Some(def) = grammar.action_for(bare)
+        {
+            return Err(ParseError::ActionWithoutOptions(def.canonical().to_string()));
+        }
+        if let Some(def) = buried_action(name, grammar) {
+            return Err(ParseError::MisplacedAction(def.to_string()));
+        }
         if name.contains(',') || name.contains(':') {
             return Err(ParseError::MisplacedOption(name.to_string()));
         }
@@ -132,7 +181,7 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
         None => DEFAULT_ENCODING.to_string(),
     };
 
-    Ok(ParsedUrl { dataset: name.to_string(), path, encoding, filters, format, extension })
+    Ok(ParsedUrl { dataset: name.to_string(), path, encoding, filters, actions, format, extension })
 }
 
 fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<String>, Vec<Segment>), ParseError> {
@@ -144,18 +193,15 @@ fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<St
         if spec.is_none() && !Grammar::RESERVED.contains(&key) {
             return Err(ParseError::UnknownOption(key.to_string()));
         }
-        let mut params: Vec<String> = Vec::new();
-        while scan.eat(b':') {
-            params.push(scan.take_value(b":,/").to_string());
-        }
-        if params.is_empty() || params.iter().any(String::is_empty) {
-            return Err(ParseError::EmptyOptionValue(key.to_string()));
-        }
-        for value in &params {
-            validate_value(value)?;
-        }
+        let params = read_params(scan);
         match key {
             _ if Grammar::RESERVED.contains(&key) => {
+                if params.is_empty() || params.iter().any(String::is_empty) {
+                    return Err(ParseError::EmptyOptionValue(key.to_string()));
+                }
+                for value in &params {
+                    validate_value(value)?;
+                }
                 let [value] = params.as_slice() else { return Err(ParseError::OptionTakesOneValue(key.to_string())) };
                 if !filters.is_empty() {
                     return Err(ParseError::MisplacedSourceOption(key.to_string()));
@@ -166,18 +212,77 @@ fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<St
                 encoding = Some(value.clone());
             }
             _ => {
-                let spec = spec.expect("checked above");
-                if !spec.accepts(params.len()) {
-                    return Err(ParseError::WrongParameterCount(key.to_string()));
-                }
+                let segment = finish_segment(key, params, spec.expect("checked above"))?;
                 if filters.len() == MAX_FILTERS {
                     return Err(ParseError::TooManyFilters);
                 }
-                filters.push(Segment { name: spec.canonical().to_string(), params });
+                filters.push(segment);
             }
         }
     }
     Ok((encoding, filters))
+}
+
+fn action_at(name: &str, grammar: &Grammar) -> Option<usize> {
+    name.match_indices("/@")
+        .find(|(at, _)| {
+            let rest = &name[at + 2..];
+            let end = rest.find('/').unwrap_or(rest.len());
+            grammar.action_for(&rest[..end]).is_some()
+        })
+        .map(|(at, _)| at)
+}
+
+fn buried_action<'g>(name: &str, grammar: &'g Grammar) -> Option<&'g str> {
+    let at = action_at(name, grammar)?;
+    let rest = &name[at + 2..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    grammar.action_for(&rest[..end]).map(|def| def.canonical())
+}
+
+fn read_params(scan: &mut Scan<'_>) -> Vec<String> {
+    let mut params: Vec<String> = Vec::new();
+    while scan.eat(b':') {
+        params.push(scan.take_value(b":,/").to_string());
+    }
+    params
+}
+
+fn finish_segment(key: &str, params: Vec<String>, def: &SegmentDef) -> Result<Segment, ParseError> {
+    if params.iter().any(String::is_empty) || (params.is_empty() && !def.accepts(0)) {
+        return Err(ParseError::EmptyOptionValue(key.to_string()));
+    }
+    for value in &params {
+        validate_value(value)?;
+    }
+    if !def.accepts(params.len()) {
+        return Err(ParseError::WrongParameterCount(key.to_string()));
+    }
+    Ok(Segment { name: def.canonical().to_string(), params })
+}
+
+fn read_action_segments(scan: &mut Scan<'_>, def: &ActionDef) -> Result<Vec<Segment>, ParseError> {
+    let mut out: Vec<Segment> = Vec::new();
+    loop {
+        let key = scan.take_until(b":,/");
+        if key.is_empty() {
+            return Err(ParseError::ActionWithoutOptions(def.canonical().to_string()));
+        }
+        let Some(option) = def.option(key) else {
+            return Err(ParseError::UnknownOption(key.to_string()));
+        };
+        let segment = finish_segment(key, read_params(scan), option)?;
+        if out.iter().any(|seen| seen.name == segment.name) {
+            return Err(ParseError::RepeatedOption(segment.name.clone()));
+        }
+        if out.len() == MAX_OPTIONS {
+            return Err(ParseError::TooManyOptions);
+        }
+        out.push(segment);
+        if !scan.eat(b',') {
+            return Ok(out);
+        }
+    }
 }
 
 struct Scan<'a> {
@@ -196,6 +301,24 @@ impl<'a> Scan<'a> {
             return true;
         }
         false
+    }
+
+    fn advance(&mut self, by: usize) {
+        self.at += by;
+    }
+
+    fn rewind(&mut self, by: usize) {
+        self.at -= by;
+    }
+
+    fn action_name(&self) -> Option<&'a str> {
+        let bytes = self.text.as_bytes();
+        if bytes.get(self.at) != Some(&b'/') || bytes.get(self.at + 1) != Some(&b'@') {
+            return None;
+        }
+        let rest = &self.text[self.at + 2..];
+        let end = rest.find('/')?;
+        (end > 0).then_some(&rest[..end])
     }
 
     fn take_until(&mut self, stops: &[u8]) -> &'a str {
@@ -283,7 +406,198 @@ pub fn is_valid_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grammar::{Param, action};
     use rstest::rstest;
+
+    fn test_grammar() -> Grammar {
+        let mut g = Grammar::core();
+        g.action(
+            action("probe")
+                .alias("p")
+                .option(&["aa", "a"], &[&[]])
+                .option(&["bb"], &[&[]])
+                .option(&["val"], &[&[Param::Value]])
+                .build(),
+        );
+        g
+    }
+
+    #[test]
+    fn core_rejects_an_action_it_does_not_know() {
+        let err = parse("/@dataset:pts/@probe/aa.json", &Grammar::core()).unwrap_err();
+        assert_eq!(err, ParseError::UnknownAction("probe".to_string()));
+    }
+
+    #[test]
+    fn a_registered_action_parses_with_its_options() {
+        let out = parse("/@dataset:pts/@probe/aa,bb.json", &test_grammar()).unwrap();
+        assert_eq!(out.actions.len(), 1);
+        assert_eq!(out.actions[0].name, "probe");
+        let names: Vec<&str> = out.actions[0].segments.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["aa", "bb"]);
+        assert!(out.actions[0].segments[0].params.is_empty(), "an option with no shape takes no parameters");
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts/@p/aa.json")]
+    #[case("/@dataset:pts/@probe/a.json")]
+    fn an_action_and_its_options_answer_to_their_aliases(#[case] url: &str) {
+        let out = parse(url, &test_grammar()).unwrap();
+        assert_eq!(out.actions[0].name, "probe", "the canonical action name is stored");
+        assert_eq!(out.actions[0].segments[0].name, "aa", "the canonical option name is stored");
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts/@probe/zz.json", ParseError::UnknownOption("zz".to_string()))]
+    #[case("/@dataset:pts/@probe/.json", ParseError::ActionWithoutOptions("probe".to_string()))]
+    #[case("/@dataset:pts/@probe/val.json", ParseError::EmptyOptionValue("val".to_string()))]
+    #[case("/@dataset:pts/@probe/val:.json", ParseError::EmptyOptionValue("val".to_string()))]
+    #[case("/@dataset:pts/@probe/aa:1.json", ParseError::WrongParameterCount("aa".to_string()))]
+    #[case("/@dataset:pts/@probe/aa,aa.json", ParseError::RepeatedOption("aa".to_string()))]
+    #[case("/@dataset:pts/@probe/aa,a.json", ParseError::RepeatedOption("aa".to_string()))]
+    fn an_action_option_is_held_to_its_registration(#[case] url: &str, #[case] expected: ParseError) {
+        assert_eq!(parse(url, &test_grammar()), Err(expected));
+    }
+
+    #[test]
+    fn an_action_survives_an_archive_sub_path() {
+        let out = parse("/@dataset:uk:gb.shp/@probe/aa.json", &test_grammar()).unwrap();
+        assert_eq!(out.path.as_deref(), Some("gb.shp"));
+        assert_eq!(out.actions.len(), 1, "the sub-path swallowed the action");
+    }
+
+    #[rstest]
+    #[case("/@dataset:uk:gb.shp/extra/@probe/aa.json")]
+    #[case("/@dataset:uk:gb.shp/a/b/@p/aa.json")]
+    fn an_action_buried_behind_a_download_name_is_rejected_not_dropped(#[case] url: &str) {
+        assert_eq!(parse(url, &test_grammar()), Err(ParseError::MisplacedAction("probe".to_string())));
+    }
+
+    #[test]
+    fn a_download_name_that_buries_no_registered_action_is_still_accepted() {
+        let out = parse("/@dataset:uk:gb.shp/extra/@nope/aa.json", &test_grammar()).unwrap();
+        assert_eq!(out.path.as_deref(), Some("gb.shp"));
+        assert!(out.actions.is_empty());
+    }
+
+    #[test]
+    fn an_at_prefixed_name_with_a_slash_is_read_as_an_action_not_a_filename() {
+        assert_eq!(
+            parse("/@dataset:pts/@a/b.json", &Grammar::core()),
+            Err(ParseError::UnknownAction("a".to_string())),
+            "an unknown action must not fall through to the filename slot"
+        );
+    }
+
+    #[test]
+    fn exactly_the_cap_is_accepted() {
+        let actions: String = (0..MAX_ACTIONS).map(|_| "/@probe/aa".to_string()).collect();
+        let out = parse(&format!("/@dataset:x{actions}.json"), &test_grammar()).unwrap();
+        assert_eq!(out.actions.len(), MAX_ACTIONS);
+
+        let mut g = Grammar::core();
+        let mut builder = action("probe");
+        for name in OPTION_NAMES {
+            builder = builder.option(&[name], &[&[]]);
+        }
+        g.action(builder.build());
+        let options: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS).copied().collect();
+        let out = parse(&format!("/@dataset:x/@probe/{}.json", options.join(",")), &g).unwrap();
+        assert_eq!(out.actions[0].segments.len(), MAX_OPTIONS);
+    }
+
+    #[rstest]
+    #[case("/@dataset:uk:gb.shp/@probe/aa/report.shp.json", "gb.shp")]
+    #[case("/@dataset:uk:gb.shp/@probe/aa/report.json", "gb.shp")]
+    #[case("/@dataset:uk:gb.shp/@probe/aa.json", "gb.shp")]
+    #[case("/@dataset:uk:a/b.geojson/c.shp/@probe/aa/out.shp.json", "a/b.geojson/c.shp")]
+    #[case("/@dataset:uk:member/@probe/aa.json", "member")]
+    fn a_download_name_that_looks_like_a_source_does_not_swallow_the_action(#[case] url: &str, #[case] path: &str) {
+        let out = parse(url, &test_grammar()).unwrap();
+        assert_eq!(out.path.as_deref(), Some(path));
+        assert_eq!(out.actions.len(), 1, "the action was lost: {out:?}");
+        assert_eq!(out.actions[0].segments[0].name, "aa");
+    }
+
+    #[test]
+    fn the_sub_path_stops_at_the_first_action_not_the_last() {
+        let out = parse("/@dataset:uk:gb.shp/@probe/val:x.shp/@probe/bb/out.json", &test_grammar()).unwrap();
+        assert_eq!(out.path.as_deref(), Some("gb.shp"));
+        assert_eq!(out.actions.len(), 2, "an option value ending in .shp moved the boundary: {out:?}");
+    }
+
+    #[test]
+    fn a_sub_path_that_is_only_an_action_marker_is_an_empty_source_value() {
+        assert_eq!(parse("/@dataset:uk:/@probe/aa.json", &test_grammar()), Err(ParseError::EmptySourceValue));
+    }
+
+    #[test]
+    fn a_registered_action_without_options_is_not_a_filename() {
+        let err = parse("/@dataset:pts/@probe.json", &test_grammar()).unwrap_err();
+        assert_eq!(err, ParseError::ActionWithoutOptions("probe".to_string()));
+    }
+
+    #[test]
+    fn a_download_filename_may_still_start_with_an_at_sign() {
+        let out = parse("/@dataset:uk/@2024-export.geojson", &test_grammar()).unwrap();
+        assert_eq!(out.dataset, "uk");
+        assert!(out.actions.is_empty(), "a filename is not an action");
+    }
+
+    #[test]
+    fn an_action_may_be_followed_by_a_download_filename() {
+        let out = parse("/@dataset:pts/@probe/aa/meta.json", &test_grammar()).unwrap();
+        assert_eq!(out.actions.len(), 1);
+        assert_eq!(out.dataset, "pts");
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts,type:Point/@probe/aa.json", "type")]
+    #[case("/@dataset:pts,valid:true/@probe/aa.json", "valid")]
+    fn a_geometry_predicate_applies_alongside_an_action(#[case] url: &str, #[case] filter: &str) {
+        let out = parse(url, &test_grammar()).unwrap();
+        assert_eq!(out.filters.len(), 1);
+        assert_eq!(out.filters[0].name, filter);
+        assert_eq!(out.actions.len(), 1);
+    }
+
+    #[test]
+    fn filters_still_apply_alongside_an_action() {
+        let out = parse("/@dataset:pts,id:1/@probe/aa.json", &test_grammar()).unwrap();
+        assert_eq!(out.filters.len(), 1);
+        assert_eq!(out.actions.len(), 1);
+    }
+
+    #[test]
+    fn a_tilde_quoted_value_containing_an_action_marker_is_not_an_action() {
+        let out = parse("/@dataset:pts,prop:name:~a/@probe~/@probe/aa.json", &test_grammar()).unwrap();
+        assert_eq!(out.filters[0].params[1], "~a/@probe~");
+        assert_eq!(out.actions.len(), 1, "only the real action counts");
+    }
+
+    #[test]
+    fn more_than_ten_actions_is_rejected() {
+        let many: String = (0..MAX_ACTIONS + 1).map(|_| "/@probe/aa".to_string()).collect();
+        assert_eq!(parse(&format!("/@dataset:x{many}.json"), &test_grammar()), Err(ParseError::TooManyActions));
+    }
+
+    #[test]
+    fn more_than_twenty_options_is_rejected() {
+        let mut g = Grammar::core();
+        let mut builder = action("probe");
+        for name in OPTION_NAMES {
+            builder = builder.option(&[name], &[&[]]);
+        }
+        g.action(builder.build());
+        let many: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS + 1).copied().collect();
+        let url = format!("/@dataset:x/@probe/{}.json", many.join(","));
+        assert_eq!(parse(&url, &g), Err(ParseError::TooManyOptions));
+    }
+
+    const OPTION_NAMES: [&str; 21] = [
+        "o0", "o1", "o2", "o3", "o4", "o5", "o6", "o7", "o8", "o9", "o10", "o11", "o12", "o13", "o14", "o15", "o16",
+        "o17", "o18", "o19", "o20",
+    ];
 
     #[rstest]
     #[case("/@dataset:plz-5stellig.json", "plz-5stellig", "json")]
