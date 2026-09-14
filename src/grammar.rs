@@ -24,9 +24,74 @@ impl SegmentDef {
     }
 }
 
+pub struct ActionDef {
+    pub names: Vec<&'static str>,
+    pub options: Vec<SegmentDef>,
+}
+
+impl ActionDef {
+    pub fn matches(&self, name: &str) -> bool {
+        self.names.contains(&name)
+    }
+
+    pub fn canonical(&self) -> &'static str {
+        self.names[0]
+    }
+
+    pub fn option(&self, name: &str) -> Option<&SegmentDef> {
+        self.options.iter().find(|option| option.matches(name))
+    }
+}
+
+pub fn action(name: &'static str) -> ActionBuilder {
+    ActionBuilder { names: vec![name], options: Vec::new() }
+}
+
+pub struct ActionBuilder {
+    names: Vec<&'static str>,
+    options: Vec<SegmentDef>,
+}
+
+impl ActionBuilder {
+    pub fn alias(mut self, name: &'static str) -> Self {
+        self.names.push(name);
+        self
+    }
+
+    pub fn option(mut self, names: &[&'static str], shapes: &[&[Param]]) -> Self {
+        assert!(!names.is_empty(), "an option needs at least one name");
+        for (at, name) in names.iter().enumerate() {
+            assert_scannable(name);
+            if self.options.iter().any(|option| option.matches(name)) || names[..at].contains(name) {
+                panic!("option {name:?} is already registered on this action");
+            }
+        }
+        self.options.push(SegmentDef { names: names.to_vec(), shapes: shapes.iter().map(|s| s.to_vec()).collect() });
+        self
+    }
+
+    pub fn build(self) -> ActionDef {
+        assert!(!self.options.is_empty(), "action {:?} has no options", self.names[0]);
+        for (at, name) in self.names.iter().enumerate() {
+            assert_scannable(name);
+            if self.names[..at].contains(name) {
+                panic!("action name {name:?} is repeated in its own registration");
+            }
+        }
+        ActionDef { names: self.names, options: self.options }
+    }
+}
+
+fn assert_scannable(name: &str) {
+    if name.is_empty() || name.contains([':', ',', '/']) {
+        panic!("name {name:?} can never be parsed from a url");
+    }
+}
+
 #[derive(Default)]
 pub struct Grammar {
     pub filters: Vec<SegmentDef>,
+    pub actions: Vec<ActionDef>,
 }
 
 impl Grammar {
@@ -43,9 +108,7 @@ impl Grammar {
         assert!(!names.is_empty(), "a filter needs at least one name");
         assert!(!shapes.iter().any(|shape| shape.is_empty()), "a filter shape needs at least one parameter");
         for (at, name) in names.iter().enumerate() {
-            if name.is_empty() || name.contains([':', ',', '/']) {
-                panic!("filter name {name:?} can never be parsed from a url");
-            }
+            assert_scannable(name);
             if Grammar::RESERVED.contains(name) {
                 panic!("filter name {name:?} is reserved for the source encoding");
             }
@@ -61,8 +124,22 @@ impl Grammar {
         self
     }
 
+    pub fn action(&mut self, def: ActionDef) -> &mut Self {
+        for name in &def.names {
+            if self.action_for(name).is_some() {
+                panic!("action {name:?} is already registered");
+            }
+        }
+        self.actions.push(def);
+        self
+    }
+
     pub fn filter_for(&self, name: &str) -> Option<&SegmentDef> {
         self.filters.iter().find(|filter| filter.matches(name))
+    }
+
+    pub fn action_for(&self, name: &str) -> Option<&ActionDef> {
+        self.actions.iter().find(|action| action.matches(name))
     }
 }
 
@@ -158,6 +235,73 @@ mod tests {
     #[should_panic(expected = "a filter shape needs at least one parameter")]
     fn registering_a_shape_with_no_parameters_panics() {
         Grammar::default().filter(&["flag"], &[&[]]);
+    }
+
+    #[test]
+    fn an_action_resolves_its_aliases_to_canonical_names() {
+        let def = action("probe").alias("p").option(&["aa", "a"], &[&[]]).build();
+        assert!(def.matches("probe") && def.matches("p"));
+        assert_eq!(def.canonical(), "probe");
+        assert_eq!(def.option("a").unwrap().canonical(), "aa");
+        assert!(def.option("zz").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "action \"probe\" is already registered")]
+    fn registering_an_action_name_twice_panics() {
+        let mut g = Grammar::default();
+        g.action(action("probe").option(&["aa"], &[&[]]).build());
+        g.action(action("probe").option(&["bb"], &[&[]]).build());
+    }
+
+    #[test]
+    #[should_panic(expected = "action \"p\" is already registered")]
+    fn registering_an_action_alias_another_action_owns_panics() {
+        let mut g = Grammar::default();
+        g.action(action("probe").alias("p").option(&["aa"], &[&[]]).build());
+        g.action(action("point").alias("p").option(&["bb"], &[&[]]).build());
+    }
+
+    #[test]
+    #[should_panic(expected = "action \"probe\" has no options")]
+    fn building_an_action_with_no_options_panics() {
+        action("probe").build();
+    }
+
+    #[test]
+    #[should_panic(expected = "option \"aa\" is already registered on this action")]
+    fn registering_an_option_name_twice_panics() {
+        action("probe").option(&["aa"], &[&[]]).option(&["aa"], &[&[Param::Value]]).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "action name \"p\" is repeated")]
+    fn repeating_an_action_name_inside_one_registration_panics() {
+        action("p").alias("p").option(&["aa"], &[&[]]).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "option \"aa\" is already registered on this action")]
+    fn repeating_an_option_name_inside_one_registration_panics() {
+        action("probe").option(&["aa", "aa"], &[&[]]).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "can never be parsed from a url")]
+    fn registering_an_action_name_the_scanner_cannot_produce_panics() {
+        action("a/b").option(&["aa"], &[&[]]).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "can never be parsed from a url")]
+    fn registering_an_option_name_the_scanner_cannot_produce_panics() {
+        action("probe").option(&["a/b"], &[&[]]).build();
+    }
+
+    #[test]
+    fn an_action_option_may_take_no_parameters_unlike_a_filter() {
+        let def = action("probe").option(&["aa"], &[&[]]).build();
+        assert!(def.option("aa").unwrap().accepts(0));
     }
 
     #[test]
