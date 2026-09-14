@@ -32,7 +32,7 @@ impl Pipeline {
     }
 
     pub fn filter(&mut self, filters: &[Segment], columns: &[(String, String)]) -> anyhow::Result<()> {
-        if let Some(predicate) = filters::condition(filters, columns)? {
+        if let Some(predicate) = filters::condition(filters, columns, &self.geometry)? {
             let filtered = Query::select().expr(Expr::cust("*")).from(self.input.clone()).and_where(predicate).take();
             self.step(filtered);
         }

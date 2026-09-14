@@ -405,6 +405,19 @@ mod tests {
     }
 
     #[rstest]
+    #[case("/@dataset:x,type:Point.geojson", "type", "Point")]
+    #[case("/@dataset:x,valid:true.geojson", "valid", "true")]
+    #[case("/@dataset:x,empty:false.geojson", "empty", "false")]
+    #[case("/@dataset:x,simple:1.geojson", "simple", "1")]
+    #[case("/@dataset:x,closed:0.geojson", "closed", "0")]
+    fn a_geometry_predicate_keeps_its_one_parameter(#[case] url: &str, #[case] name: &str, #[case] value: &str) {
+        let p = parse(url, &Grammar::core()).unwrap();
+        assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
+        assert_eq!(p.filters[0].name, name);
+        assert_eq!(p.filters[0].params, vec![value]);
+    }
+
+    #[rstest]
     #[case("/@dataset:x,prop:a:1,prop:b:2.geojson")]
     #[case("/@dataset:x,id:gte:5,id:lte:10.geojson")]
     #[case("/@dataset:x,id:1,prop:a:2.geojson")]
@@ -427,6 +440,9 @@ mod tests {
     #[rstest]
     #[case("/@dataset:x,prop:only.geojson", ParseError::WrongParameterCount("prop".to_string()))]
     #[case("/@dataset:x,prop:a:b:c:d.geojson", ParseError::WrongParameterCount("prop".to_string()))]
+    #[case("/@dataset:x,valid:true:false.geojson", ParseError::WrongParameterCount("valid".to_string()))]
+    #[case("/@dataset:x,type:Point:Line.geojson", ParseError::WrongParameterCount("type".to_string()))]
+    #[case("/@dataset:x,closed.geojson", ParseError::EmptyOptionValue("closed".to_string()))]
     #[case("/@dataset:x,id:a:b:c.geojson", ParseError::WrongParameterCount("id".to_string()))]
     #[case("/@dataset:x,prop.geojson", ParseError::EmptyOptionValue("prop".to_string()))]
     fn a_filter_takes_the_parameter_count_its_spec_allows(#[case] url: &str, #[case] expected: ParseError) {
