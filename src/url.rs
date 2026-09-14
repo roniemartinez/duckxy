@@ -513,6 +513,16 @@ mod tests {
         assert_eq!(out.dataset, "pts");
     }
 
+    #[rstest]
+    #[case("/@dataset:pts,type:Point/@probe/aa.json", "type")]
+    #[case("/@dataset:pts,valid:true/@probe/aa.json", "valid")]
+    fn a_geometry_predicate_applies_alongside_an_action(#[case] url: &str, #[case] filter: &str) {
+        let out = parse(url, &test_grammar()).unwrap();
+        assert_eq!(out.filters.len(), 1);
+        assert_eq!(out.filters[0].name, filter);
+        assert_eq!(out.actions.len(), 1);
+    }
+
     #[test]
     fn filters_still_apply_alongside_an_action() {
         let out = parse("/@dataset:pts,id:1/@probe/aa.json", &test_grammar()).unwrap();
