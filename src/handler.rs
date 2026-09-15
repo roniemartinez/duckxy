@@ -19,6 +19,7 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
 
     let root = state.root;
     let backend = state.backend;
+    let grammar = state.grammar;
     let output = parsed.output.clone();
     let framing = parsed.output.clone();
     let download = format!("{}.{}", parsed.dataset, parsed.extension);
@@ -48,9 +49,7 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
             &source,
             &encoding,
             output.separator(),
-            |columns, crs| {
-                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed, &source, columns, crs, backend.clone())
-            },
+            |columns, crs| crate::sql::plan(&grammar, &parsed, &source, columns, crs, backend.clone()),
             || {
                 if let Some(ready_tx) = ready.take() {
                     let _ = ready_tx.send(Ok(()));

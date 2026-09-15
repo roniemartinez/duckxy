@@ -71,6 +71,39 @@ mod tests {
     const NO_ID: &str = r#"{"type":"FeatureCollection","features":[
         {"type":"Feature","properties":{"name":"alpha"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
 
+    fn counted(ctx: &mut crate::grammar::StageCtx) -> sea_query::SimpleExpr {
+        sea_query::Expr::cust_with_exprs("CAST(COUNT($1) AS VARCHAR)", [ctx.geom()])
+    }
+
+    fn one_row(
+        ctx: &mut crate::grammar::StageCtx,
+        parts: Vec<(&'static str, sea_query::SimpleExpr)>,
+    ) -> sea_query::SelectStatement {
+        let mut select = sea_query::Query::select();
+        for (name, expr) in parts {
+            select.expr_as(expr, sea_query::Alias::new(name));
+        }
+        select.from(ctx.data()).take()
+    }
+
+    fn extended_state(tag: &str) -> AppState {
+        let base = state(tag, false);
+        let mut grammar = crate::grammar::Grammar::core();
+        grammar.action(crate::grammar::action("probe").option(&["n"], counted).terminal(one_row).build());
+        AppState::new(base.root.clone(), base.auth.clone(), grammar)
+    }
+
+    #[tokio::test]
+    async fn a_registered_action_is_planned_with_the_grammar_that_parsed_it() {
+        let s = extended_state("probe");
+        let (status, body) = get(s.clone(), &signed(&s, "/@dataset:pts/@probe/n.json")).await;
+        assert!(
+            !body.contains("not registered in this grammar"),
+            "the planner used a different grammar than the parser: {body}"
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     fn state(tag: &str, allow_insecure: bool) -> AppState {
         crate::ensure_spatial();
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
