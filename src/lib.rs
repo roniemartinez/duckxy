@@ -109,8 +109,7 @@ impl FromRef<AppState> for Auth {
 
 #[cfg(test)]
 pub(crate) fn ensure_spatial() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| query::install_extensions().expect("install spatial"));
+    query::install_extensions().expect("install spatial");
 }
 
 #[cfg(test)]
