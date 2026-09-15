@@ -1,10 +1,11 @@
+use crate::grammar::FromParam;
 use crate::parexp;
 use crate::url::Segment;
 use sea_query::{Alias, Expr, ExprTrait, Func, LikeExpr, Query, SimpleExpr};
 use std::fmt;
 
 const ID_CANDIDATES: [&str; 4] = ["id", "fid", "gid", "objectid"];
-const GEOMETRY_TYPES: [&str; 7] =
+pub const GEOMETRY_TYPES: [&str; 7] =
     ["POINT", "LINESTRING", "POLYGON", "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION"];
 const LINEAR_TYPES: [&str; 2] = ["LINESTRING", "MULTILINESTRING"];
 
@@ -94,11 +95,9 @@ fn text(value: SimpleExpr) -> SimpleExpr {
 }
 
 fn boolean(value: &str) -> Result<bool, FilterError> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" => Ok(true),
-        "false" | "0" => Ok(false),
-        _ => Err(FilterError::NotABoolean(value.to_string())),
-    }
+    crate::grammar::Boolean::from_param(value)
+        .map(|parsed| parsed.0)
+        .ok_or_else(|| FilterError::NotABoolean(value.to_string()))
 }
 
 fn named_type(value: &str) -> Result<&'static str, FilterError> {
@@ -258,7 +257,7 @@ mod tests {
         for def in &crate::grammar::Grammar::core().filters {
             for shape in &def.shapes {
                 let segment =
-                    Segment { name: def.canonical().to_string(), params: vec!["name".to_string(); shape.len()] };
+                    Segment { name: def.canonical().to_string(), params: vec!["name".to_string(); shape.params.len()] };
                 let outcome = condition(&[segment], &columns, "geom");
                 assert!(
                     !matches!(outcome, Err(FilterError::UnknownFilter(_))),

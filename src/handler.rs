@@ -95,6 +95,9 @@ fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
     if let Some(no_geometry) = e.downcast_ref::<query::NoGeometry>() {
         return (StatusCode::UNPROCESSABLE_ENTITY, no_geometry.to_string());
     }
+    if let Some(param_error) = e.downcast_ref::<crate::grammar::ParamError>() {
+        return (StatusCode::BAD_REQUEST, param_error.to_string());
+    }
     if let Some(filter_error) = e.downcast_ref::<crate::filters::FilterError>() {
         let status = match filter_error {
             crate::filters::FilterError::NoIdColumn => StatusCode::UNPROCESSABLE_ENTITY,
@@ -155,6 +158,18 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(message, "source could not be opened as a geospatial dataset");
         assert!(!message.contains("/srv/data"), "the data root leaked: {message}");
+    }
+
+    #[test]
+    fn a_bad_action_parameter_is_a_client_error() {
+        let raw = anyhow::Error::new(crate::grammar::ParamError {
+            at: 0,
+            expected: crate::grammar::Param::Boolean,
+            got: "banana".to_string(),
+        });
+        let (status, message) = error_status(&raw, "UTF-8");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(message.contains("true or false"), "{message}");
     }
 
     #[test]

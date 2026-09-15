@@ -1,7 +1,10 @@
 use crate::formats::Format;
-use crate::url::Segment;
+use crate::grammar::{Grammar, StageCtx};
+use crate::url::{ParsedUrl, Segment};
 use crate::{filters, query};
-use sea_query::{Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, SelectStatement, WithClause};
+use sea_query::{
+    Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr, WithClause,
+};
 
 pub struct Pipeline {
     ctes: WithClause,
@@ -94,6 +97,10 @@ impl Pipeline {
             .map(|(_, _, full)| Alias::new(full))
     }
 
+    pub fn geometry(&self) -> &str {
+        &self.geometry
+    }
+
     pub fn input(&self) -> Alias {
         self.input.clone()
     }
@@ -158,6 +165,49 @@ pub fn build_sql(
     Ok(pipeline.finish(format))
 }
 
+pub fn plan(
+    grammar: &Grammar,
+    parsed: &ParsedUrl,
+    source: &str,
+    columns: &[(String, String)],
+    crs: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut pipeline = Pipeline::source(source, &parsed.encoding, columns)?;
+    pipeline.filter(&parsed.filters, columns)?;
+    pipeline.reproject(crs, parsed.format);
+
+    if parsed.actions.is_empty() {
+        return Ok(pipeline.finish(parsed.format));
+    }
+
+    for action in &parsed.actions {
+        let Some(def) = grammar.action_for(&action.name) else {
+            anyhow::bail!("action {:?} is not registered in this grammar", action.name);
+        };
+        let select = {
+            let mut ctx = StageCtx::new(&mut pipeline);
+            let mut parts: Vec<(&'static str, SimpleExpr)> = Vec::new();
+            for segment in &action.segments {
+                let Some(option) = def.option(&segment.name) else {
+                    return Err(anyhow::anyhow!("option {:?} is not registered on {:?}", segment.name, action.name));
+                };
+                let Some(fragment) = option.shape_for(segment.params.len()).and_then(|s| s.fragment.as_ref()) else {
+                    return Err(anyhow::anyhow!(
+                        "option {:?} does not take {} parameters",
+                        segment.name,
+                        segment.params.len()
+                    ));
+                };
+                let expr = fragment(&mut ctx, &segment.params).map_err(anyhow::Error::new)?;
+                parts.push((option.canonical(), expr));
+            }
+            (def.assemble)(&mut ctx, parts)
+        };
+        pipeline.step(select);
+    }
+    Ok(pipeline.finish_raw())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +219,156 @@ mod tests {
 
     fn id_filter() -> Vec<Segment> {
         vec![Segment { name: "id".to_string(), params: vec!["7".to_string()] }]
+    }
+
+    fn probe_grammar() -> Grammar {
+        fn bounds(ctx: &mut StageCtx) -> SimpleExpr {
+            let extent = ctx.cte_once("extent", |from| {
+                Query::select().expr_as(Expr::cust("ST_Extent(geom)"), Alias::new("e")).from(from.clone()).take()
+            });
+            Expr::col((extent, Alias::new("e")))
+        }
+        fn count(_: &mut StageCtx) -> SimpleExpr {
+            Expr::cust("COUNT(*)")
+        }
+        fn width(ctx: &mut StageCtx) -> SimpleExpr {
+            let extent = ctx.cte_once("extent", |from| {
+                Query::select().expr_as(Expr::cust("ST_Extent(geom)"), Alias::new("e")).from(from.clone()).take()
+            });
+            Expr::cust_with_exprs("ST_XMax($1)", [Expr::col((extent, Alias::new("e")))])
+        }
+        fn three(
+            _: &mut StageCtx,
+            c: crate::grammar::Column,
+            o: crate::grammar::Operator,
+            v: crate::grammar::Value,
+        ) -> SimpleExpr {
+            Expr::cust(format!("{}|{}|{}", c.0, o.0, v.0))
+        }
+        fn assemble(ctx: &mut StageCtx, parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
+            let mut select = Query::select();
+            for (name, expr) in parts {
+                select.expr_as(expr, Alias::new(name));
+            }
+            select.from(ctx.data());
+            if let Some(extent) = ctx.cte("extent") {
+                select.from(extent);
+            }
+            select.take()
+        }
+        let mut g = Grammar::core();
+        g.action(
+            crate::grammar::action("probe")
+                .option(&["bounds", "b"], bounds)
+                .option(&["count", "n"], count)
+                .option(&["width"], width)
+                .option(&["three"], three)
+                .terminal(assemble)
+                .build(),
+        );
+        g
+    }
+
+    fn planned(url: &str) -> String {
+        let grammar = probe_grammar();
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        plan(&grammar, &parsed, "/x.geojson", &columns, None).unwrap()
+    }
+
+    #[test]
+    fn a_request_with_no_action_is_the_feature_pipeline() {
+        let out = planned("/@dataset:x.geojson");
+        assert!(out.contains("ST_AsGeoJSON"), "{out}");
+        assert!(!out.contains("COUNT(*)"), "{out}");
+    }
+
+    #[test]
+    fn an_action_replaces_the_feature_select_with_its_own() {
+        let out = planned("/@dataset:x/@probe/count.json");
+        assert!(out.contains("COUNT(*) AS \"count\""), "{out}");
+        assert!(!out.contains("ST_AsGeoJSON"), "an action must skip the geojson conversion: {out}");
+    }
+
+    #[test]
+    fn option_expressions_arrive_in_url_order_under_canonical_names() {
+        let out = planned("/@dataset:x/@probe/n,b.json");
+        let count_at = out.find("AS \"count\"").expect("count");
+        let bounds_at = out.find("AS \"bounds\"").expect("bounds");
+        assert!(count_at < bounds_at, "aliases must not reorder the parts: {out}");
+    }
+
+    #[test]
+    fn a_fragment_may_add_a_side_table_that_options_share() {
+        let out = planned("/@dataset:x/@probe/b,width.json");
+        assert_eq!(out.matches("\"x_extent\" AS").count(), 1, "{out}");
+        assert!(out.contains("\"x_extent\""), "the side table must be joined, not dangling: {out}");
+    }
+
+    #[test]
+    fn every_option_sees_the_same_relation() {
+        let out = planned("/@dataset:x,id:7/@probe/count,bounds,width.json");
+        assert_eq!(out.matches("FROM \"step_1\"").count(), 2, "options disagreed about the input: {out}");
+        assert_eq!(out.matches("\"x_extent\" AS").count(), 1, "the shared side table was built twice: {out}");
+    }
+
+    #[test]
+    fn a_fragment_receives_its_parameters_in_order() {
+        let out = planned("/@dataset:x/@probe/three:name:eq:foo.json");
+        assert!(out.contains("name|eq|foo AS \"three\""), "parameters arrived out of order: {out}");
+    }
+
+    #[test]
+    fn a_bad_parameter_reports_its_own_position() {
+        fn flagged(_: &mut StageCtx, _v: crate::grammar::Value, _f: crate::grammar::Boolean) -> SimpleExpr {
+            Expr::cust("1")
+        }
+        fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
+            Query::select().expr(Expr::cust("1")).take()
+        }
+        let mut grammar = Grammar::core();
+        grammar.action(crate::grammar::action("probe").option(&["pair"], flagged).terminal(assemble).build());
+        let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse("/@dataset:x/@probe/pair:ok:banana.json", &grammar).unwrap();
+        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None).unwrap_err();
+        let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
+        assert_eq!(typed.at, 1, "the wrong parameter position was reported");
+        assert_eq!(typed.got, "banana");
+    }
+
+    #[test]
+    fn an_action_still_reprojects_a_source_that_is_not_wgs84() {
+        let grammar = probe_grammar();
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse("/@dataset:x/@probe/count.json", &grammar).unwrap();
+        let out = plan(&grammar, &parsed, "/x.geojson", &columns, Some("EPSG:25832")).unwrap();
+        assert!(out.contains("ST_Transform"), "an action skipped reprojection: {out}");
+        assert!(out.find("ST_Transform") < out.find("COUNT(*)"), "reprojection must precede the action: {out}");
+    }
+
+    #[test]
+    fn a_filter_applies_before_the_action_runs() {
+        let out = planned("/@dataset:x,id:7/@probe/count.json");
+        assert!(out.contains("\"step_1\" AS (SELECT * FROM \"source\" WHERE"), "{out}");
+        assert!(out.contains("COUNT(*) AS \"count\" FROM \"step_1\""), "the action must read the filtered rows: {out}");
+    }
+
+    #[test]
+    fn a_bad_action_parameter_surfaces_as_a_typed_error() {
+        fn flagged(_: &mut StageCtx, _flag: crate::grammar::Boolean) -> SimpleExpr {
+            Expr::cust("1")
+        }
+        fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
+            Query::select().expr(Expr::cust("1")).take()
+        }
+        let mut grammar = Grammar::core();
+        grammar.action(crate::grammar::action("probe").option(&["flag"], flagged).terminal(assemble).build());
+        let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse("/@dataset:x/@probe/flag:banana.json", &grammar).unwrap();
+        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None).unwrap_err();
+        let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
+        assert_eq!(typed.expected, crate::grammar::Param::Boolean);
+        assert_eq!(typed.got, "banana");
     }
 
     #[test]
