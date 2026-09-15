@@ -12,7 +12,7 @@ pub struct Pipeline {
     ctes: WithClause,
     input: Alias,
     input_name: String,
-    steps: usize,
+    steps: Vec<(String, usize)>,
     geometry: String,
     backend: Arc<Backend>,
     side: Vec<(String, String, String)>,
@@ -39,13 +39,21 @@ impl Pipeline {
                 .table_name(input.clone())
                 .to_owned(),
         );
-        Ok(Self { ctes, input, input_name: "source".to_string(), steps: 0, geometry, backend, side: Vec::new() })
+        Ok(Self {
+            ctes,
+            input,
+            input_name: "source".to_string(),
+            steps: Vec::new(),
+            geometry,
+            backend,
+            side: Vec::new(),
+        })
     }
 
     pub fn filter(&mut self, filters: &[Segment], columns: &[(String, String)]) -> anyhow::Result<()> {
         if let Some(predicate) = filters::condition(filters, columns, &self.geometry)? {
             let filtered = Query::select().expr(Expr::cust("*")).from(self.input.clone()).and_where(predicate).take();
-            self.step(filtered);
+            self.step("step", filtered);
         }
         Ok(())
     }
@@ -64,39 +72,50 @@ impl Pipeline {
             ))
             .from(self.input.clone())
             .take();
-        self.step(reprojected);
+        self.step("step", reprojected);
     }
 
-    pub fn step(&mut self, select: SelectStatement) {
-        self.steps += 1;
-        let name = format!("step_{}", self.steps);
+    pub fn step(&mut self, prefix: &str, select: SelectStatement) {
+        let n = match self.steps.iter_mut().find(|(known, _)| known == prefix) {
+            Some((_, seen)) => {
+                *seen += 1;
+                *seen
+            }
+            None => {
+                self.steps.push((prefix.to_string(), 1));
+                1
+            }
+        };
+        let name = format!("{prefix}_{n}");
         let alias = Alias::new(&name);
         self.ctes.cte(CommonTableExpression::new().query(select).table_name(alias.clone()).to_owned());
         self.input = alias;
         self.input_name = name;
     }
 
-    pub fn cte_once(&mut self, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
-        if let Some(alias) = self.cte(name) {
+    pub fn cte_once(&mut self, prefix: &str, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
+        if let Some(alias) = self.cte(prefix, name) {
             return alias;
         }
-        let mut full = format!("x_{name}");
+        let key = format!("{prefix}_{name}");
+        let mut full = key.clone();
         let mut seen = 0;
         while self.side.iter().any(|(_, _, taken)| taken == &full) {
             seen += 1;
-            full = format!("x_{name}_{seen}");
+            full = format!("{key}_{seen}");
         }
         let alias = Alias::new(&full);
         let select = build(&self.input);
         self.ctes.cte(CommonTableExpression::new().query(select).table_name(alias.clone()).to_owned());
-        self.side.push((name.to_string(), self.input_name.clone(), full));
+        self.side.push((key, self.input_name.clone(), full));
         alias
     }
 
-    pub fn cte(&self, name: &str) -> Option<Alias> {
+    pub fn cte(&self, prefix: &str, name: &str) -> Option<Alias> {
+        let key = format!("{prefix}_{name}");
         self.side
             .iter()
-            .find(|(registered, over, _)| registered == name && over == &self.input_name)
+            .find(|(registered, over, _)| registered == &key && over == &self.input_name)
             .map(|(_, _, full)| Alias::new(full))
     }
 
@@ -104,12 +123,12 @@ impl Pipeline {
         &self.geometry
     }
 
-    pub fn replace_geometry(&mut self, geometry: SimpleExpr) {
+    pub fn replace_geometry(&mut self, prefix: &str, geometry: SimpleExpr) {
         let select = Query::select()
             .expr(Expr::cust_with_exprs("* REPLACE ($1 AS $2)", [geometry, Expr::col(Alias::new(&self.geometry))]))
             .from(self.input.clone())
             .take();
-        self.step(select);
+        self.step(prefix, select);
     }
 
     pub fn backend(&self) -> &Arc<Backend> {
@@ -158,12 +177,12 @@ pub fn plan(
                 }
             }
         }
-        let mut ctx = StageCtx::new(&mut pipeline);
+        let mut ctx = StageCtx::new(&mut pipeline, def.canonical());
         def.run(&mut ctx, &action.segments)?;
     }
 
     let select = {
-        let mut ctx = StageCtx::new(&mut pipeline);
+        let mut ctx = StageCtx::new(&mut pipeline, "out");
         parsed.output.clone().rows(&mut ctx, parsed)?
     };
     Ok(pipeline.finish(select))
@@ -199,7 +218,7 @@ mod tests {
 
     impl crate::grammar::Action for Probe {
         fn name(&self) -> &'static str {
-            "probe"
+            "test"
         }
 
         fn options(&self) -> &'static [crate::grammar::Opt] {
@@ -255,6 +274,34 @@ mod tests {
         }
     }
 
+    struct Second;
+
+    impl crate::grammar::Action for Second {
+        fn name(&self) -> &'static str {
+            "second"
+        }
+
+        fn options(&self) -> &'static [crate::grammar::Opt] {
+            const OPTIONS: &[crate::grammar::Opt] = &[crate::grammar::flag("tally", "")];
+            OPTIONS
+        }
+
+        fn run(&self, ctx: &mut StageCtx, _: &[Segment]) -> anyhow::Result<()> {
+            let extent = ctx.cte_once("extent", |from| {
+                Query::select().expr_as(Expr::cust("ST_Extent_Agg(geom)"), Alias::new("e")).from(from.clone()).take()
+            });
+            let data = ctx.data();
+            ctx.step(
+                Query::select()
+                    .expr(Expr::cust("*"))
+                    .expr_as(Expr::col((extent, Alias::new("e"))), Alias::new("tally"))
+                    .from(data)
+                    .take(),
+            );
+            Ok(())
+        }
+    }
+
     struct Typed;
 
     impl crate::grammar::Action for Typed {
@@ -280,17 +327,51 @@ mod tests {
         g
     }
 
-    fn probe_grammar() -> Grammar {
+    fn test_action_grammar() -> Grammar {
         let mut g = Grammar::core();
         g.register_action(Probe);
         g
     }
 
     fn planned(url: &str) -> String {
-        let grammar = probe_grammar();
+        planned_with(url, test_action_grammar())
+    }
+
+    fn planned_with(url: &str, grammar: Grammar) -> String {
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse(url, &grammar).unwrap();
         plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap()
+    }
+
+    #[test]
+    fn a_step_counter_is_kept_per_prefix() {
+        let columns = geom_columns();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        p.step("step", Query::select().expr(Expr::cust("1")).from(p.input()).take());
+        p.step("alpha", Query::select().expr(Expr::cust("2")).from(p.input()).take());
+        p.step("step", Query::select().expr(Expr::cust("3")).from(p.input()).take());
+        let out = rendered(p);
+        assert!(out.contains("\"step_1\" AS (SELECT 1 FROM \"source\")"), "{out}");
+        assert!(out.contains("\"alpha_1\" AS (SELECT 2 FROM \"step_1\")"), "{out}");
+        assert!(out.contains("\"step_2\" AS (SELECT 3 FROM \"alpha_1\")"), "{out}");
+    }
+
+    #[test]
+    fn an_action_names_its_step_and_its_side_table_after_itself() {
+        let out = planned("/@dataset:x/@test/bounds.json");
+        assert!(out.contains("\"test_extent\" AS"), "the side table is not namespaced: {out}");
+        assert!(out.contains("\"test_1\" AS"), "the step is not namespaced: {out}");
+    }
+
+    #[test]
+    fn two_actions_keep_their_own_namespaces() {
+        let mut grammar = test_action_grammar();
+        grammar.register_action(Second);
+        let out = planned_with("/@dataset:x/@test/bounds/@second/tally.json", grammar);
+        for name in ["test_extent", "test_1", "second_extent", "second_1"] {
+            assert!(out.contains(&format!("\"{name}\" AS")), "{name} is missing: {out}");
+        }
+        assert_eq!(out.matches("ST_Extent_Agg").count(), 2, "the actions shared a side table: {out}");
     }
 
     #[test]
@@ -302,14 +383,14 @@ mod tests {
 
     #[test]
     fn an_action_adds_to_the_relation_and_the_output_still_frames_it() {
-        let out = planned("/@dataset:x/@probe/count.json");
+        let out = planned("/@dataset:x/@test/count.json");
         assert!(out.contains("COUNT(*) AS \"count\""), "{out}");
         assert!(out.contains("ST_AsGeoJSON"), "the output still supplies the terminal query: {out}");
     }
 
     #[test]
     fn option_expressions_arrive_in_url_order_under_canonical_names() {
-        let out = planned("/@dataset:x/@probe/n,b.json");
+        let out = planned("/@dataset:x/@test/n,b.json");
         let count_at = out.find("AS \"count\"").expect("count");
         let bounds_at = out.find("AS \"bounds\"").expect("bounds");
         assert!(count_at < bounds_at, "aliases must not reorder the parts: {out}");
@@ -317,21 +398,21 @@ mod tests {
 
     #[test]
     fn a_fragment_may_add_a_side_table_that_options_share() {
-        let out = planned("/@dataset:x/@probe/b,width.json");
-        assert_eq!(out.matches("\"x_extent\" AS").count(), 1, "{out}");
-        assert!(out.contains("\"x_extent\""), "the side table must be joined, not dangling: {out}");
+        let out = planned("/@dataset:x/@test/b,width.json");
+        assert_eq!(out.matches("\"test_extent\" AS").count(), 1, "{out}");
+        assert!(out.contains("\"test_extent\""), "the side table must be joined, not dangling: {out}");
     }
 
     #[test]
     fn every_option_sees_the_same_relation() {
-        let out = planned("/@dataset:x,id:7/@probe/count,bounds,width.json");
+        let out = planned("/@dataset:x,id:7/@test/count,bounds,width.json");
         assert_eq!(out.matches("FROM \"step_1\"").count(), 2, "options disagreed about the input: {out}");
-        assert_eq!(out.matches("\"x_extent\" AS").count(), 1, "the shared side table was built twice: {out}");
+        assert_eq!(out.matches("\"test_extent\" AS").count(), 1, "the shared side table was built twice: {out}");
     }
 
     #[test]
     fn a_fragment_receives_its_parameters_in_order() {
-        let out = planned("/@dataset:x/@probe/three:name:eq:foo.json");
+        let out = planned("/@dataset:x/@test/three:name:eq:foo.json");
         assert!(out.contains("name|eq|foo AS \"three\""), "parameters arrived out of order: {out}");
     }
 
@@ -348,9 +429,9 @@ mod tests {
 
     #[test]
     fn an_action_still_reprojects_a_source_that_is_not_wgs84() {
-        let grammar = probe_grammar();
+        let grammar = test_action_grammar();
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let parsed = crate::url::parse("/@dataset:x/@probe/count.json", &grammar).unwrap();
+        let parsed = crate::url::parse("/@dataset:x/@test/count.json", &grammar).unwrap();
         let out = plan(&grammar, &parsed, "/x.geojson", &columns, Some("EPSG:25832"), backend()).unwrap();
         assert!(out.contains("ST_Transform"), "an action skipped reprojection: {out}");
         assert!(out.find("ST_Transform") < out.find("COUNT(*)"), "reprojection must precede the action: {out}");
@@ -358,7 +439,7 @@ mod tests {
 
     #[test]
     fn a_filter_applies_before_the_action_runs() {
-        let out = planned("/@dataset:x,id:7/@probe/count.json");
+        let out = planned("/@dataset:x,id:7/@test/count.json");
         assert!(out.contains("\"step_1\" AS (SELECT * FROM \"source\" WHERE"), "{out}");
         assert!(out.contains("COUNT(*) AS \"count\" FROM \"step_1\""), "the action must read the filtered rows: {out}");
     }
@@ -378,8 +459,8 @@ mod tests {
     fn a_step_names_itself_and_becomes_the_input() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
-        p.step(Query::select().expr(Expr::cust("1")).from(p.input()).take());
-        p.step(Query::select().expr(Expr::cust("2")).from(p.input()).take());
+        p.step("step", Query::select().expr(Expr::cust("1")).from(p.input()).take());
+        p.step("step", Query::select().expr(Expr::cust("2")).from(p.input()).take());
         let out = rendered(p);
         assert!(out.contains("\"step_1\" AS (SELECT 1 FROM \"source\")"), "{out}");
         assert!(out.contains("\"step_2\" AS (SELECT 2 FROM \"step_1\")"), "{out}");
@@ -390,12 +471,12 @@ mod tests {
     fn a_side_table_is_namespaced_shared_and_does_not_advance_the_input() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
-        assert!(p.cte("extent").is_none());
-        p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
-        p.cte_once("extent", |_| panic!("a repeated side table must not be rebuilt"));
-        assert!(p.cte("extent").is_some());
+        assert!(p.cte("test", "extent").is_none());
+        p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+        p.cte_once("test", "extent", |_| panic!("a repeated side table must not be rebuilt"));
+        assert!(p.cte("test", "extent").is_some());
         let out = rendered(p);
-        assert_eq!(out.matches("\"x_extent\" AS").count(), 1, "the side table was emitted twice: {out}");
+        assert_eq!(out.matches("\"test_extent\" AS").count(), 1, "the side table was emitted twice: {out}");
         assert!(out.trim_end().ends_with("SELECT * FROM \"source\""), "a side table advanced the input: {out}");
     }
 
@@ -403,14 +484,14 @@ mod tests {
     fn a_side_table_lookup_names_the_alias_built_over_the_current_input() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
-        p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+        p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.filter(&id_filter(), &columns).unwrap();
-        assert!(p.cte("extent").is_none(), "a side table from an earlier stage must not be reported as live");
-        p.cte_once("extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
+        assert!(p.cte("test", "extent").is_none(), "a side table from an earlier stage must not be reported as live");
+        p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
 
-        let live = p.cte("extent").expect("a side table was built over the current input");
+        let live = p.cte("test", "extent").expect("a side table was built over the current input");
         let out = Query::select().expr(Expr::cust("*")).from(live).to_owned().to_string(PostgresQueryBuilder);
-        assert!(out.ends_with("FROM \"x_extent_1\""), "the lookup named the stale alias: {out}");
+        assert!(out.ends_with("FROM \"test_extent_1\""), "the lookup named the stale alias: {out}");
     }
 
     #[rstest]
@@ -423,8 +504,8 @@ mod tests {
             if at > 0 {
                 p.filter(&id_filter(), &columns).unwrap();
             }
-            p.cte_once(name, |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
-            assert!(p.cte(name).is_some(), "{name} was built but is not live");
+            p.cte_once("test", name, |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+            assert!(p.cte("test", name).is_some(), "{name} was built but is not live");
         }
         let out = rendered(p);
         let mut declared: Vec<&str> = out
@@ -444,12 +525,15 @@ mod tests {
     fn a_side_table_is_not_shared_across_stages() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
-        p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+        p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.filter(&id_filter(), &columns).unwrap();
-        p.cte_once("extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
+        p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
         let out = rendered(p);
-        assert!(out.contains("\"x_extent\" AS (SELECT 1 FROM \"source\")"), "{out}");
-        assert!(out.contains("\"x_extent_1\" AS (SELECT 2 FROM \"step_1\")"), "a stale side table was reused: {out}");
+        assert!(out.contains("\"test_extent\" AS (SELECT 1 FROM \"source\")"), "{out}");
+        assert!(
+            out.contains("\"test_extent_1\" AS (SELECT 2 FROM \"step_1\")"),
+            "a stale side table was reused: {out}"
+        );
     }
 
     #[test]
@@ -457,16 +541,16 @@ mod tests {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.filter(&id_filter(), &columns).unwrap();
-        p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+        p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         let out = rendered(p);
-        assert!(out.contains("\"x_extent\" AS (SELECT 1 FROM \"step_1\")"), "{out}");
+        assert!(out.contains("\"test_extent\" AS (SELECT 1 FROM \"step_1\")"), "{out}");
     }
 
     #[test]
     fn the_source_relation_carries_the_reader_and_its_encoding() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
-        p.step(Query::select().expr(Expr::cust("1")).from(p.input()).take());
+        p.step("step", Query::select().expr(Expr::cust("1")).from(p.input()).take());
         assert_eq!(
             rendered(p),
             "WITH \"source\" AS (SELECT * FROM ST_Read('/x.geojson', open_options=list_value('ENCODING=UTF-8')) AS \"src\") , \"step_1\" AS (SELECT 1 FROM \"source\") SELECT * FROM \"step_1\""
@@ -487,9 +571,12 @@ mod tests {
         .unwrap();
         assert!(out.contains("\"step_2\" AS (SELECT * REPLACE (ST_Transform("), "{out}");
         assert!(out.contains("FROM \"step_1\""), "{out}");
-        assert!(out.contains("\"step_3\" AS (SELECT * REPLACE (ST_AsGeoJSON("), "{out}");
-        assert!(out.contains("to_json(\"step_3\")"), "the feature select read the wrong cte: {out}");
-        assert!(out.trim_end().ends_with("FROM \"step_3\""), "the feature select read the wrong cte: {out}");
+        assert!(
+            out.contains("\"out_1\" AS (SELECT * REPLACE (ST_AsGeoJSON("),
+            "the output did not namespace its step: {out}"
+        );
+        assert!(out.contains("to_json(\"out_1\")"), "the feature select read the wrong cte: {out}");
+        assert!(out.trim_end().ends_with("FROM \"out_1\""), "the feature select read the wrong cte: {out}");
     }
 
     #[test]
@@ -505,7 +592,7 @@ mod tests {
         )
         .unwrap();
         assert!(!out.contains("ST_Transform"), "{out}");
-        assert!(out.contains("\"step_1\" AS (SELECT * REPLACE (ST_AsGeoJSON("), "a pass-through step was added: {out}");
+        assert!(out.contains("\"out_1\" AS (SELECT * REPLACE (ST_AsGeoJSON("), "a pass-through step was added: {out}");
     }
 
     #[test]

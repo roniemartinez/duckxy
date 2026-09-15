@@ -7,6 +7,7 @@ pub enum Param {
     Column,
     Operator,
     Value,
+    Token,
     Boolean,
     GeometryType,
 }
@@ -17,6 +18,7 @@ impl Param {
             Param::Column => "a column name",
             Param::Operator => "an operator",
             Param::Value => "a value",
+            Param::Token => "letters, digits, dot, dash or underscore",
             Param::Boolean => "true or false",
             Param::GeometryType => "a geometry type",
         }
@@ -45,6 +47,7 @@ pub trait FromParam: Sized {
 
 pub struct Column(pub String);
 pub struct Value(pub String);
+pub struct Token(pub String);
 pub struct Operator(pub String);
 pub struct Boolean(pub bool);
 pub struct GeometryType(pub &'static str);
@@ -60,6 +63,15 @@ impl FromParam for Value {
     const KIND: Param = Param::Value;
     fn from_param(raw: &str) -> Option<Self> {
         (!raw.is_empty()).then(|| Value(raw.to_string()))
+    }
+}
+
+impl FromParam for Token {
+    const KIND: Param = Param::Token;
+    fn from_param(raw: &str) -> Option<Self> {
+        let shaped =
+            !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+        shaped.then(|| Token(raw.to_string()))
     }
 }
 
@@ -91,11 +103,12 @@ impl FromParam for GeometryType {
 
 pub struct StageCtx<'a> {
     pipeline: &'a mut Pipeline,
+    action: &'static str,
 }
 
 impl<'a> StageCtx<'a> {
-    pub fn new(pipeline: &'a mut Pipeline) -> Self {
-        Self { pipeline }
+    pub fn new(pipeline: &'a mut Pipeline, action: &'static str) -> Self {
+        Self { pipeline, action }
     }
 
     pub fn dialect(&self) -> &dyn crate::backend::Dialect {
@@ -115,11 +128,11 @@ impl<'a> StageCtx<'a> {
     }
 
     pub fn step(&mut self, select: SelectStatement) {
-        self.pipeline.step(select);
+        self.pipeline.step(self.action, select);
     }
 
     pub fn replace_geometry(&mut self, geometry: SimpleExpr) {
-        self.pipeline.replace_geometry(geometry);
+        self.pipeline.replace_geometry(self.action, geometry);
     }
 
     pub fn geom(&self) -> SimpleExpr {
@@ -131,11 +144,11 @@ impl<'a> StageCtx<'a> {
     }
 
     pub fn cte_once(&mut self, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
-        self.pipeline.cte_once(name, build)
+        self.pipeline.cte_once(self.action, name, build)
     }
 
     pub fn cte(&self, name: &str) -> Option<Alias> {
-        self.pipeline.cte(name)
+        self.pipeline.cte(self.action, name)
     }
 }
 
@@ -145,6 +158,7 @@ impl Param {
             Param::Column => Column::from_param(raw).is_some(),
             Param::Operator => Operator::from_param(raw).is_some(),
             Param::Value => Value::from_param(raw).is_some(),
+            Param::Token => Token::from_param(raw).is_some(),
             Param::Boolean => Boolean::from_param(raw).is_some(),
             Param::GeometryType => GeometryType::from_param(raw).is_some(),
         }
@@ -397,7 +411,7 @@ mod tests {
             self.0
         }
         fn content_type(&self) -> &'static str {
-            "application/x-probe"
+            "application/x-test"
         }
         fn overrides(&self) -> bool {
             self.1
@@ -566,8 +580,8 @@ mod tests {
             opt("two", "", &[&[Param::Column, Param::Value]]),
             opt("three", "", &[&[Param::Column, Param::Operator, Param::Value]]),
         ];
-        let g = registered(Noop("probe", "", OPTIONS));
-        let def = g.action_for("probe").unwrap();
+        let g = registered(Noop("test", "", OPTIONS));
+        let def = g.action_for("test").unwrap();
         assert_eq!(shapes(def.option("none").unwrap()), vec![Vec::new()]);
         assert_eq!(shapes(def.option("one").unwrap()), vec![vec![Param::Value]]);
         assert_eq!(shapes(def.option("flag").unwrap()), vec![vec![Param::Boolean]]);
@@ -578,8 +592,8 @@ mod tests {
     #[test]
     fn an_option_declaring_two_shapes_accepts_both_arities() {
         const OPTIONS: &[Opt] = &[opt("id", "", &[&[Param::Value], &[Param::Column, Param::Value]])];
-        let g = registered(Noop("probe", "", OPTIONS));
-        let def = g.action_for("probe").unwrap();
+        let g = registered(Noop("test", "", OPTIONS));
+        let def = g.action_for("test").unwrap();
         assert_eq!(shapes(def.option("id").unwrap()), vec![vec![Param::Value], vec![Param::Column, Param::Value]]);
         assert!(def.option("id").unwrap().accepts(1));
         assert!(def.option("id").unwrap().accepts(2));
@@ -610,7 +624,7 @@ mod tests {
     fn a_stage_reads_the_relation_it_was_given() {
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
         let mut pipeline = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
-        let mut ctx = StageCtx::new(&mut pipeline);
+        let mut ctx = StageCtx::new(&mut pipeline, "test");
         assert_eq!(ctx.geometry(), "geom");
         assert!(ctx.cte("extent").is_none());
         ctx.cte_once("extent", |from| {
@@ -620,53 +634,53 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "action \"probe\" has no options")]
+    #[should_panic(expected = "action \"test\" has no options")]
     fn registering_an_action_without_options_panics() {
-        registered(Noop("probe", "", &[]));
+        registered(Noop("test", "", &[]));
     }
 
     #[test]
     fn an_action_resolves_its_aliases_to_canonical_names() {
-        let g = registered(Noop("probe", "p", AA_SHORT));
-        let def = g.action_for("probe").unwrap();
-        assert!(def.matches("probe") && def.matches("p"));
-        assert_eq!(def.canonical(), "probe");
+        let g = registered(Noop("test", "p", AA_SHORT));
+        let def = g.action_for("test").unwrap();
+        assert!(def.matches("test") && def.matches("p"));
+        assert_eq!(def.canonical(), "test");
         assert_eq!(def.option("a").unwrap().canonical(), "aa");
         assert!(def.option("zz").is_none());
     }
 
     #[test]
-    #[should_panic(expected = "action \"probe\" is already registered")]
+    #[should_panic(expected = "action \"test\" is already registered")]
     fn registering_an_action_name_twice_panics() {
         let mut g = Grammar::default();
-        g.register_action(Noop("probe", "", ONE_AA));
-        g.register_action(Noop("probe", "", ONE_BB));
+        g.register_action(Noop("test", "", ONE_AA));
+        g.register_action(Noop("test", "", ONE_BB));
     }
 
     #[test]
     #[should_panic(expected = "action \"p\" is already registered")]
     fn registering_an_action_alias_another_action_owns_panics() {
         let mut g = Grammar::default();
-        g.register_action(Noop("probe", "p", ONE_AA));
+        g.register_action(Noop("test", "p", ONE_AA));
         g.register_action(Noop("point", "p", ONE_BB));
     }
 
     #[test]
     #[should_panic(expected = "is already registered on this action")]
     fn reusing_an_option_alias_for_a_different_option_panics() {
-        registered(Noop("probe", "", SHARED_SHORT));
+        registered(Noop("test", "", SHARED_SHORT));
     }
 
     #[test]
     #[should_panic(expected = "is already registered on this action")]
     fn redeclaring_an_option_with_different_aliases_panics() {
-        registered(Noop("probe", "", SAME_TWICE));
+        registered(Noop("test", "", SAME_TWICE));
     }
 
     #[test]
     #[should_panic(expected = "registered two shapes of the same arity")]
     fn registering_two_shapes_of_the_same_arity_panics() {
-        registered(Noop("probe", "", TWO_SAME_ARITY));
+        registered(Noop("test", "", TWO_SAME_ARITY));
     }
 
     #[test]
@@ -678,7 +692,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "short name \"aa\" repeats the canonical name")]
     fn an_option_whose_short_name_repeats_its_canonical_one_panics() {
-        registered(Noop("probe", "", AA_SELF));
+        registered(Noop("test", "", AA_SELF));
     }
 
     #[test]
@@ -690,13 +704,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "can never be parsed from a url")]
     fn registering_an_option_name_the_scanner_cannot_produce_panics() {
-        registered(Noop("probe", "", BAD_OPT));
+        registered(Noop("test", "", BAD_OPT));
     }
 
     #[test]
     fn a_flag_takes_no_parameters_unlike_a_filter() {
-        let g = registered(Noop("probe", "", AA_FLAG));
-        let def = g.action_for("probe").unwrap();
+        let g = registered(Noop("test", "", AA_FLAG));
+        let def = g.action_for("test").unwrap();
         assert!(def.option("aa").unwrap().accepts(0));
         assert!(!def.option("aa").unwrap().accepts(1));
     }

@@ -53,6 +53,7 @@ pub enum ParseError {
     MissingOutputSegment,
     MissingSourcePrefix,
     RepeatedOption(String),
+    RepeatedAction(String),
     UnknownFormat(String),
     UnknownOption(String),
     UnknownSource(String),
@@ -89,6 +90,7 @@ impl fmt::Display for ParseError {
             ParseError::MisplacedSourceOption(s) => write!(f, "source options must come before any filter: {s}"),
             ParseError::OptionTakesOneValue(s) => write!(f, "option takes exactly one value: {s}"),
             ParseError::WrongParameterCount(s) => write!(f, "filter has the wrong number of parameters: {s}"),
+            ParseError::RepeatedAction(s) => write!(f, "action given more than once: {s}"),
             ParseError::UnknownAction(s) => write!(f, "unknown action: {s}"),
             ParseError::ActionWithoutOptions(s) => write!(f, "action has no options: {s}"),
             ParseError::MisplacedAction(s) => write!(f, "actions must come before the output name: {s}"),
@@ -170,6 +172,9 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
         let segments = read_action_segments(&mut scan, def)?;
         if actions.len() == MAX_ACTIONS {
             return Err(ParseError::TooManyActions);
+        }
+        if actions.iter().any(|seen| seen.name == def.canonical()) {
+            return Err(ParseError::RepeatedAction(def.canonical().to_string()));
         }
         actions.push(Action { name: def.canonical().to_string(), segments });
     }
@@ -296,9 +301,6 @@ fn read_action_segments(scan: &mut Scan<'_>, def: &dyn crate::grammar::Action) -
             return Err(ParseError::UnknownOption(key.to_string()));
         };
         let segment = finish_segment(key, read_params(scan), option)?;
-        if out.iter().any(|seen| seen.name == segment.name) {
-            return Err(ParseError::RepeatedOption(segment.name.clone()));
-        }
         if out.len() == MAX_OPTIONS {
             return Err(ParseError::TooManyOptions);
         }
@@ -477,59 +479,82 @@ mod tests {
 
     fn test_grammar() -> Grammar {
         let mut g = Grammar::core();
-        g.register_action(Probe("probe", "p", TEST_OPTIONS));
+        g.register_action(Probe("test", "t", TEST_OPTIONS));
         g
     }
 
     #[test]
     fn core_rejects_an_action_it_does_not_know() {
-        let err = parse("/@dataset:pts/@probe/aa.json", &Grammar::core()).unwrap_err();
-        assert_eq!(err, ParseError::UnknownAction("probe".to_string()));
+        let err = parse("/@dataset:pts/@test/aa.json", &Grammar::core()).unwrap_err();
+        assert_eq!(err, ParseError::UnknownAction("test".to_string()));
     }
 
     #[test]
     fn a_registered_action_parses_with_its_options() {
-        let out = parse("/@dataset:pts/@probe/aa,bb.json", &test_grammar()).unwrap();
+        let out = parse("/@dataset:pts/@test/aa,bb.json", &test_grammar()).unwrap();
         assert_eq!(out.actions.len(), 1);
-        assert_eq!(out.actions[0].name, "probe");
+        assert_eq!(out.actions[0].name, "test");
         let names: Vec<&str> = out.actions[0].segments.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["aa", "bb"]);
         assert!(out.actions[0].segments[0].params.is_empty(), "an option with no shape takes no parameters");
     }
 
     #[rstest]
-    #[case("/@dataset:pts/@p/aa.json")]
-    #[case("/@dataset:pts/@probe/a.json")]
+    #[case("/@dataset:pts/@test/aa,aa.json")]
+    #[case("/@dataset:pts/@test/aa,a.json")]
+    fn an_option_may_repeat_and_keeps_its_url_order(#[case] url: &str) {
+        let out = parse(url, &test_grammar()).unwrap();
+        let names: Vec<&str> = out.actions[0].segments.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["aa", "aa"]);
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts/@test/aa/@test/bb.json")]
+    #[case("/@dataset:pts/@test/aa/@t/bb.json")]
+    fn an_action_may_not_repeat(#[case] url: &str) {
+        assert_eq!(parse(url, &test_grammar()), Err(ParseError::RepeatedAction("test".to_string())));
+    }
+
+    #[test]
+    fn two_different_actions_both_parse() {
+        let mut g = test_grammar();
+        g.register_action(Probe("second", "", TEST_OPTIONS));
+        let out = parse("/@dataset:pts/@test/aa/@second/bb.json", &g).unwrap();
+        let names: Vec<&str> = out.actions.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["test", "second"]);
+    }
+
+    #[rstest]
+    #[case("/@dataset:pts/@t/aa.json")]
+    #[case("/@dataset:pts/@test/a.json")]
     fn an_action_and_its_options_answer_to_their_aliases(#[case] url: &str) {
         let out = parse(url, &test_grammar()).unwrap();
-        assert_eq!(out.actions[0].name, "probe", "the canonical action name is stored");
+        assert_eq!(out.actions[0].name, "test", "the canonical action name is stored");
         assert_eq!(out.actions[0].segments[0].name, "aa", "the canonical option name is stored");
     }
 
     #[rstest]
-    #[case("/@dataset:pts/@probe/zz.json", ParseError::UnknownOption("zz".to_string()))]
-    #[case("/@dataset:pts/@probe/.json", ParseError::ActionWithoutOptions("probe".to_string()))]
-    #[case("/@dataset:pts/@probe/val.json", ParseError::EmptyOptionValue("val".to_string()))]
-    #[case("/@dataset:pts/@probe/val:.json", ParseError::EmptyOptionValue("val".to_string()))]
-    #[case("/@dataset:pts/@probe/aa:1.json", ParseError::WrongParameterCount("aa".to_string()))]
-    #[case("/@dataset:pts/@probe/aa,aa.json", ParseError::RepeatedOption("aa".to_string()))]
-    #[case("/@dataset:pts/@probe/aa,a.json", ParseError::RepeatedOption("aa".to_string()))]
+    #[case("/@dataset:pts/@test/zz.json", ParseError::UnknownOption("zz".to_string()))]
+    #[case("/@dataset:pts/@test/.json", ParseError::ActionWithoutOptions("test".to_string()))]
+    #[case("/@dataset:pts/@test/val.json", ParseError::EmptyOptionValue("val".to_string()))]
+    #[case("/@dataset:pts/@test/val:.json", ParseError::EmptyOptionValue("val".to_string()))]
+    #[case("/@dataset:pts/@test/aa:1.json", ParseError::WrongParameterCount("aa".to_string()))]
     fn an_action_option_is_held_to_its_registration(#[case] url: &str, #[case] expected: ParseError) {
         assert_eq!(parse(url, &test_grammar()), Err(expected));
     }
 
     #[test]
     fn an_action_survives_an_archive_sub_path() {
-        let out = parse("/@dataset:uk:gb.shp/@probe/aa.json", &test_grammar()).unwrap();
+        let out = parse("/@dataset:uk:gb.shp/@test/aa.json", &test_grammar()).unwrap();
         assert_eq!(out.path.as_deref(), Some("gb.shp"));
         assert_eq!(out.actions.len(), 1, "the sub-path swallowed the action");
     }
 
     #[rstest]
-    #[case("/@dataset:uk:gb.shp/extra/@probe/aa.json")]
-    #[case("/@dataset:uk:gb.shp/a/b/@p/aa.json")]
+    #[case("/@dataset:uk:gb.shp/extra/@test/aa.json")]
+    #[case("/@dataset:uk:gb.shp/a/b/@t/aa.json")]
     fn an_action_buried_behind_a_download_name_is_rejected_not_dropped(#[case] url: &str) {
-        assert_eq!(parse(url, &test_grammar()), Err(ParseError::MisplacedAction("probe".to_string())));
+        assert_eq!(parse(url, &test_grammar()), Err(ParseError::MisplacedAction("test".to_string())));
     }
 
     #[test]
@@ -550,23 +575,23 @@ mod tests {
 
     #[test]
     fn exactly_the_cap_is_accepted() {
-        let actions: String = (0..MAX_ACTIONS).map(|_| "/@probe/aa".to_string()).collect();
-        let out = parse(&format!("/@dataset:x{actions}.json"), &test_grammar()).unwrap();
+        let (g, actions) = many_actions(MAX_ACTIONS);
+        let out = parse(&format!("/@dataset:x{actions}.json"), &g).unwrap();
         assert_eq!(out.actions.len(), MAX_ACTIONS);
 
         let mut g = Grammar::core();
-        g.register_action(Probe("probe", "", MANY_OPTIONS));
+        g.register_action(Probe("test", "", MANY_OPTIONS));
         let options: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS).copied().collect();
-        let out = parse(&format!("/@dataset:x/@probe/{}.json", options.join(",")), &g).unwrap();
+        let out = parse(&format!("/@dataset:x/@test/{}.json", options.join(",")), &g).unwrap();
         assert_eq!(out.actions[0].segments.len(), MAX_OPTIONS);
     }
 
     #[rstest]
-    #[case("/@dataset:uk:gb.shp/@probe/aa/report.shp.json", "gb.shp")]
-    #[case("/@dataset:uk:gb.shp/@probe/aa/report.json", "gb.shp")]
-    #[case("/@dataset:uk:gb.shp/@probe/aa.json", "gb.shp")]
-    #[case("/@dataset:uk:a/b.geojson/c.shp/@probe/aa/out.shp.json", "a/b.geojson/c.shp")]
-    #[case("/@dataset:uk:member/@probe/aa.json", "member")]
+    #[case("/@dataset:uk:gb.shp/@test/aa/report.shp.json", "gb.shp")]
+    #[case("/@dataset:uk:gb.shp/@test/aa/report.json", "gb.shp")]
+    #[case("/@dataset:uk:gb.shp/@test/aa.json", "gb.shp")]
+    #[case("/@dataset:uk:a/b.geojson/c.shp/@test/aa/out.shp.json", "a/b.geojson/c.shp")]
+    #[case("/@dataset:uk:member/@test/aa.json", "member")]
     fn a_download_name_that_looks_like_a_source_does_not_swallow_the_action(#[case] url: &str, #[case] path: &str) {
         let out = parse(url, &test_grammar()).unwrap();
         assert_eq!(out.path.as_deref(), Some(path));
@@ -576,20 +601,22 @@ mod tests {
 
     #[test]
     fn the_sub_path_stops_at_the_first_action_not_the_last() {
-        let out = parse("/@dataset:uk:gb.shp/@probe/val:x.shp/@probe/bb/out.json", &test_grammar()).unwrap();
+        let mut g = test_grammar();
+        g.register_action(Probe("second", "", TEST_OPTIONS));
+        let out = parse("/@dataset:uk:gb.shp/@test/val:x.shp/@second/bb/out.json", &g).unwrap();
         assert_eq!(out.path.as_deref(), Some("gb.shp"));
         assert_eq!(out.actions.len(), 2, "an option value ending in .shp moved the boundary: {out:?}");
     }
 
     #[test]
     fn a_sub_path_that_is_only_an_action_marker_is_an_empty_source_value() {
-        assert_eq!(parse("/@dataset:uk:/@probe/aa.json", &test_grammar()), Err(ParseError::EmptySourceValue));
+        assert_eq!(parse("/@dataset:uk:/@test/aa.json", &test_grammar()), Err(ParseError::EmptySourceValue));
     }
 
     #[test]
     fn a_registered_action_without_options_is_not_a_filename() {
-        let err = parse("/@dataset:pts/@probe.json", &test_grammar()).unwrap_err();
-        assert_eq!(err, ParseError::ActionWithoutOptions("probe".to_string()));
+        let err = parse("/@dataset:pts/@test.json", &test_grammar()).unwrap_err();
+        assert_eq!(err, ParseError::ActionWithoutOptions("test".to_string()));
     }
 
     #[test]
@@ -601,14 +628,14 @@ mod tests {
 
     #[test]
     fn an_action_may_be_followed_by_a_download_filename() {
-        let out = parse("/@dataset:pts/@probe/aa/meta.json", &test_grammar()).unwrap();
+        let out = parse("/@dataset:pts/@test/aa/meta.json", &test_grammar()).unwrap();
         assert_eq!(out.actions.len(), 1);
         assert_eq!(out.dataset, "pts");
     }
 
     #[rstest]
-    #[case("/@dataset:pts,type:Point/@probe/aa.json", "type")]
-    #[case("/@dataset:pts,valid:true/@probe/aa.json", "valid")]
+    #[case("/@dataset:pts,type:Point/@test/aa.json", "type")]
+    #[case("/@dataset:pts,valid:true/@test/aa.json", "valid")]
     fn a_geometry_predicate_applies_alongside_an_action(#[case] url: &str, #[case] filter: &str) {
         let out = parse(url, &test_grammar()).unwrap();
         assert_eq!(out.filters.len(), 1);
@@ -618,30 +645,42 @@ mod tests {
 
     #[test]
     fn filters_still_apply_alongside_an_action() {
-        let out = parse("/@dataset:pts,id:1/@probe/aa.json", &test_grammar()).unwrap();
+        let out = parse("/@dataset:pts,id:1/@test/aa.json", &test_grammar()).unwrap();
         assert_eq!(out.filters.len(), 1);
         assert_eq!(out.actions.len(), 1);
     }
 
     #[test]
     fn a_tilde_quoted_value_containing_an_action_marker_is_not_an_action() {
-        let out = parse("/@dataset:pts,prop:name:~a/@probe~/@probe/aa.json", &test_grammar()).unwrap();
-        assert_eq!(out.filters[0].params[1], "~a/@probe~");
+        let out = parse("/@dataset:pts,prop:name:~a/@test~/@test/aa.json", &test_grammar()).unwrap();
+        assert_eq!(out.filters[0].params[1], "~a/@test~");
         assert_eq!(out.actions.len(), 1, "only the real action counts");
     }
 
     #[test]
     fn more_than_ten_actions_is_rejected() {
-        let many: String = (0..MAX_ACTIONS + 1).map(|_| "/@probe/aa".to_string()).collect();
-        assert_eq!(parse(&format!("/@dataset:x{many}.json"), &test_grammar()), Err(ParseError::TooManyActions));
+        let (g, many) = many_actions(MAX_ACTIONS + 1);
+        assert_eq!(parse(&format!("/@dataset:x{many}.json"), &g), Err(ParseError::TooManyActions));
+    }
+
+    fn many_actions(count: usize) -> (Grammar, String) {
+        const NAMES: [&str; 11] =
+            ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven"];
+        let mut g = Grammar::core();
+        let mut url = String::new();
+        for name in NAMES.iter().take(count) {
+            g.register_action(Probe(name, "", TEST_OPTIONS));
+            url.push_str(&format!("/@{name}/aa"));
+        }
+        (g, url)
     }
 
     #[test]
     fn more_than_twenty_options_is_rejected() {
         let mut g = Grammar::core();
-        g.register_action(Probe("probe", "", MANY_OPTIONS));
+        g.register_action(Probe("test", "", MANY_OPTIONS));
         let many: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS + 1).copied().collect();
-        let url = format!("/@dataset:x/@probe/{}.json", many.join(","));
+        let url = format!("/@dataset:x/@test/{}.json", many.join(","));
         assert_eq!(parse(&url, &g), Err(ParseError::TooManyOptions));
     }
 
