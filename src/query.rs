@@ -21,6 +21,14 @@ impl std::fmt::Display for NoGeometry {
 impl std::error::Error for NoGeometry {}
 
 pub fn install_extensions() -> Result<()> {
+    static ONCE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| install_once().map_err(|e| format!("{e:#}")))
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!(e.clone()))
+        .copied()
+}
+
+fn install_once() -> Result<()> {
     let conn = Connection::open_in_memory().context("open duckdb")?;
     conn.execute_batch("INSTALL spatial; LOAD spatial;").context("install the spatial extension")?;
     match tuning() {
@@ -192,6 +200,12 @@ pub fn geometry_of(columns: &[(String, String)]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installing_the_extension_twice_is_harmless() {
+        install_extensions().unwrap();
+        install_extensions().unwrap();
+    }
 
     fn backend() -> std::sync::Arc<crate::backend::Backend> {
         std::sync::Arc::new(crate::backend::Backend::default())
