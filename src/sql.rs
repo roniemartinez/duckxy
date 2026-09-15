@@ -16,6 +16,7 @@ pub struct Pipeline {
     geometry: String,
     backend: Arc<Backend>,
     side: Vec<(String, String, String)>,
+    taken: Vec<String>,
 }
 
 impl Pipeline {
@@ -43,6 +44,7 @@ impl Pipeline {
             ctes,
             input,
             input_name: "source".to_string(),
+            taken: vec!["source".to_string()],
             steps: Vec::new(),
             geometry,
             backend,
@@ -75,18 +77,28 @@ impl Pipeline {
         self.step("step", reprojected);
     }
 
+    fn reserved(&self, candidate: &str) -> bool {
+        self.taken.iter().any(|name| name == candidate)
+    }
+
     pub fn step(&mut self, prefix: &str, select: SelectStatement) {
-        let n = match self.steps.iter_mut().find(|(known, _)| known == prefix) {
-            Some((_, seen)) => {
-                *seen += 1;
-                *seen
-            }
-            None => {
-                self.steps.push((prefix.to_string(), 1));
-                1
+        let name = loop {
+            let n = match self.steps.iter_mut().find(|(known, _)| known == prefix) {
+                Some((_, seen)) => {
+                    *seen += 1;
+                    *seen
+                }
+                None => {
+                    self.steps.push((prefix.to_string(), 1));
+                    1
+                }
+            };
+            let candidate = format!("{prefix}_{n}");
+            if !self.reserved(&candidate) {
+                break candidate;
             }
         };
-        let name = format!("{prefix}_{n}");
+        self.taken.push(name.clone());
         let alias = Alias::new(&name);
         self.ctes.cte(CommonTableExpression::new().query(select).table_name(alias.clone()).to_owned());
         self.input = alias;
@@ -100,10 +112,11 @@ impl Pipeline {
         let key = format!("{prefix}_{name}");
         let mut full = key.clone();
         let mut seen = 0;
-        while self.side.iter().any(|(_, _, taken)| taken == &full) {
+        while self.reserved(&full) {
             seen += 1;
             full = format!("{key}_{seen}");
         }
+        self.taken.push(full.clone());
         let alias = Alias::new(&full);
         let select = build(&self.input);
         self.ctes.cte(CommonTableExpression::new().query(select).table_name(alias.clone()).to_owned());
@@ -354,6 +367,31 @@ mod tests {
         assert!(out.contains("\"step_1\" AS (SELECT 1 FROM \"source\")"), "{out}");
         assert!(out.contains("\"alpha_1\" AS (SELECT 2 FROM \"step_1\")"), "{out}");
         assert!(out.contains("\"step_2\" AS (SELECT 3 FROM \"alpha_1\")"), "{out}");
+    }
+
+    #[test]
+    fn a_side_table_and_a_step_never_claim_the_same_name() {
+        let columns = geom_columns();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        p.cte_once("test", "1", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
+        p.step("test", Query::select().expr(Expr::cust("2")).from(p.input()).take());
+        let out = rendered(p);
+        assert_eq!(out.matches("\"test_1\" AS").count(), 1, "two ctes claimed one name: {out}");
+        assert!(
+            out.contains("\"test_2\" AS (SELECT 2 FROM \"source\")"),
+            "the step did not move past the side table: {out}"
+        );
+    }
+
+    #[test]
+    fn a_step_and_a_side_table_never_claim_the_same_name() {
+        let columns = geom_columns();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        p.step("test", Query::select().expr(Expr::cust("1")).from(p.input()).take());
+        p.cte_once("test", "1", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
+        let out = rendered(p);
+        assert_eq!(out.matches("\"test_1\" AS").count(), 1, "two ctes claimed one name: {out}");
+        assert!(out.contains("\"test_1_1\" AS"), "the side table did not step aside: {out}");
     }
 
     #[test]
