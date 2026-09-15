@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::formats::Format;
 use crate::grammar::{Grammar, StageCtx};
 use crate::url::{ParsedUrl, Segment};
@@ -5,6 +6,7 @@ use crate::{filters, query};
 use sea_query::{
     Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr, WithClause,
 };
+use std::sync::Arc;
 
 pub struct Pipeline {
     ctes: WithClause,
@@ -12,11 +14,17 @@ pub struct Pipeline {
     input_name: String,
     steps: usize,
     geometry: String,
+    backend: Arc<Backend>,
     side: Vec<(String, String, String)>,
 }
 
 impl Pipeline {
-    pub fn source(source: &str, encoding: &str, columns: &[(String, String)]) -> anyhow::Result<Self> {
+    pub fn source(
+        source: &str,
+        encoding: &str,
+        columns: &[(String, String)],
+        backend: Arc<Backend>,
+    ) -> anyhow::Result<Self> {
         let geometry = query::geometry_of(columns).ok_or(query::NoGeometry)?.to_string();
         let mut ctes = WithClause::new();
         let input = Alias::new("source");
@@ -31,7 +39,7 @@ impl Pipeline {
                 .table_name(input.clone())
                 .to_owned(),
         );
-        Ok(Self { ctes, input, input_name: "source".to_string(), steps: 0, geometry, side: Vec::new() })
+        Ok(Self { ctes, input, input_name: "source".to_string(), steps: 0, geometry, backend, side: Vec::new() })
     }
 
     pub fn filter(&mut self, filters: &[Segment], columns: &[(String, String)]) -> anyhow::Result<()> {
@@ -50,12 +58,7 @@ impl Pipeline {
             .expr(Expr::cust_with_exprs(
                 "* REPLACE ($1 AS $2)",
                 [
-                    Func::cust("ST_Transform")
-                        .arg(Expr::col(Alias::new(&self.geometry)))
-                        .arg(from)
-                        .arg("EPSG:4326")
-                        .arg(Expr::cust("always_xy := true"))
-                        .into(),
+                    self.dialect().transform(Expr::col(Alias::new(&self.geometry)), from, "EPSG:4326"),
                     Expr::col(Alias::new(&self.geometry)),
                 ],
             ))
@@ -101,6 +104,14 @@ impl Pipeline {
         &self.geometry
     }
 
+    pub fn backend(&self) -> &Arc<Backend> {
+        &self.backend
+    }
+
+    pub fn dialect(&self) -> &dyn crate::backend::Dialect {
+        self.backend.dialect()
+    }
+
     pub fn input(&self) -> Alias {
         self.input.clone()
     }
@@ -110,10 +121,7 @@ impl Pipeline {
         let replaced = Query::select()
             .expr(Expr::cust_with_exprs(
                 "* REPLACE ($1 AS $2)",
-                [
-                    Func::cust("ST_AsGeoJSON").arg(Expr::col(Alias::new(&geometry))).into(),
-                    Expr::col(Alias::new(&geometry)),
-                ],
+                [self.dialect().as_geojson(Expr::col(Alias::new(&geometry))), Expr::col(Alias::new(&geometry))],
             ))
             .from(self.input.clone())
             .take();
@@ -158,8 +166,9 @@ pub fn build_sql(
     format: Format,
     columns: &[(String, String)],
     crs: Option<&str>,
+    backend: Arc<Backend>,
 ) -> anyhow::Result<String> {
-    let mut pipeline = Pipeline::source(source, encoding, columns)?;
+    let mut pipeline = Pipeline::source(source, encoding, columns, backend)?;
     pipeline.filter(filters, columns)?;
     pipeline.reproject(crs, format);
     Ok(pipeline.finish(format))
@@ -171,8 +180,9 @@ pub fn plan(
     source: &str,
     columns: &[(String, String)],
     crs: Option<&str>,
+    backend: Arc<Backend>,
 ) -> anyhow::Result<String> {
-    let mut pipeline = Pipeline::source(source, &parsed.encoding, columns)?;
+    let mut pipeline = Pipeline::source(source, &parsed.encoding, columns, backend)?;
     pipeline.filter(&parsed.filters, columns)?;
     pipeline.reproject(crs, parsed.format);
 
@@ -211,6 +221,10 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend() -> Arc<Backend> {
+        Arc::new(Backend::default())
+    }
     use rstest::rstest;
 
     fn geom_columns() -> Vec<(String, String)> {
@@ -273,7 +287,7 @@ mod tests {
         let grammar = probe_grammar();
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse(url, &grammar).unwrap();
-        plan(&grammar, &parsed, "/x.geojson", &columns, None).unwrap()
+        plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap()
     }
 
     #[test]
@@ -330,7 +344,7 @@ mod tests {
         grammar.action(crate::grammar::action("probe").option(&["pair"], flagged).terminal(assemble).build());
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse("/@dataset:x/@probe/pair:ok:banana.json", &grammar).unwrap();
-        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None).unwrap_err();
+        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap_err();
         let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
         assert_eq!(typed.at, 1, "the wrong parameter position was reported");
         assert_eq!(typed.got, "banana");
@@ -341,7 +355,7 @@ mod tests {
         let grammar = probe_grammar();
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse("/@dataset:x/@probe/count.json", &grammar).unwrap();
-        let out = plan(&grammar, &parsed, "/x.geojson", &columns, Some("EPSG:25832")).unwrap();
+        let out = plan(&grammar, &parsed, "/x.geojson", &columns, Some("EPSG:25832"), backend()).unwrap();
         assert!(out.contains("ST_Transform"), "an action skipped reprojection: {out}");
         assert!(out.find("ST_Transform") < out.find("COUNT(*)"), "reprojection must precede the action: {out}");
     }
@@ -365,7 +379,7 @@ mod tests {
         grammar.action(crate::grammar::action("probe").option(&["flag"], flagged).terminal(assemble).build());
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse("/@dataset:x/@probe/flag:banana.json", &grammar).unwrap();
-        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None).unwrap_err();
+        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap_err();
         let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
         assert_eq!(typed.expected, crate::grammar::Param::Boolean);
         assert_eq!(typed.got, "banana");
@@ -374,7 +388,7 @@ mod tests {
     #[test]
     fn a_step_names_itself_and_becomes_the_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.step(Query::select().expr(Expr::cust("1")).from(p.input()).take());
         p.step(Query::select().expr(Expr::cust("2")).from(p.input()).take());
         let out = p.finish_raw();
@@ -386,7 +400,7 @@ mod tests {
     #[test]
     fn a_side_table_is_namespaced_shared_and_does_not_advance_the_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         assert!(p.cte("extent").is_none());
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.cte_once("extent", |_| panic!("a repeated side table must not be rebuilt"));
@@ -399,7 +413,7 @@ mod tests {
     #[test]
     fn a_side_table_lookup_names_the_alias_built_over_the_current_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.filter(&id_filter(), &columns).unwrap();
         assert!(p.cte("extent").is_none(), "a side table from an earlier stage must not be reported as live");
@@ -415,7 +429,7 @@ mod tests {
     #[case(&["a_1", "a", "a"])]
     fn a_side_table_never_reuses_an_alias_another_one_took(#[case] names: &[&str]) {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         for (at, name) in names.iter().enumerate() {
             if at > 0 {
                 p.filter(&id_filter(), &columns).unwrap();
@@ -440,7 +454,7 @@ mod tests {
     #[test]
     fn a_side_table_is_not_shared_across_stages() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.filter(&id_filter(), &columns).unwrap();
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
@@ -452,7 +466,7 @@ mod tests {
     #[test]
     fn a_side_table_reads_from_the_current_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.filter(&id_filter(), &columns).unwrap();
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         let out = p.finish_raw();
@@ -462,7 +476,7 @@ mod tests {
     #[test]
     fn finish_raw_skips_the_geojson_conversion() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.step(Query::select().expr(Expr::cust("1")).from(p.input()).take());
         assert_eq!(
             p.finish_raw(),
@@ -474,7 +488,8 @@ mod tests {
     fn reprojection_takes_the_step_after_the_filter() {
         let columns = geom_columns();
         let out =
-            build_sql("/x.geojson", "UTF-8", &id_filter(), Format::GeoJson, &columns, Some("EPSG:25832")).unwrap();
+            build_sql("/x.geojson", "UTF-8", &id_filter(), Format::GeoJson, &columns, Some("EPSG:25832"), backend())
+                .unwrap();
         assert!(out.contains("\"step_2\" AS (SELECT * REPLACE (ST_Transform("), "{out}");
         assert!(out.contains("FROM \"step_1\""), "{out}");
         assert!(out.contains("\"step_3\" AS (SELECT * REPLACE (ST_AsGeoJSON("), "{out}");
@@ -485,7 +500,8 @@ mod tests {
     #[test]
     fn a_crs_already_in_wgs84_adds_no_reprojection_step() {
         let columns = geom_columns();
-        let out = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, Some("EPSG:4326")).unwrap();
+        let out =
+            build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, Some("EPSG:4326"), backend()).unwrap();
         assert!(!out.contains("ST_Transform"), "{out}");
         assert!(out.contains("\"step_1\" AS (SELECT * REPLACE (ST_AsGeoJSON("), "a pass-through step was added: {out}");
     }
@@ -493,14 +509,14 @@ mod tests {
     #[test]
     fn build_sql_without_a_geometry_column_errors_rather_than_panics() {
         let columns = vec![("id".to_string(), "BIGINT".to_string())];
-        let err = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None).unwrap_err();
+        let err = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None, backend()).unwrap_err();
         assert!(err.downcast_ref::<query::NoGeometry>().is_some(), "{err:#}");
     }
 
     #[test]
     fn an_unfiltered_request_adds_no_filter_step() {
         let columns = vec![("name".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let out = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None).unwrap();
+        let out = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None, backend()).unwrap();
         assert!(!out.contains("WHERE"), "an empty filter list added a predicate: {out}");
     }
 
@@ -508,7 +524,7 @@ mod tests {
     fn a_filtered_request_is_the_first_numbered_step() {
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let filters = vec![Segment { name: "id".to_string(), params: vec!["7".to_string()] }];
-        let out = build_sql("/x.geojson", "UTF-8", &filters, Format::GeoJson, &columns, None).unwrap();
+        let out = build_sql("/x.geojson", "UTF-8", &filters, Format::GeoJson, &columns, None, backend()).unwrap();
         assert!(out.contains("\"step_1\" AS (SELECT * FROM \"source\" WHERE"), "{out}");
         assert!(out.contains("\"id\" = (7)"), "{out}");
     }

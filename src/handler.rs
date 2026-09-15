@@ -18,6 +18,7 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
     };
 
     let root = state.root;
+    let backend = state.backend;
     let format = parsed.format;
     let render = crate::render::Render::of(format);
     let download = format!("{}.{}", parsed.dataset, parsed.extension);
@@ -48,7 +49,7 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
             &source,
             &encoding,
             render.separator,
-            |columns, crs| crate::sql::build_sql(&source, &encoding, &filters, format, columns, crs),
+            |columns, crs| crate::sql::build_sql(&source, &encoding, &filters, format, columns, crs, backend.clone()),
             || {
                 if let Some(ready_tx) = ready.take() {
                     let _ = ready_tx.send(Ok(()));
@@ -92,6 +93,9 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
 }
 
 fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
+    if let Some(unknown) = e.downcast_ref::<crate::backend::UnknownOp>() {
+        return (StatusCode::NOT_IMPLEMENTED, unknown.to_string());
+    }
     if let Some(no_geometry) = e.downcast_ref::<query::NoGeometry>() {
         return (StatusCode::UNPROCESSABLE_ENTITY, no_geometry.to_string());
     }

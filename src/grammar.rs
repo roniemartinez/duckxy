@@ -98,6 +98,18 @@ impl<'a> StageCtx<'a> {
         Self { pipeline }
     }
 
+    pub fn dialect(&self) -> &dyn crate::backend::Dialect {
+        self.pipeline.dialect()
+    }
+
+    pub fn call(&self, name: &str, args: Vec<SimpleExpr>) -> Result<SimpleExpr, crate::backend::UnknownOp> {
+        self.pipeline.backend().call(name, args)
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.pipeline.backend().has(name)
+    }
+
     pub fn geom(&self) -> SimpleExpr {
         sea_query::Expr::col(Alias::new(self.pipeline.geometry()))
     }
@@ -349,6 +361,10 @@ impl Grammar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend() -> std::sync::Arc<crate::backend::Backend> {
+        std::sync::Arc::new(crate::backend::Backend::default())
+    }
     use rstest::rstest;
     use sea_query::{Expr, Query};
 
@@ -535,7 +551,8 @@ mod tests {
         let shape = def.option("flag").unwrap().shape_for(1).unwrap();
         let fragment = shape.fragment.as_ref().unwrap();
         let mut pipeline =
-            Pipeline::source("/x.geojson", "UTF-8", &[("geom".to_string(), "GEOMETRY".to_string())]).unwrap();
+            Pipeline::source("/x.geojson", "UTF-8", &[("geom".to_string(), "GEOMETRY".to_string())], backend())
+                .unwrap();
         let mut ctx = StageCtx { pipeline: &mut pipeline };
         let err = fragment(&mut ctx, &["banana".to_string()]).unwrap_err();
         assert_eq!(err, ParamError { at: 0, expected: Param::Boolean, got: "banana".to_string() });

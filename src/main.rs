@@ -67,11 +67,8 @@ async fn main() -> Result<()> {
         "duckxy starting"
     );
 
-    axum::serve(
-        listener,
-        routes::router(AppState { root, auth, grammar: std::sync::Arc::new(grammar::Grammar::core()) }),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    axum::serve(listener, routes::router(AppState::new(root, auth, grammar::Grammar::core())))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
