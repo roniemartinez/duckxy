@@ -81,11 +81,11 @@ mod tests {
         fs::write(dir.join("pts.geojson"), POINTS).unwrap();
         fs::write(dir.join("noid.geojson"), NO_ID).unwrap();
         fs::write(dir.join("shapes.geojson"), SHAPES).unwrap();
-        AppState {
-            root: DatasetRoot::new(dir),
-            auth: Auth::new(Some(KEY), allow_insecure).unwrap(),
-            grammar: std::sync::Arc::new(crate::grammar::Grammar::core()),
-        }
+        AppState::new(
+            DatasetRoot::new(dir),
+            Auth::new(Some(KEY), allow_insecure).unwrap(),
+            crate::grammar::Grammar::core(),
+        )
     }
 
     async fn get(state: AppState, uri: &str) -> (StatusCode, String) {

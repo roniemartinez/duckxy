@@ -192,6 +192,10 @@ pub fn geometry_of(columns: &[(String, String)]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend() -> std::sync::Arc<crate::backend::Backend> {
+        std::sync::Arc::new(crate::backend::Backend::default())
+    }
     use crate::formats::Format;
     use std::fs;
 
@@ -223,7 +227,7 @@ mod tests {
             source,
             crate::url::DEFAULT_ENCODING,
             r.separator,
-            |c, crs| crate::sql::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
+            |c, crs| crate::sql::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c, crs, backend()),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -259,7 +263,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             r.separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs, backend()),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -318,7 +322,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             crate::render::Render::of(Format::GeoJson).separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs, backend()),
             || panic!("a source with no geometry must not reach the ready signal"),
             &mut |_| true,
         )
@@ -429,7 +433,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             crate::render::Render::of(f).separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs, backend()),
             || {},
             &mut |_| {
                 stopped_after += 1;
@@ -444,7 +448,7 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             crate::render::Render::of(f).separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs),
+            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs, backend()),
             || {},
             &mut |_| {
                 chunks += 1;

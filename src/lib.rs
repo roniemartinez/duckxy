@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backend;
 pub mod dataset;
 mod encodings;
 pub mod filters;
@@ -86,6 +87,18 @@ pub struct AppState {
     pub root: DatasetRoot,
     pub auth: Auth,
     pub grammar: Arc<grammar::Grammar>,
+    pub backend: Arc<backend::Backend>,
+}
+
+impl AppState {
+    pub fn new(root: DatasetRoot, auth: Auth, grammar: grammar::Grammar) -> Self {
+        Self { root, auth, grammar: Arc::new(grammar), backend: Arc::new(backend::Backend::default()) }
+    }
+
+    pub fn with_backend(mut self, backend: backend::Backend) -> Self {
+        self.backend = Arc::new(backend);
+        self
+    }
 }
 
 impl FromRef<AppState> for Auth {
