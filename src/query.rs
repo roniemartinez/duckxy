@@ -200,6 +200,15 @@ pub fn geometry_of(columns: &[(String, String)]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::Output;
+
+    fn geojson_output() -> std::sync::Arc<dyn Output> {
+        std::sync::Arc::new(crate::formats::GeoJson)
+    }
+
+    fn parsed_for(ext: &str) -> crate::url::ParsedUrl {
+        crate::url::parse(&format!("/@dataset:x.{ext}"), &crate::grammar::Grammar::core()).unwrap()
+    }
 
     #[test]
     fn installing_the_extension_twice_is_harmless() {
@@ -210,7 +219,6 @@ mod tests {
     fn backend() -> std::sync::Arc<crate::backend::Backend> {
         std::sync::Arc::new(crate::backend::Backend::default())
     }
-    use crate::formats::Format;
     use std::fs;
 
     const TWO: &str = r#"{"type":"FeatureCollection","features":[
@@ -234,14 +242,15 @@ mod tests {
 
     fn collect(source: &str, ext: &str) -> String {
         crate::ensure_spatial();
-        let f = Format::from_extension(ext).unwrap();
-        let r = crate::render::Render::of(f);
-        let mut out = String::from(r.header);
+        let g = crate::grammar::Grammar::core();
+        let parsed = crate::url::parse(&format!("/@dataset:x.{ext}"), &g).unwrap();
+        let f = parsed.output.clone();
+        let mut out = String::from(f.header());
         run(
             source,
             crate::url::DEFAULT_ENCODING,
-            r.separator,
-            |c, crs| crate::sql::build_sql(source, crate::url::DEFAULT_ENCODING, &[], f, c, crs, backend()),
+            f.separator(),
+            |c, crs| crate::sql::plan(&crate::grammar::Grammar::core(), &parsed, source, c, crs, backend()),
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -249,7 +258,7 @@ mod tests {
             },
         )
         .unwrap();
-        out.push_str(r.footer);
+        out.push_str(f.footer());
         out
     }
 
@@ -271,13 +280,15 @@ mod tests {
         .unwrap();
 
         let src = crate::dataset::DatasetRoot::new(dir).resolve("ds", None).unwrap();
-        let r = crate::render::Render::of(Format::GeoJson);
-        let mut out = String::from(r.header);
+        let f = geojson_output();
+        let mut out = String::from(f.header());
         run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            r.separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs, backend()),
+            f.separator(),
+            |c, crs| {
+                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            },
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -285,7 +296,7 @@ mod tests {
             },
         )
         .unwrap();
-        out.push_str(r.footer);
+        out.push_str(f.footer());
 
         assert!(out.contains(r#""coordinates":[1.0,2.0]"#), "{out}");
         assert!(!out.contains("SHAPE"), "the geometry column leaked into properties: {out}");
@@ -335,8 +346,10 @@ mod tests {
         let err = run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            crate::render::Render::of(Format::GeoJson).separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], Format::GeoJson, c, crs, backend()),
+            geojson_output().separator(),
+            |c, crs| {
+                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            },
             || panic!("a source with no geometry must not reach the ready signal"),
             &mut |_| true,
         )
@@ -441,13 +454,15 @@ mod tests {
     fn a_sink_returning_false_stops_the_scan() {
         crate::ensure_spatial();
         let src = fixture("stop", &many_features(2000));
-        let f = Format::GeoJson;
+        let f = geojson_output();
         let mut stopped_after = 0;
         run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            crate::render::Render::of(f).separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs, backend()),
+            f.separator(),
+            |c, crs| {
+                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            },
             || {},
             &mut |_| {
                 stopped_after += 1;
@@ -461,8 +476,10 @@ mod tests {
         run(
             &src,
             crate::url::DEFAULT_ENCODING,
-            crate::render::Render::of(f).separator,
-            |c, crs| crate::sql::build_sql(&src, crate::url::DEFAULT_ENCODING, &[], f, c, crs, backend()),
+            f.separator(),
+            |c, crs| {
+                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            },
             || {},
             &mut |_| {
                 chunks += 1;

@@ -19,15 +19,27 @@ pub struct Action {
     pub segments: Vec<Segment>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ParsedUrl {
     pub dataset: String,
     pub path: Option<String>,
     pub encoding: String,
     pub filters: Vec<Segment>,
     pub actions: Vec<Action>,
-    pub format: crate::formats::Format,
+    pub output: std::sync::Arc<dyn crate::formats::Output>,
     pub extension: &'static str,
+}
+
+impl PartialEq for ParsedUrl {
+    fn eq(&self, other: &Self) -> bool {
+        self.dataset == other.dataset
+            && self.path == other.path
+            && self.encoding == other.encoding
+            && self.filters == other.filters
+            && self.actions == other.actions
+            && self.extension == other.extension
+            && self.output.extensions() == other.output.extensions()
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -98,12 +110,13 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
     if url.is_empty() {
         return Err(ParseError::Empty);
     }
-    let Some((source, extension, format)) = crate::formats::Format::split(url) else {
+    let Some((cut, extension)) = crate::formats::split(url, grammar) else {
         return Err(match url.rsplit_once('.') {
             Some((_, ext)) => ParseError::UnknownFormat(ext.to_ascii_lowercase()),
             None => ParseError::MissingOutputSegment,
         });
     };
+    let source = &url[..cut];
 
     let mut scan = Scan { text: source, at: 0 };
     if !scan.eat(b'@') {
@@ -181,7 +194,18 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
         None => DEFAULT_ENCODING.to_string(),
     };
 
-    Ok(ParsedUrl { dataset: name.to_string(), path, encoding, filters, actions, format, extension })
+    let mut parsed = ParsedUrl {
+        dataset: name.to_string(),
+        path,
+        encoding,
+        filters,
+        actions,
+        output: std::sync::Arc::new(crate::formats::GeoJson),
+        extension,
+    };
+    parsed.output = crate::formats::claim(extension, &parsed, grammar)
+        .ok_or_else(|| ParseError::UnknownFormat(extension.to_ascii_lowercase()))?;
+    Ok(parsed)
 }
 
 fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<String>, Vec<Segment>), ParseError> {

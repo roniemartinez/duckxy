@@ -1,10 +1,10 @@
 use crate::backend::Backend;
-use crate::formats::Format;
+use crate::formats::Output;
 use crate::grammar::{Grammar, StageCtx};
 use crate::url::{ParsedUrl, Segment};
 use crate::{filters, query};
 use sea_query::{
-    Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr, WithClause,
+    Alias, CommonTableExpression, Expr, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr, WithClause,
 };
 use std::sync::Arc;
 
@@ -50,8 +50,8 @@ impl Pipeline {
         Ok(())
     }
 
-    pub fn reproject(&mut self, crs: Option<&str>, format: Format) {
-        let Some(from) = crs.filter(|c| format.requires_wgs84() && !matches!(*c, "EPSG:4326" | "OGC:CRS84")) else {
+    pub fn reproject(&mut self, crs: Option<&str>, output: &dyn Output) {
+        let Some(from) = crs.filter(|c| output.requires_wgs84() && !matches!(*c, "EPSG:4326" | "OGC:CRS84")) else {
             return;
         };
         let reprojected = Query::select()
@@ -104,6 +104,14 @@ impl Pipeline {
         &self.geometry
     }
 
+    pub fn replace_geometry(&mut self, geometry: SimpleExpr) {
+        let select = Query::select()
+            .expr(Expr::cust_with_exprs("* REPLACE ($1 AS $2)", [geometry, Expr::col(Alias::new(&self.geometry))]))
+            .from(self.input.clone())
+            .take();
+        self.step(select);
+    }
+
     pub fn backend(&self) -> &Arc<Backend> {
         &self.backend
     }
@@ -116,37 +124,8 @@ impl Pipeline {
         self.input.clone()
     }
 
-    pub fn finish(mut self, format: Format) -> String {
-        let geometry = self.geometry.clone();
-        let replaced = Query::select()
-            .expr(Expr::cust_with_exprs(
-                "* REPLACE ($1 AS $2)",
-                [self.dialect().as_geojson(Expr::col(Alias::new(&geometry))), Expr::col(Alias::new(&geometry))],
-            ))
-            .from(self.input.clone())
-            .take();
-        self.step(replaced);
-        match format {
-            Format::GeoJson | Format::Json => Query::select()
-                .expr(Func::cast_as(
-                    Func::cust("json_object").args([
-                        Expr::val("type"),
-                        Expr::val("Feature"),
-                        Expr::val("properties"),
-                        Func::cust("json_merge_patch")
-                            .arg(Func::cust("to_json").arg(Expr::col(self.input.clone())))
-                            .arg(Func::cust("json_object").args([Expr::val(&geometry), Expr::cust("NULL")]))
-                            .into(),
-                        Expr::val("geometry"),
-                        Func::cast_as(Expr::col(Alias::new(&geometry)), "JSON").into(),
-                    ]),
-                    "VARCHAR",
-                ))
-                .from(self.input)
-                .to_owned()
-                .with(self.ctes)
-                .to_string(PostgresQueryBuilder),
-        }
+    pub fn finish(self, select: SelectStatement) -> String {
+        select.with(self.ctes).to_string(PostgresQueryBuilder)
     }
 
     pub fn finish_raw(self) -> String {
@@ -159,21 +138,6 @@ impl Pipeline {
     }
 }
 
-pub fn build_sql(
-    source: &str,
-    encoding: &str,
-    filters: &[Segment],
-    format: Format,
-    columns: &[(String, String)],
-    crs: Option<&str>,
-    backend: Arc<Backend>,
-) -> anyhow::Result<String> {
-    let mut pipeline = Pipeline::source(source, encoding, columns, backend)?;
-    pipeline.filter(filters, columns)?;
-    pipeline.reproject(crs, format);
-    Ok(pipeline.finish(format))
-}
-
 pub fn plan(
     grammar: &Grammar,
     parsed: &ParsedUrl,
@@ -184,10 +148,14 @@ pub fn plan(
 ) -> anyhow::Result<String> {
     let mut pipeline = Pipeline::source(source, &parsed.encoding, columns, backend)?;
     pipeline.filter(&parsed.filters, columns)?;
-    pipeline.reproject(crs, parsed.format);
+    pipeline.reproject(crs, parsed.output.as_ref());
 
     if parsed.actions.is_empty() {
-        return Ok(pipeline.finish(parsed.format));
+        let select = {
+            let mut ctx = StageCtx::new(&mut pipeline);
+            parsed.output.clone().rows(&mut ctx, parsed)?
+        };
+        return Ok(pipeline.finish(select));
     }
 
     for action in &parsed.actions {
@@ -221,6 +189,10 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parsed_for(url: &str) -> crate::url::ParsedUrl {
+        crate::url::parse(url, &Grammar::core()).unwrap()
+    }
 
     fn backend() -> Arc<Backend> {
         Arc::new(Backend::default())
@@ -487,9 +459,15 @@ mod tests {
     #[test]
     fn reprojection_takes_the_step_after_the_filter() {
         let columns = geom_columns();
-        let out =
-            build_sql("/x.geojson", "UTF-8", &id_filter(), Format::GeoJson, &columns, Some("EPSG:25832"), backend())
-                .unwrap();
+        let out = plan(
+            &Grammar::core(),
+            &parsed_for("/@dataset:x,id:7.geojson"),
+            "/x.geojson",
+            &columns,
+            Some("EPSG:25832"),
+            backend(),
+        )
+        .unwrap();
         assert!(out.contains("\"step_2\" AS (SELECT * REPLACE (ST_Transform("), "{out}");
         assert!(out.contains("FROM \"step_1\""), "{out}");
         assert!(out.contains("\"step_3\" AS (SELECT * REPLACE (ST_AsGeoJSON("), "{out}");
@@ -500,31 +478,41 @@ mod tests {
     #[test]
     fn a_crs_already_in_wgs84_adds_no_reprojection_step() {
         let columns = geom_columns();
-        let out =
-            build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, Some("EPSG:4326"), backend()).unwrap();
+        let out = plan(
+            &Grammar::core(),
+            &parsed_for("/@dataset:x.geojson"),
+            "/x.geojson",
+            &columns,
+            Some("EPSG:4326"),
+            backend(),
+        )
+        .unwrap();
         assert!(!out.contains("ST_Transform"), "{out}");
         assert!(out.contains("\"step_1\" AS (SELECT * REPLACE (ST_AsGeoJSON("), "a pass-through step was added: {out}");
     }
 
     #[test]
-    fn build_sql_without_a_geometry_column_errors_rather_than_panics() {
+    fn a_source_without_a_geometry_column_errors_rather_than_panics() {
         let columns = vec![("id".to_string(), "BIGINT".to_string())];
-        let err = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None, backend()).unwrap_err();
+        let err = plan(&Grammar::core(), &parsed_for("/@dataset:x.geojson"), "/x.geojson", &columns, None, backend())
+            .unwrap_err();
         assert!(err.downcast_ref::<query::NoGeometry>().is_some(), "{err:#}");
     }
 
     #[test]
     fn an_unfiltered_request_adds_no_filter_step() {
         let columns = vec![("name".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let out = build_sql("/x.geojson", "UTF-8", &[], Format::GeoJson, &columns, None, backend()).unwrap();
+        let out = plan(&Grammar::core(), &parsed_for("/@dataset:x.geojson"), "/x.geojson", &columns, None, backend())
+            .unwrap();
         assert!(!out.contains("WHERE"), "an empty filter list added a predicate: {out}");
     }
 
     #[test]
     fn a_filtered_request_is_the_first_numbered_step() {
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let filters = vec![Segment { name: "id".to_string(), params: vec!["7".to_string()] }];
-        let out = build_sql("/x.geojson", "UTF-8", &filters, Format::GeoJson, &columns, None, backend()).unwrap();
+        let out =
+            plan(&Grammar::core(), &parsed_for("/@dataset:x,id:7.geojson"), "/x.geojson", &columns, None, backend())
+                .unwrap();
         assert!(out.contains("\"step_1\" AS (SELECT * FROM \"source\" WHERE"), "{out}");
         assert!(out.contains("\"id\" = (7)"), "{out}");
     }
