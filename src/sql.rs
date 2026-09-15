@@ -127,15 +127,6 @@ impl Pipeline {
     pub fn finish(self, select: SelectStatement) -> String {
         select.with(self.ctes).to_string(PostgresQueryBuilder)
     }
-
-    pub fn finish_raw(self) -> String {
-        Query::select()
-            .expr(Expr::cust("*"))
-            .from(self.input)
-            .to_owned()
-            .with(self.ctes)
-            .to_string(PostgresQueryBuilder)
-    }
 }
 
 pub fn plan(
@@ -181,6 +172,11 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered(pipeline: Pipeline) -> String {
+        let input = pipeline.input();
+        pipeline.finish(Query::select().expr(Expr::cust("*")).from(input).take())
+    }
 
     fn parsed_for(url: &str) -> crate::url::ParsedUrl {
         crate::url::parse(url, &Grammar::core()).unwrap()
@@ -384,7 +380,7 @@ mod tests {
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.step(Query::select().expr(Expr::cust("1")).from(p.input()).take());
         p.step(Query::select().expr(Expr::cust("2")).from(p.input()).take());
-        let out = p.finish_raw();
+        let out = rendered(p);
         assert!(out.contains("\"step_1\" AS (SELECT 1 FROM \"source\")"), "{out}");
         assert!(out.contains("\"step_2\" AS (SELECT 2 FROM \"step_1\")"), "{out}");
         assert!(out.trim_end().ends_with("SELECT * FROM \"step_2\""), "{out}");
@@ -398,7 +394,7 @@ mod tests {
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.cte_once("extent", |_| panic!("a repeated side table must not be rebuilt"));
         assert!(p.cte("extent").is_some());
-        let out = p.finish_raw();
+        let out = rendered(p);
         assert_eq!(out.matches("\"x_extent\" AS").count(), 1, "the side table was emitted twice: {out}");
         assert!(out.trim_end().ends_with("SELECT * FROM \"source\""), "a side table advanced the input: {out}");
     }
@@ -430,7 +426,7 @@ mod tests {
             p.cte_once(name, |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
             assert!(p.cte(name).is_some(), "{name} was built but is not live");
         }
-        let out = p.finish_raw();
+        let out = rendered(p);
         let mut declared: Vec<&str> = out
             .match_indices("\" AS (")
             .map(|(at, _)| {
@@ -451,7 +447,7 @@ mod tests {
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.filter(&id_filter(), &columns).unwrap();
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
-        let out = p.finish_raw();
+        let out = rendered(p);
         assert!(out.contains("\"x_extent\" AS (SELECT 1 FROM \"source\")"), "{out}");
         assert!(out.contains("\"x_extent_1\" AS (SELECT 2 FROM \"step_1\")"), "a stale side table was reused: {out}");
     }
@@ -462,17 +458,17 @@ mod tests {
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.filter(&id_filter(), &columns).unwrap();
         p.cte_once("extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
-        let out = p.finish_raw();
+        let out = rendered(p);
         assert!(out.contains("\"x_extent\" AS (SELECT 1 FROM \"step_1\")"), "{out}");
     }
 
     #[test]
-    fn finish_raw_skips_the_geojson_conversion() {
+    fn the_source_relation_carries_the_reader_and_its_encoding() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
         p.step(Query::select().expr(Expr::cust("1")).from(p.input()).take());
         assert_eq!(
-            p.finish_raw(),
+            rendered(p),
             "WITH \"source\" AS (SELECT * FROM ST_Read('/x.geojson', open_options=list_value('ENCODING=UTF-8')) AS \"src\") , \"step_1\" AS (SELECT 1 FROM \"source\") SELECT * FROM \"step_1\""
         );
     }
