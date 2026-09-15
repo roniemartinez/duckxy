@@ -75,7 +75,7 @@ mod tests {
 
     impl crate::grammar::Action for Probe {
         fn name(&self) -> &'static str {
-            "probe"
+            "test"
         }
 
         fn options(&self) -> &'static [crate::grammar::Opt] {
@@ -106,8 +106,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_registered_action_is_planned_with_the_grammar_that_parsed_it() {
-        let s = extended_state("probe");
-        let (status, body) = get(s.clone(), &signed(&s, "/@dataset:pts/@probe/n.json")).await;
+        let s = extended_state("action");
+        let (status, body) = get(s.clone(), &signed(&s, "/@dataset:pts/@test/n.json")).await;
         assert!(
             !body.contains("not registered in this grammar"),
             "the planner used a different grammar than the parser: {body}"
