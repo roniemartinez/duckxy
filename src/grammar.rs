@@ -110,6 +110,14 @@ impl<'a> StageCtx<'a> {
         self.pipeline.backend().has(name)
     }
 
+    pub fn geometry(&self) -> &str {
+        self.pipeline.geometry()
+    }
+
+    pub fn replace_geometry(&mut self, geometry: SimpleExpr) {
+        self.pipeline.replace_geometry(geometry);
+    }
+
     pub fn geom(&self) -> SimpleExpr {
         sea_query::Expr::col(Alias::new(self.pipeline.geometry()))
     }
@@ -300,6 +308,7 @@ fn assert_scannable(name: &str) {
 pub struct Grammar {
     pub filters: Vec<SegmentDef>,
     pub actions: Vec<ActionDef>,
+    pub outputs: Vec<std::sync::Arc<dyn crate::formats::Output>>,
 }
 
 impl Grammar {
@@ -307,6 +316,7 @@ impl Grammar {
 
     pub fn core() -> Grammar {
         let mut g = Grammar::default();
+        g.register_output(crate::formats::GeoJson);
         g.filter(&["id"], &[&[Param::Value], &[Param::Operator, Param::Value]]);
         g.filter(&["prop"], &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]]);
         g.filter(&["type"], &[&[Param::GeometryType]]);
@@ -349,6 +359,31 @@ impl Grammar {
         self
     }
 
+    pub fn register_output(&mut self, output: impl crate::formats::Output + 'static) -> &mut Self {
+        assert!(!output.extensions().is_empty(), "an output needs at least one extension");
+        for (at, ext) in output.extensions().iter().enumerate() {
+            assert_scannable(ext);
+            assert!(!ext.starts_with('.') && !ext.ends_with('.'), "extension {ext:?} can never be parsed from a url");
+            assert!(
+                ext.chars().all(|c| !c.is_ascii_uppercase()),
+                "extension {ext:?} must be lowercase; lookup lowercases the url, so an uppercase \
+                 registration can never match"
+            );
+            assert!(!output.extensions()[..at].contains(ext), "extension {ext:?} is repeated in its own registration");
+            if let Some(existing) = self.outputs.iter().find(|held| held.extensions().contains(ext))
+                && !output.overrides()
+            {
+                panic!(
+                    "extension {ext:?} is already claimed by an output for {:?}; an output sharing an \
+                     extension must declare overrides() and gate itself with applies()",
+                    existing.extensions()
+                );
+            }
+        }
+        self.outputs.push(std::sync::Arc::new(output));
+        self
+    }
+
     pub fn filter_for(&self, name: &str) -> Option<&SegmentDef> {
         self.filters.iter().find(|filter| filter.matches(name))
     }
@@ -378,6 +413,55 @@ mod tests {
 
     fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
         Query::select().expr(Expr::cust("1")).take()
+    }
+
+    struct Probe(&'static [&'static str], bool);
+
+    impl crate::formats::Output for Probe {
+        fn extensions(&self) -> &'static [&'static str] {
+            self.0
+        }
+        fn content_type(&self) -> &'static str {
+            "application/x-probe"
+        }
+        fn overrides(&self) -> bool {
+            self.1
+        }
+        fn rows(&self, ctx: &mut StageCtx, _: &crate::url::ParsedUrl) -> anyhow::Result<sea_query::SelectStatement> {
+            Ok(sea_query::Query::select().expr(sea_query::Expr::cust("1")).from(ctx.data()).take())
+        }
+    }
+
+    #[test]
+    fn the_core_grammar_registers_the_built_in_output() {
+        let g = Grammar::core();
+        assert_eq!(g.outputs.len(), 1);
+        assert_eq!(g.outputs[0].extensions(), &["geojson", "json"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is already claimed")]
+    fn registering_an_output_over_a_claimed_extension_without_overrides_panics() {
+        Grammar::core().register_output(Probe(&["json"], false));
+    }
+
+    #[test]
+    fn an_output_that_declares_the_override_may_share_an_extension() {
+        let mut g = Grammar::core();
+        g.register_output(Probe(&["json"], true));
+        assert_eq!(g.outputs.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be lowercase")]
+    fn registering_an_uppercase_extension_panics() {
+        Grammar::default().register_output(Probe(&["GeoJSON"], false));
+    }
+
+    #[test]
+    #[should_panic(expected = "an output needs at least one extension")]
+    fn registering_an_output_with_no_extension_panics() {
+        Grammar::default().register_output(Probe(&[], false));
     }
 
     #[test]

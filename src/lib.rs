@@ -8,7 +8,6 @@ pub mod grammar;
 pub mod handler;
 pub mod parexp;
 pub mod query;
-pub mod render;
 pub mod routes;
 pub mod sql;
 pub mod url;

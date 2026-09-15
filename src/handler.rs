@@ -19,15 +19,14 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
 
     let root = state.root;
     let backend = state.backend;
-    let format = parsed.format;
-    let render = crate::render::Render::of(format);
+    let output = parsed.output.clone();
+    let framing = parsed.output.clone();
     let download = format!("{}.{}", parsed.dataset, parsed.extension);
-    let dataset = parsed.dataset;
-    let encoding = parsed.encoding;
+    let dataset = parsed.dataset.clone();
+    let encoding = parsed.encoding.clone();
 
     let name = dataset.clone();
-    let filters = parsed.filters;
-    let selected = parsed.path;
+    let selected = parsed.path.clone();
     let source = match tokio::task::spawn_blocking(move || root.resolve(&name, selected.as_deref())).await {
         Ok(Ok(source)) => source,
         Ok(Err(e)) => return resolve_error(e),
@@ -41,15 +40,17 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(CHANNEL_DEPTH);
 
     tokio::task::spawn_blocking(move || {
-        if tx.blocking_send(Ok(Bytes::from_static(render.header.as_bytes()))).is_err() {
+        if tx.blocking_send(Ok(Bytes::from_static(output.header().as_bytes()))).is_err() {
             return;
         }
         let mut ready = Some(ready_tx);
         let sent = query::run(
             &source,
             &encoding,
-            render.separator,
-            |columns, crs| crate::sql::build_sql(&source, &encoding, &filters, format, columns, crs, backend.clone()),
+            output.separator(),
+            |columns, crs| {
+                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed, &source, columns, crs, backend.clone())
+            },
             || {
                 if let Some(ready_tx) = ready.take() {
                     let _ = ready_tx.send(Ok(()));
@@ -59,7 +60,7 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
         );
         match sent {
             Ok(()) => {
-                let _ = tx.blocking_send(Ok(Bytes::from_static(render.footer.as_bytes())));
+                let _ = tx.blocking_send(Ok(Bytes::from_static(output.footer().as_bytes())));
             }
             Err(e) => {
                 tracing::error!(dataset, error = ?e, "query failed");
@@ -84,7 +85,7 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
 
     (
         [
-            (header::CONTENT_TYPE, render.content_type.to_string()),
+            (header::CONTENT_TYPE, framing.content_type().to_string()),
             (header::CONTENT_DISPOSITION, format!("inline; filename=\"{download}\"")),
         ],
         Body::from_stream(ReceiverStream::new(rx)),
