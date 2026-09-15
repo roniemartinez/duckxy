@@ -1,6 +1,6 @@
 use crate::backend::Backend;
 use crate::formats::Output;
-use crate::grammar::{Grammar, StageCtx};
+use crate::grammar::{Grammar, ParamError, StageCtx};
 use crate::url::{ParsedUrl, Segment};
 use crate::{filters, query};
 use sea_query::{
@@ -150,40 +150,32 @@ pub fn plan(
     pipeline.filter(&parsed.filters, columns)?;
     pipeline.reproject(crs, parsed.output.as_ref());
 
-    if parsed.actions.is_empty() {
-        let select = {
-            let mut ctx = StageCtx::new(&mut pipeline);
-            parsed.output.clone().rows(&mut ctx, parsed)?
-        };
-        return Ok(pipeline.finish(select));
-    }
-
     for action in &parsed.actions {
         let Some(def) = grammar.action_for(&action.name) else {
             anyhow::bail!("action {:?} is not registered in this grammar", action.name);
         };
-        let select = {
-            let mut ctx = StageCtx::new(&mut pipeline);
-            let mut parts: Vec<(&'static str, SimpleExpr)> = Vec::new();
-            for segment in &action.segments {
-                let Some(option) = def.option(&segment.name) else {
-                    return Err(anyhow::anyhow!("option {:?} is not registered on {:?}", segment.name, action.name));
-                };
-                let Some(fragment) = option.shape_for(segment.params.len()).and_then(|s| s.fragment.as_ref()) else {
-                    return Err(anyhow::anyhow!(
-                        "option {:?} does not take {} parameters",
-                        segment.name,
-                        segment.params.len()
-                    ));
-                };
-                let expr = fragment(&mut ctx, &segment.params).map_err(anyhow::Error::new)?;
-                parts.push((option.canonical(), expr));
+        for segment in &action.segments {
+            let Some(option) = def.option(&segment.name) else {
+                anyhow::bail!("option {:?} is not registered on {:?}", segment.name, action.name);
+            };
+            let Some(shape) = option.shape_for(segment.params.len()) else {
+                anyhow::bail!("option {:?} does not take {} parameters", segment.name, segment.params.len());
+            };
+            for (at, (kind, raw)) in shape.iter().zip(&segment.params).enumerate() {
+                if !kind.accepts(raw) {
+                    return Err(anyhow::Error::new(ParamError { at, expected: *kind, got: raw.clone() }));
+                }
             }
-            (def.assemble)(&mut ctx, parts)
-        };
-        pipeline.step(select);
+        }
+        let mut ctx = StageCtx::new(&mut pipeline);
+        def.run(&mut ctx, &action.segments)?;
     }
-    Ok(pipeline.finish_raw())
+
+    let select = {
+        let mut ctx = StageCtx::new(&mut pipeline);
+        parsed.output.clone().rows(&mut ctx, parsed)?
+    };
+    Ok(pipeline.finish(select))
 }
 
 #[cfg(test)]
@@ -207,51 +199,94 @@ mod tests {
         vec![Segment { name: "id".to_string(), params: vec!["7".to_string()] }]
     }
 
-    fn probe_grammar() -> Grammar {
-        fn bounds(ctx: &mut StageCtx) -> SimpleExpr {
-            let extent = ctx.cte_once("extent", |from| {
-                Query::select().expr_as(Expr::cust("ST_Extent(geom)"), Alias::new("e")).from(from.clone()).take()
-            });
-            Expr::col((extent, Alias::new("e")))
+    struct Probe;
+
+    impl crate::grammar::Action for Probe {
+        fn name(&self) -> &'static str {
+            "probe"
         }
-        fn count(_: &mut StageCtx) -> SimpleExpr {
-            Expr::cust("COUNT(*)")
+
+        fn options(&self) -> &'static [crate::grammar::Opt] {
+            use crate::grammar::{Param, opt};
+            const OPTIONS: &[crate::grammar::Opt] = &[
+                opt("bounds", "b", &[&[]]),
+                opt("count", "n", &[&[]]),
+                opt("width", "", &[&[]]),
+                opt("three", "", &[&[Param::Column, Param::Operator, Param::Value]]),
+            ];
+            OPTIONS
         }
-        fn width(ctx: &mut StageCtx) -> SimpleExpr {
-            let extent = ctx.cte_once("extent", |from| {
-                Query::select().expr_as(Expr::cust("ST_Extent(geom)"), Alias::new("e")).from(from.clone()).take()
-            });
-            Expr::cust_with_exprs("ST_XMax($1)", [Expr::col((extent, Alias::new("e")))])
-        }
-        fn three(
-            _: &mut StageCtx,
-            c: crate::grammar::Column,
-            o: crate::grammar::Operator,
-            v: crate::grammar::Value,
-        ) -> SimpleExpr {
-            Expr::cust(format!("{}|{}|{}", c.0, o.0, v.0))
-        }
-        fn assemble(ctx: &mut StageCtx, parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
+
+        fn run(&self, ctx: &mut StageCtx, segments: &[Segment]) -> anyhow::Result<()> {
+            let extent = |ctx: &mut StageCtx| {
+                ctx.cte_once("extent", |from| {
+                    Query::select()
+                        .expr_as(Expr::cust("ST_Extent_Agg(geom)"), Alias::new("e"))
+                        .from(from.clone())
+                        .take()
+                })
+            };
+            let mut parts: Vec<(&'static str, SimpleExpr)> = Vec::new();
+            for segment in segments {
+                let part: (&'static str, SimpleExpr) = match segment.name.as_str() {
+                    "bounds" => {
+                        let e = extent(ctx);
+                        ("bounds", Expr::col((e, Alias::new("e"))))
+                    }
+                    "count" => ("count", Expr::cust("COUNT(*)")),
+                    "width" => {
+                        let e = extent(ctx);
+                        ("width", Expr::cust_with_exprs("ST_XMax($1)", [Expr::col((e, Alias::new("e")))]))
+                    }
+                    "three" => ("three", Expr::cust(segment.params.join("|"))),
+                    other => anyhow::bail!("option {other:?} is not handled"),
+                };
+                parts.push(part);
+            }
+            let data = ctx.data();
+            let held = ctx.cte("extent");
             let mut select = Query::select();
+            select.expr(Expr::cust("*"));
             for (name, expr) in parts {
                 select.expr_as(expr, Alias::new(name));
             }
-            select.from(ctx.data());
-            if let Some(extent) = ctx.cte("extent") {
+            select.from(data);
+            if let Some(extent) = held {
                 select.from(extent);
             }
-            select.take()
+            ctx.step(select.take());
+            Ok(())
         }
+    }
+
+    struct Typed;
+
+    impl crate::grammar::Action for Typed {
+        fn name(&self) -> &'static str {
+            "typed"
+        }
+
+        fn options(&self) -> &'static [crate::grammar::Opt] {
+            use crate::grammar::{Param, opt};
+            const OPTIONS: &[crate::grammar::Opt] =
+                &[opt("pair", "", &[&[Param::Boolean, Param::Boolean]]), opt("flag", "", &[&[Param::Boolean]])];
+            OPTIONS
+        }
+
+        fn run(&self, _: &mut StageCtx, _: &[Segment]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn typed_grammar() -> Grammar {
         let mut g = Grammar::core();
-        g.action(
-            crate::grammar::action("probe")
-                .option(&["bounds", "b"], bounds)
-                .option(&["count", "n"], count)
-                .option(&["width"], width)
-                .option(&["three"], three)
-                .terminal(assemble)
-                .build(),
-        );
+        g.register_action(Typed);
+        g
+    }
+
+    fn probe_grammar() -> Grammar {
+        let mut g = Grammar::core();
+        g.register_action(Probe);
         g
     }
 
@@ -270,10 +305,10 @@ mod tests {
     }
 
     #[test]
-    fn an_action_replaces_the_feature_select_with_its_own() {
+    fn an_action_adds_to_the_relation_and_the_output_still_frames_it() {
         let out = planned("/@dataset:x/@probe/count.json");
         assert!(out.contains("COUNT(*) AS \"count\""), "{out}");
-        assert!(!out.contains("ST_AsGeoJSON"), "an action must skip the geojson conversion: {out}");
+        assert!(out.contains("ST_AsGeoJSON"), "the output still supplies the terminal query: {out}");
     }
 
     #[test]
@@ -306,16 +341,9 @@ mod tests {
 
     #[test]
     fn a_bad_parameter_reports_its_own_position() {
-        fn flagged(_: &mut StageCtx, _v: crate::grammar::Value, _f: crate::grammar::Boolean) -> SimpleExpr {
-            Expr::cust("1")
-        }
-        fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
-            Query::select().expr(Expr::cust("1")).take()
-        }
-        let mut grammar = Grammar::core();
-        grammar.action(crate::grammar::action("probe").option(&["pair"], flagged).terminal(assemble).build());
+        let grammar = typed_grammar();
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
-        let parsed = crate::url::parse("/@dataset:x/@probe/pair:ok:banana.json", &grammar).unwrap();
+        let parsed = crate::url::parse("/@dataset:x/@typed/pair:true:banana.json", &grammar).unwrap();
         let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap_err();
         let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
         assert_eq!(typed.at, 1, "the wrong parameter position was reported");
@@ -341,16 +369,9 @@ mod tests {
 
     #[test]
     fn a_bad_action_parameter_surfaces_as_a_typed_error() {
-        fn flagged(_: &mut StageCtx, _flag: crate::grammar::Boolean) -> SimpleExpr {
-            Expr::cust("1")
-        }
-        fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
-            Query::select().expr(Expr::cust("1")).take()
-        }
-        let mut grammar = Grammar::core();
-        grammar.action(crate::grammar::action("probe").option(&["flag"], flagged).terminal(assemble).build());
+        let grammar = typed_grammar();
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
-        let parsed = crate::url::parse("/@dataset:x/@probe/flag:banana.json", &grammar).unwrap();
+        let parsed = crate::url::parse("/@dataset:x/@typed/flag:banana.json", &grammar).unwrap();
         let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap_err();
         let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
         assert_eq!(typed.expected, crate::grammar::Param::Boolean);

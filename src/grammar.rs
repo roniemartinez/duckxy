@@ -114,6 +114,10 @@ impl<'a> StageCtx<'a> {
         self.pipeline.geometry()
     }
 
+    pub fn step(&mut self, select: SelectStatement) {
+        self.pipeline.step(select);
+    }
+
     pub fn replace_geometry(&mut self, geometry: SimpleExpr) {
         self.pipeline.replace_geometry(geometry);
     }
@@ -135,166 +139,125 @@ impl<'a> StageCtx<'a> {
     }
 }
 
-pub type ErasedFragment = Box<dyn Fn(&mut StageCtx, &[String]) -> Result<SimpleExpr, ParamError> + Send + Sync>;
-
-pub trait IntoFragment<Args> {
-    fn shape() -> Vec<Param>;
-    fn erase(self) -> ErasedFragment;
-}
-
-macro_rules! impl_into_fragment {
-    ($($name:ident : $T:ident),*) => {
-        impl<F, $($T),*> IntoFragment<($($T,)*)> for F
-        where
-            F: Fn(&mut StageCtx, $($T),*) -> SimpleExpr + Send + Sync + 'static,
-            $($T: FromParam,)*
-        {
-            fn shape() -> Vec<Param> {
-                vec![$($T::KIND),*]
-            }
-
-            #[allow(unused_variables, unused_mut, unused_assignments)]
-            fn erase(self) -> ErasedFragment {
-                Box::new(move |ctx, raw| {
-                    let mut at = 0usize;
-                    $(
-                        let $name = match raw.get(at).and_then(|value| $T::from_param(value)) {
-                            Some(typed) => typed,
-                            None => {
-                                return Err(ParamError {
-                                    at,
-                                    expected: $T::KIND,
-                                    got: raw.get(at).cloned().unwrap_or_default(),
-                                });
-                            }
-                        };
-                        at += 1;
-                    )*
-                    Ok(self(ctx, $($name),*))
-                })
-            }
+impl Param {
+    pub fn accepts(self, raw: &str) -> bool {
+        match self {
+            Param::Column => Column::from_param(raw).is_some(),
+            Param::Operator => Operator::from_param(raw).is_some(),
+            Param::Value => Value::from_param(raw).is_some(),
+            Param::Boolean => Boolean::from_param(raw).is_some(),
+            Param::GeometryType => GeometryType::from_param(raw).is_some(),
         }
-    };
+    }
 }
 
-impl_into_fragment!();
-impl_into_fragment!(a: A);
-impl_into_fragment!(a: A, b: B);
-impl_into_fragment!(a: A, b: B, c: C);
-
-pub struct Shape {
-    pub params: Vec<Param>,
-    pub fragment: Option<ErasedFragment>,
+pub struct Opt {
+    pub name: &'static str,
+    pub short: &'static str,
+    pub shapes: &'static [&'static [Param]],
 }
 
-pub type Assemble = fn(&mut StageCtx, Vec<(&'static str, SimpleExpr)>) -> SelectStatement;
+pub const fn opt(name: &'static str, short: &'static str, shapes: &'static [&'static [Param]]) -> Opt {
+    Opt { name, short, shapes }
+}
+
+pub const fn flag(name: &'static str, short: &'static str) -> Opt {
+    Opt { name, short, shapes: &[&[]] }
+}
+
+pub(crate) trait Declared {
+    fn canonical(&self) -> &'static str;
+    fn accepts(&self, params: usize) -> bool;
+}
+
+impl Opt {
+    pub fn matches(&self, name: &str) -> bool {
+        self.name == name || (!self.short.is_empty() && self.short == name)
+    }
+
+    pub fn shape_for(&self, params: usize) -> Option<&'static [Param]> {
+        self.shapes.iter().copied().find(|shape| shape.len() == params)
+    }
+}
+
+impl Declared for Opt {
+    fn canonical(&self) -> &'static str {
+        self.name
+    }
+
+    fn accepts(&self, params: usize) -> bool {
+        self.shapes.iter().any(|shape| shape.len() == params)
+    }
+}
+
+impl Declared for SegmentDef {
+    fn canonical(&self) -> &'static str {
+        self.name
+    }
+
+    fn accepts(&self, params: usize) -> bool {
+        self.shapes.iter().any(|shape| shape.len() == params)
+    }
+}
+
+pub trait Action: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn options(&self) -> &'static [Opt];
+    fn run(&self, ctx: &mut StageCtx, segments: &[crate::url::Segment]) -> anyhow::Result<()>;
+
+    fn short(&self) -> &'static str {
+        ""
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        self.name() == name || (!self.short().is_empty() && self.short() == name)
+    }
+
+    fn canonical(&self) -> &'static str {
+        self.name()
+    }
+
+    fn option(&self, name: &str) -> Option<&'static Opt> {
+        self.options().iter().find(|option| option.matches(name))
+    }
+}
 
 pub struct SegmentDef {
-    pub names: Vec<&'static str>,
-    pub shapes: Vec<Shape>,
+    pub name: &'static str,
+    pub short: &'static str,
+    pub shapes: Vec<Vec<Param>>,
 }
 
 impl SegmentDef {
     pub fn matches(&self, name: &str) -> bool {
-        self.names.contains(&name)
-    }
-
-    pub fn canonical(&self) -> &'static str {
-        self.names[0]
-    }
-
-    pub fn accepts(&self, params: usize) -> bool {
-        self.shape_for(params).is_some()
-    }
-
-    pub fn shape_for(&self, params: usize) -> Option<&Shape> {
-        self.shapes.iter().find(|shape| shape.params.len() == params)
+        self.name == name || (!self.short.is_empty() && self.short == name)
     }
 }
 
-pub struct ActionDef {
-    pub names: Vec<&'static str>,
-    pub options: Vec<SegmentDef>,
-    pub assemble: Assemble,
-}
-
-impl ActionDef {
-    pub fn matches(&self, name: &str) -> bool {
-        self.names.contains(&name)
-    }
-
-    pub fn canonical(&self) -> &'static str {
-        self.names[0]
-    }
-
-    pub fn option(&self, name: &str) -> Option<&SegmentDef> {
-        self.options.iter().find(|option| option.matches(name))
-    }
-}
-
-pub fn action(name: &'static str) -> ActionBuilder {
-    ActionBuilder { names: vec![name], options: Vec::new(), assemble: None }
-}
-
-pub struct ActionBuilder {
-    names: Vec<&'static str>,
-    options: Vec<SegmentDef>,
-    assemble: Option<Assemble>,
-}
-
-impl ActionBuilder {
-    pub fn alias(mut self, name: &'static str) -> Self {
-        self.names.push(name);
-        self
-    }
-
-    pub fn terminal(mut self, assemble: Assemble) -> Self {
-        self.assemble = Some(assemble);
-        self
-    }
-
-    pub fn option<F, Args>(mut self, names: &[&'static str], fragment: F) -> Self
-    where
-        F: IntoFragment<Args>,
-    {
-        assert!(!names.is_empty(), "an option needs at least one name");
-        for (at, name) in names.iter().enumerate() {
-            assert_scannable(name);
-            if names[..at].contains(name) {
-                panic!("option {name:?} is repeated in its own registration");
+fn assert_declaration(action: &dyn Action) {
+    assert_pair(action.name(), action.short());
+    assert!(!action.options().is_empty(), "action {:?} has no options", action.name());
+    for (at, declared) in action.options().iter().enumerate() {
+        assert_pair(declared.name, declared.short);
+        assert!(!declared.shapes.is_empty(), "option {:?} needs at least one shape", declared.name);
+        for earlier in &action.options()[..at] {
+            if earlier.matches(declared.name) || (!declared.short.is_empty() && earlier.matches(declared.short)) {
+                panic!("option {:?} is already registered on this action as {:?}", declared.name, earlier.name);
             }
         }
-        let shape = Shape { params: F::shape(), fragment: Some(fragment.erase()) };
-        match self.options.iter_mut().find(|option| names.iter().any(|name| option.matches(name))) {
-            Some(existing) if existing.names == names => existing.shapes.push(shape),
-            Some(existing) => {
-                panic!("option {:?} is already registered on this action as {:?}", names, existing.names)
-            }
-            None => self.options.push(SegmentDef { names: names.to_vec(), shapes: vec![shape] }),
-        }
-        if let Some(existing) = self.options.iter().find(|option| option.names == names) {
-            let mut arities: Vec<usize> = existing.shapes.iter().map(|shape| shape.params.len()).collect();
-            let total = arities.len();
-            arities.sort_unstable();
-            arities.dedup();
-            assert_eq!(arities.len(), total, "option {:?} registered two shapes of the same arity", names[0]);
-        }
-        self
+        let mut arities: Vec<usize> = declared.shapes.iter().map(|shape| shape.len()).collect();
+        let total = arities.len();
+        arities.sort_unstable();
+        arities.dedup();
+        assert_eq!(arities.len(), total, "option {:?} registered two shapes of the same arity", declared.name);
     }
+}
 
-    pub fn build(self) -> ActionDef {
-        assert!(!self.options.is_empty(), "action {:?} has no options", self.names[0]);
-        for (at, name) in self.names.iter().enumerate() {
-            assert_scannable(name);
-            if self.names[..at].contains(name) {
-                panic!("action name {name:?} is repeated in its own registration");
-            }
-        }
-        ActionDef {
-            assemble: self.assemble.unwrap_or_else(|| panic!("action {:?} has no terminal", self.names[0])),
-            names: self.names,
-            options: self.options,
-        }
+fn assert_pair(name: &str, short: &str) {
+    assert_scannable(name);
+    if !short.is_empty() {
+        assert_scannable(short);
+        assert!(short != name, "short name {short:?} repeats the canonical name");
     }
 }
 
@@ -307,7 +270,7 @@ fn assert_scannable(name: &str) {
 #[derive(Default)]
 pub struct Grammar {
     pub filters: Vec<SegmentDef>,
-    pub actions: Vec<ActionDef>,
+    pub actions: Vec<Box<dyn Action>>,
     pub outputs: Vec<std::sync::Arc<dyn crate::formats::Output>>,
 }
 
@@ -317,45 +280,43 @@ impl Grammar {
     pub fn core() -> Grammar {
         let mut g = Grammar::default();
         g.register_output(crate::formats::GeoJson);
-        g.filter(&["id"], &[&[Param::Value], &[Param::Operator, Param::Value]]);
-        g.filter(&["prop"], &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]]);
-        g.filter(&["type"], &[&[Param::GeometryType]]);
-        g.filter(&["valid"], &[&[Param::Boolean]]);
-        g.filter(&["empty"], &[&[Param::Boolean]]);
-        g.filter(&["simple"], &[&[Param::Boolean]]);
-        g.filter(&["closed"], &[&[Param::Boolean]]);
+        g.filter("id", "", &[&[Param::Value], &[Param::Operator, Param::Value]]);
+        g.filter("prop", "", &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]]);
+        g.filter("type", "", &[&[Param::GeometryType]]);
+        g.filter("valid", "", &[&[Param::Boolean]]);
+        g.filter("empty", "", &[&[Param::Boolean]]);
+        g.filter("simple", "", &[&[Param::Boolean]]);
+        g.filter("closed", "", &[&[Param::Boolean]]);
         g
     }
 
-    pub fn filter(&mut self, names: &[&'static str], shapes: &[&[Param]]) -> &mut Self {
-        assert!(!names.is_empty(), "a filter needs at least one name");
+    pub fn filter(&mut self, name: &'static str, short: &'static str, shapes: &[&[Param]]) -> &mut Self {
+        assert!(!shapes.is_empty(), "a filter needs at least one shape");
         assert!(!shapes.iter().any(|shape| shape.is_empty()), "a filter shape needs at least one parameter");
-        for (at, name) in names.iter().enumerate() {
-            assert_scannable(name);
-            if Grammar::RESERVED.contains(name) {
-                panic!("filter name {name:?} is reserved for the source encoding");
+        assert_pair(name, short);
+        for candidate in [name, short] {
+            if candidate.is_empty() {
+                continue;
             }
-            if self.filter_for(name).is_some() {
-                panic!("filter {name:?} is already registered");
+            if Grammar::RESERVED.contains(&candidate) {
+                panic!("filter name {candidate:?} is reserved for the source encoding");
             }
-            if names[..at].contains(name) {
-                panic!("filter name {name:?} is repeated in its own registration");
+            if self.filter_for(candidate).is_some() {
+                panic!("filter {candidate:?} is already registered");
             }
         }
-        self.filters.push(SegmentDef {
-            names: names.to_vec(),
-            shapes: shapes.iter().map(|params| Shape { params: params.to_vec(), fragment: None }).collect(),
-        });
+        self.filters.push(SegmentDef { name, short, shapes: shapes.iter().map(|s| s.to_vec()).collect() });
         self
     }
 
-    pub fn action(&mut self, def: ActionDef) -> &mut Self {
-        for name in &def.names {
-            if self.action_for(name).is_some() {
-                panic!("action {name:?} is already registered");
+    pub fn register_action(&mut self, action: impl Action + 'static) -> &mut Self {
+        assert_declaration(&action);
+        for candidate in [action.name(), action.short()] {
+            if !candidate.is_empty() && self.action_for(candidate).is_some() {
+                panic!("action {candidate:?} is already registered");
             }
         }
-        self.actions.push(def);
+        self.actions.push(Box::new(action));
         self
     }
 
@@ -388,8 +349,8 @@ impl Grammar {
         self.filters.iter().find(|filter| filter.matches(name))
     }
 
-    pub fn action_for(&self, name: &str) -> Option<&ActionDef> {
-        self.actions.iter().find(|action| action.matches(name))
+    pub fn action_for(&self, name: &str) -> Option<&dyn Action> {
+        self.actions.iter().find(|action| action.matches(name)).map(|held| held.as_ref())
     }
 }
 
@@ -401,19 +362,33 @@ mod tests {
         std::sync::Arc::new(crate::backend::Backend::default())
     }
     use rstest::rstest;
-    use sea_query::{Expr, Query};
 
-    fn nothing(_: &mut StageCtx) -> SimpleExpr {
-        Expr::cust("1")
+    struct Noop(&'static str, &'static str, &'static [Opt]);
+
+    impl Action for Noop {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn short(&self) -> &'static str {
+            self.1
+        }
+        fn options(&self) -> &'static [Opt] {
+            self.2
+        }
+        fn run(&self, _: &mut StageCtx, _: &[crate::url::Segment]) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
-    fn one_value(_: &mut StageCtx, _value: Value) -> SimpleExpr {
-        Expr::cust("1")
-    }
-
-    fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
-        Query::select().expr(Expr::cust("1")).take()
-    }
+    const ONE_AA: &[Opt] = &[opt("aa", "", &[&[Param::Value]])];
+    const ONE_BB: &[Opt] = &[opt("bb", "", &[&[Param::Value]])];
+    const AA_SHORT: &[Opt] = &[opt("aa", "a", &[&[Param::Value]])];
+    const AA_SELF: &[Opt] = &[opt("aa", "aa", &[&[Param::Value]])];
+    const AA_FLAG: &[Opt] = &[flag("aa", "")];
+    const BAD_OPT: &[Opt] = &[opt("a/b", "", &[&[Param::Value]])];
+    const SAME_TWICE: &[Opt] = &[opt("aa", "", &[&[Param::Value]]), opt("aa", "a", &[&[Param::Value]])];
+    const SHARED_SHORT: &[Opt] = &[opt("aa", "a", &[&[Param::Value]]), opt("bb", "a", &[&[Param::Value]])];
+    const TWO_SAME_ARITY: &[Opt] = &[opt("aa", "", &[&[Param::Value], &[Param::Column]])];
 
     struct Probe(&'static [&'static str], bool);
 
@@ -472,7 +447,17 @@ mod tests {
     }
 
     fn kinds(def: &SegmentDef) -> Vec<Vec<Param>> {
-        def.shapes.iter().map(|shape| shape.params.clone()).collect()
+        def.shapes.clone()
+    }
+
+    fn shapes(option: &Opt) -> Vec<Vec<Param>> {
+        option.shapes.iter().map(|shape| shape.to_vec()).collect()
+    }
+
+    fn registered(action: impl Action + 'static) -> Grammar {
+        let mut g = Grammar::default();
+        g.register_action(action);
+        g
     }
 
     #[test]
@@ -516,35 +501,36 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_resolves_to_the_canonical_name() {
+    fn a_short_name_resolves_to_the_canonical_one() {
         let mut g = Grammar::default();
-        g.filter(&["property", "prop", "p"], &[&[Param::Column, Param::Value]]);
-        for name in ["property", "prop", "p"] {
+        g.filter("property", "prop", &[&[Param::Column, Param::Value]]);
+        for name in ["property", "prop"] {
             assert_eq!(g.filter_for(name).unwrap().canonical(), "property");
         }
         assert!(g.filter_for("nope").is_none());
+        assert!(g.filter_for("p").is_none(), "only one short name is registered");
     }
 
     #[test]
     #[should_panic(expected = "filter \"id\" is already registered")]
     fn registering_a_filter_name_twice_panics() {
         let mut g = Grammar::default();
-        g.filter(&["id"], &[&[Param::Value]]);
-        g.filter(&["id"], &[&[Param::Value]]);
+        g.filter("id", "", &[&[Param::Value]]);
+        g.filter("id", "", &[&[Param::Value]]);
     }
 
     #[test]
     #[should_panic(expected = "filter \"p\" is already registered")]
     fn registering_an_alias_that_another_filter_owns_panics() {
         let mut g = Grammar::default();
-        g.filter(&["prop", "p"], &[&[Param::Column, Param::Value]]);
-        g.filter(&["point", "p"], &[&[Param::Value]]);
+        g.filter("prop", "p", &[&[Param::Column, Param::Value]]);
+        g.filter("point", "p", &[&[Param::Value]]);
     }
 
     #[test]
-    #[should_panic(expected = "filter name \"p\" is repeated")]
-    fn repeating_a_name_inside_one_registration_panics() {
-        Grammar::default().filter(&["p", "p"], &[&[Param::Value]]);
+    #[should_panic(expected = "short name \"p\" repeats the canonical name")]
+    fn a_filter_short_name_repeating_its_canonical_one_panics() {
+        Grammar::default().filter("p", "p", &[&[Param::Value]]);
     }
 
     #[rstest]
@@ -552,7 +538,7 @@ mod tests {
     #[case("encoding")]
     #[should_panic(expected = "is reserved for the source encoding")]
     fn registering_a_reserved_name_panics(#[case] name: &'static str) {
-        Grammar::default().filter(&[name], &[&[Param::Value]]);
+        Grammar::default().filter(name, "", &[&[Param::Value]]);
     }
 
     #[rstest]
@@ -562,48 +548,39 @@ mod tests {
     #[case("a/b")]
     #[should_panic(expected = "can never be parsed from a url")]
     fn registering_a_name_the_scanner_cannot_produce_panics(#[case] name: &'static str) {
-        Grammar::default().filter(&[name], &[&[Param::Value]]);
+        Grammar::default().filter(name, "", &[&[Param::Value]]);
     }
 
     #[test]
     #[should_panic(expected = "a filter shape needs at least one parameter")]
     fn registering_a_shape_with_no_parameters_panics() {
-        Grammar::default().filter(&["flag"], &[&[]]);
-    }
-
-    fn one_boolean(_: &mut StageCtx, _flag: Boolean) -> SimpleExpr {
-        Expr::cust("1")
-    }
-
-    fn two_params(_: &mut StageCtx, _column: Column, _value: Value) -> SimpleExpr {
-        Expr::cust("1")
-    }
-
-    fn three_params(_: &mut StageCtx, _c: Column, _o: Operator, _v: Value) -> SimpleExpr {
-        Expr::cust("1")
+        Grammar::default().filter("flag", "", &[&[]]);
     }
 
     #[test]
-    fn a_fragment_declares_the_shape_of_its_own_signature() {
-        let def = action("probe")
-            .option(&["none"], nothing)
-            .option(&["one"], one_value)
-            .option(&["flag"], one_boolean)
-            .option(&["two"], two_params)
-            .option(&["three"], three_params)
-            .terminal(assemble)
-            .build();
-        assert_eq!(kinds(def.option("none").unwrap()), vec![Vec::new()]);
-        assert_eq!(kinds(def.option("one").unwrap()), vec![vec![Param::Value]]);
-        assert_eq!(kinds(def.option("flag").unwrap()), vec![vec![Param::Boolean]]);
-        assert_eq!(kinds(def.option("two").unwrap()), vec![vec![Param::Column, Param::Value]]);
-        assert_eq!(kinds(def.option("three").unwrap()), vec![vec![Param::Column, Param::Operator, Param::Value]]);
+    fn an_option_declares_the_kinds_its_parameters_take() {
+        const OPTIONS: &[Opt] = &[
+            flag("none", ""),
+            opt("one", "", &[&[Param::Value]]),
+            opt("flag", "", &[&[Param::Boolean]]),
+            opt("two", "", &[&[Param::Column, Param::Value]]),
+            opt("three", "", &[&[Param::Column, Param::Operator, Param::Value]]),
+        ];
+        let g = registered(Noop("probe", "", OPTIONS));
+        let def = g.action_for("probe").unwrap();
+        assert_eq!(shapes(def.option("none").unwrap()), vec![Vec::new()]);
+        assert_eq!(shapes(def.option("one").unwrap()), vec![vec![Param::Value]]);
+        assert_eq!(shapes(def.option("flag").unwrap()), vec![vec![Param::Boolean]]);
+        assert_eq!(shapes(def.option("two").unwrap()), vec![vec![Param::Column, Param::Value]]);
+        assert_eq!(shapes(def.option("three").unwrap()), vec![vec![Param::Column, Param::Operator, Param::Value]]);
     }
 
     #[test]
-    fn registering_an_option_twice_adds_an_alternative_shape() {
-        let def = action("probe").option(&["id"], one_value).option(&["id"], two_params).terminal(assemble).build();
-        assert_eq!(kinds(def.option("id").unwrap()), vec![vec![Param::Value], vec![Param::Column, Param::Value]]);
+    fn an_option_declaring_two_shapes_accepts_both_arities() {
+        const OPTIONS: &[Opt] = &[opt("id", "", &[&[Param::Value], &[Param::Column, Param::Value]])];
+        let g = registered(Noop("probe", "", OPTIONS));
+        let def = g.action_for("probe").unwrap();
+        assert_eq!(shapes(def.option("id").unwrap()), vec![vec![Param::Value], vec![Param::Column, Param::Value]]);
         assert!(def.option("id").unwrap().accepts(1));
         assert!(def.option("id").unwrap().accepts(2));
         assert!(!def.option("id").unwrap().accepts(3));
@@ -630,28 +607,28 @@ mod tests {
     }
 
     #[test]
-    fn a_fragment_reports_which_parameter_was_wrong() {
-        let def = action("probe").option(&["flag"], one_boolean).terminal(assemble).build();
-        let shape = def.option("flag").unwrap().shape_for(1).unwrap();
-        let fragment = shape.fragment.as_ref().unwrap();
-        let mut pipeline =
-            Pipeline::source("/x.geojson", "UTF-8", &[("geom".to_string(), "GEOMETRY".to_string())], backend())
-                .unwrap();
-        let mut ctx = StageCtx { pipeline: &mut pipeline };
-        let err = fragment(&mut ctx, &["banana".to_string()]).unwrap_err();
-        assert_eq!(err, ParamError { at: 0, expected: Param::Boolean, got: "banana".to_string() });
-        assert_eq!(err.to_string(), "parameter 1 expected true or false, got \"banana\"");
+    fn a_stage_reads_the_relation_it_was_given() {
+        let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
+        let mut pipeline = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut ctx = StageCtx::new(&mut pipeline);
+        assert_eq!(ctx.geometry(), "geom");
+        assert!(ctx.cte("extent").is_none());
+        ctx.cte_once("extent", |from| {
+            sea_query::Query::select().expr(sea_query::Expr::cust("1")).from(from.clone()).take()
+        });
+        assert!(ctx.cte("extent").is_some());
     }
 
     #[test]
-    #[should_panic(expected = "action \"probe\" has no terminal")]
-    fn building_an_action_without_a_terminal_panics() {
-        action("probe").option(&["aa"], nothing).build();
+    #[should_panic(expected = "action \"probe\" has no options")]
+    fn registering_an_action_without_options_panics() {
+        registered(Noop("probe", "", &[]));
     }
 
     #[test]
     fn an_action_resolves_its_aliases_to_canonical_names() {
-        let def = action("probe").alias("p").option(&["aa", "a"], nothing).terminal(assemble).build();
+        let g = registered(Noop("probe", "p", AA_SHORT));
+        let def = g.action_for("probe").unwrap();
         assert!(def.matches("probe") && def.matches("p"));
         assert_eq!(def.canonical(), "probe");
         assert_eq!(def.option("a").unwrap().canonical(), "aa");
@@ -662,75 +639,71 @@ mod tests {
     #[should_panic(expected = "action \"probe\" is already registered")]
     fn registering_an_action_name_twice_panics() {
         let mut g = Grammar::default();
-        g.action(action("probe").option(&["aa"], nothing).terminal(assemble).build());
-        g.action(action("probe").option(&["bb"], nothing).terminal(assemble).build());
+        g.register_action(Noop("probe", "", ONE_AA));
+        g.register_action(Noop("probe", "", ONE_BB));
     }
 
     #[test]
     #[should_panic(expected = "action \"p\" is already registered")]
     fn registering_an_action_alias_another_action_owns_panics() {
         let mut g = Grammar::default();
-        g.action(action("probe").alias("p").option(&["aa"], nothing).terminal(assemble).build());
-        g.action(action("point").alias("p").option(&["bb"], nothing).terminal(assemble).build());
-    }
-
-    #[test]
-    #[should_panic(expected = "action \"probe\" has no options")]
-    fn building_an_action_with_no_options_panics() {
-        action("probe").terminal(assemble).build();
+        g.register_action(Noop("probe", "p", ONE_AA));
+        g.register_action(Noop("point", "p", ONE_BB));
     }
 
     #[test]
     #[should_panic(expected = "is already registered on this action")]
     fn reusing_an_option_alias_for_a_different_option_panics() {
-        action("probe").option(&["aa", "a"], nothing).option(&["bb", "a"], one_value).terminal(assemble).build();
+        registered(Noop("probe", "", SHARED_SHORT));
     }
 
     #[test]
     #[should_panic(expected = "is already registered on this action")]
     fn redeclaring_an_option_with_different_aliases_panics() {
-        action("probe").option(&["aa"], nothing).option(&["aa", "a"], one_value).terminal(assemble).build();
+        registered(Noop("probe", "", SAME_TWICE));
     }
 
     #[test]
     #[should_panic(expected = "registered two shapes of the same arity")]
     fn registering_two_shapes_of_the_same_arity_panics() {
-        action("probe").option(&["aa"], one_value).option(&["aa"], one_boolean).terminal(assemble).build();
+        registered(Noop("probe", "", TWO_SAME_ARITY));
     }
 
     #[test]
-    #[should_panic(expected = "action name \"p\" is repeated")]
+    #[should_panic(expected = "short name \"p\" repeats the canonical name")]
     fn repeating_an_action_name_inside_one_registration_panics() {
-        action("p").alias("p").option(&["aa"], nothing).terminal(assemble).build();
+        registered(Noop("p", "p", ONE_AA));
     }
 
     #[test]
-    #[should_panic(expected = "option \"aa\" is repeated in its own registration")]
-    fn repeating_an_option_name_inside_one_registration_panics() {
-        action("probe").option(&["aa", "aa"], nothing).terminal(assemble).build();
+    #[should_panic(expected = "short name \"aa\" repeats the canonical name")]
+    fn an_option_whose_short_name_repeats_its_canonical_one_panics() {
+        registered(Noop("probe", "", AA_SELF));
     }
 
     #[test]
     #[should_panic(expected = "can never be parsed from a url")]
     fn registering_an_action_name_the_scanner_cannot_produce_panics() {
-        action("a/b").option(&["aa"], nothing).terminal(assemble).build();
+        registered(Noop("a/b", "", ONE_AA));
     }
 
     #[test]
     #[should_panic(expected = "can never be parsed from a url")]
     fn registering_an_option_name_the_scanner_cannot_produce_panics() {
-        action("probe").option(&["a/b"], nothing).terminal(assemble).build();
+        registered(Noop("probe", "", BAD_OPT));
     }
 
     #[test]
-    fn an_action_option_may_take_no_parameters_unlike_a_filter() {
-        let def = action("probe").option(&["aa"], nothing).terminal(assemble).build();
+    fn a_flag_takes_no_parameters_unlike_a_filter() {
+        let g = registered(Noop("probe", "", AA_FLAG));
+        let def = g.action_for("probe").unwrap();
         assert!(def.option("aa").unwrap().accepts(0));
+        assert!(!def.option("aa").unwrap().accepts(1));
     }
 
     #[test]
-    #[should_panic(expected = "a filter needs at least one name")]
+    #[should_panic(expected = "can never be parsed from a url")]
     fn registering_a_filter_with_no_name_panics() {
-        Grammar::default().filter(&[], &[&[Param::Value]]);
+        Grammar::default().filter("", "", &[&[Param::Value]]);
     }
 }

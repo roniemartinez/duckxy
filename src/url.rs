@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::grammar::{ActionDef, Grammar, SegmentDef};
+use crate::grammar::Grammar;
 
 pub const DEFAULT_ENCODING: &str = crate::encodings::UTF8;
 pub const MAX_FILTERS: usize = 50;
@@ -272,7 +272,7 @@ fn read_params(scan: &mut Scan<'_>) -> Vec<String> {
     params
 }
 
-fn finish_segment(key: &str, params: Vec<String>, def: &SegmentDef) -> Result<Segment, ParseError> {
+fn finish_segment(key: &str, params: Vec<String>, def: &dyn crate::grammar::Declared) -> Result<Segment, ParseError> {
     if params.iter().any(String::is_empty) || (params.is_empty() && !def.accepts(0)) {
         return Err(ParseError::EmptyOptionValue(key.to_string()));
     }
@@ -285,7 +285,7 @@ fn finish_segment(key: &str, params: Vec<String>, def: &SegmentDef) -> Result<Se
     Ok(Segment { name: def.canonical().to_string(), params })
 }
 
-fn read_action_segments(scan: &mut Scan<'_>, def: &ActionDef) -> Result<Vec<Segment>, ParseError> {
+fn read_action_segments(scan: &mut Scan<'_>, def: &dyn crate::grammar::Action) -> Result<Vec<Segment>, ParseError> {
     let mut out: Vec<Segment> = Vec::new();
     loop {
         let key = scan.take_until(b":,/");
@@ -430,33 +430,54 @@ pub fn is_valid_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::{StageCtx, Value, action};
-    use sea_query::{Expr, Query, SelectStatement, SimpleExpr};
+    use crate::grammar::{Action, Opt, Param, StageCtx, flag, opt};
 
-    fn nothing(_: &mut StageCtx) -> SimpleExpr {
-        Expr::cust("1")
-    }
+    struct Probe(&'static str, &'static str, &'static [Opt]);
 
-    fn one_value(_: &mut StageCtx, _value: Value) -> SimpleExpr {
-        Expr::cust("1")
-    }
-
-    fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
-        Query::select().expr(Expr::cust("1")).take()
+    impl Action for Probe {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn short(&self) -> &'static str {
+            self.1
+        }
+        fn options(&self) -> &'static [Opt] {
+            self.2
+        }
+        fn run(&self, _: &mut StageCtx, _: &[Segment]) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
     use rstest::rstest;
 
+    const TEST_OPTIONS: &[Opt] = &[flag("aa", "a"), flag("bb", ""), opt("val", "", &[&[Param::Value]])];
+    const MANY_OPTIONS: &[Opt] = &[
+        flag("o0", ""),
+        flag("o1", ""),
+        flag("o2", ""),
+        flag("o3", ""),
+        flag("o4", ""),
+        flag("o5", ""),
+        flag("o6", ""),
+        flag("o7", ""),
+        flag("o8", ""),
+        flag("o9", ""),
+        flag("o10", ""),
+        flag("o11", ""),
+        flag("o12", ""),
+        flag("o13", ""),
+        flag("o14", ""),
+        flag("o15", ""),
+        flag("o16", ""),
+        flag("o17", ""),
+        flag("o18", ""),
+        flag("o19", ""),
+        flag("o20", ""),
+    ];
+
     fn test_grammar() -> Grammar {
         let mut g = Grammar::core();
-        g.action(
-            action("probe")
-                .alias("p")
-                .option(&["aa", "a"], nothing)
-                .option(&["bb"], nothing)
-                .option(&["val"], one_value)
-                .terminal(assemble)
-                .build(),
-        );
+        g.register_action(Probe("probe", "p", TEST_OPTIONS));
         g
     }
 
@@ -534,11 +555,7 @@ mod tests {
         assert_eq!(out.actions.len(), MAX_ACTIONS);
 
         let mut g = Grammar::core();
-        let mut builder = action("probe");
-        for name in OPTION_NAMES {
-            builder = builder.option(&[name], nothing);
-        }
-        g.action(builder.terminal(assemble).build());
+        g.register_action(Probe("probe", "", MANY_OPTIONS));
         let options: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS).copied().collect();
         let out = parse(&format!("/@dataset:x/@probe/{}.json", options.join(",")), &g).unwrap();
         assert_eq!(out.actions[0].segments.len(), MAX_OPTIONS);
@@ -622,11 +639,7 @@ mod tests {
     #[test]
     fn more_than_twenty_options_is_rejected() {
         let mut g = Grammar::core();
-        let mut builder = action("probe");
-        for name in OPTION_NAMES {
-            builder = builder.option(&[name], nothing);
-        }
-        g.action(builder.terminal(assemble).build());
+        g.register_action(Probe("probe", "", MANY_OPTIONS));
         let many: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS + 1).copied().collect();
         let url = format!("/@dataset:x/@probe/{}.json", many.join(","));
         assert_eq!(parse(&url, &g), Err(ParseError::TooManyOptions));
