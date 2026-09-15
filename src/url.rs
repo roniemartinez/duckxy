@@ -406,7 +406,20 @@ pub fn is_valid_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::{Param, action};
+    use crate::grammar::{StageCtx, Value, action};
+    use sea_query::{Expr, Query, SelectStatement, SimpleExpr};
+
+    fn nothing(_: &mut StageCtx) -> SimpleExpr {
+        Expr::cust("1")
+    }
+
+    fn one_value(_: &mut StageCtx, _value: Value) -> SimpleExpr {
+        Expr::cust("1")
+    }
+
+    fn assemble(_: &mut StageCtx, _parts: Vec<(&'static str, SimpleExpr)>) -> SelectStatement {
+        Query::select().expr(Expr::cust("1")).take()
+    }
     use rstest::rstest;
 
     fn test_grammar() -> Grammar {
@@ -414,9 +427,10 @@ mod tests {
         g.action(
             action("probe")
                 .alias("p")
-                .option(&["aa", "a"], &[&[]])
-                .option(&["bb"], &[&[]])
-                .option(&["val"], &[&[Param::Value]])
+                .option(&["aa", "a"], nothing)
+                .option(&["bb"], nothing)
+                .option(&["val"], one_value)
+                .terminal(assemble)
                 .build(),
         );
         g
@@ -498,9 +512,9 @@ mod tests {
         let mut g = Grammar::core();
         let mut builder = action("probe");
         for name in OPTION_NAMES {
-            builder = builder.option(&[name], &[&[]]);
+            builder = builder.option(&[name], nothing);
         }
-        g.action(builder.build());
+        g.action(builder.terminal(assemble).build());
         let options: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS).copied().collect();
         let out = parse(&format!("/@dataset:x/@probe/{}.json", options.join(",")), &g).unwrap();
         assert_eq!(out.actions[0].segments.len(), MAX_OPTIONS);
@@ -586,9 +600,9 @@ mod tests {
         let mut g = Grammar::core();
         let mut builder = action("probe");
         for name in OPTION_NAMES {
-            builder = builder.option(&[name], &[&[]]);
+            builder = builder.option(&[name], nothing);
         }
-        g.action(builder.build());
+        g.action(builder.terminal(assemble).build());
         let many: Vec<&str> = OPTION_NAMES.iter().take(MAX_OPTIONS + 1).copied().collect();
         let url = format!("/@dataset:x/@probe/{}.json", many.join(","));
         assert_eq!(parse(&url, &g), Err(ParseError::TooManyOptions));
