@@ -13,6 +13,34 @@ pub mod routes;
 pub mod sql;
 pub mod url;
 
+#[derive(Debug)]
+pub struct Fault {
+    pub status: StatusCode,
+    pub message: String,
+}
+
+impl Fault {
+    pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self { status, message: message.into() }
+    }
+
+    pub fn bad_request(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self::new(StatusCode::BAD_REQUEST, message))
+    }
+
+    pub fn unprocessable(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(Self::new(StatusCode::UNPROCESSABLE_ENTITY, message))
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Fault {}
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
