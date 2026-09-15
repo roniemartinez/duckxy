@@ -71,25 +71,36 @@ mod tests {
     const NO_ID: &str = r#"{"type":"FeatureCollection","features":[
         {"type":"Feature","properties":{"name":"alpha"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
 
-    fn counted(ctx: &mut crate::grammar::StageCtx) -> sea_query::SimpleExpr {
-        sea_query::Expr::cust_with_exprs("CAST(COUNT($1) AS VARCHAR)", [ctx.geom()])
-    }
+    struct Probe;
 
-    fn one_row(
-        ctx: &mut crate::grammar::StageCtx,
-        parts: Vec<(&'static str, sea_query::SimpleExpr)>,
-    ) -> sea_query::SelectStatement {
-        let mut select = sea_query::Query::select();
-        for (name, expr) in parts {
-            select.expr_as(expr, sea_query::Alias::new(name));
+    impl crate::grammar::Action for Probe {
+        fn name(&self) -> &'static str {
+            "probe"
         }
-        select.from(ctx.data()).take()
+
+        fn options(&self) -> &'static [crate::grammar::Opt] {
+            const OPTIONS: &[crate::grammar::Opt] = &[crate::grammar::flag("n", "")];
+            OPTIONS
+        }
+
+        fn run(&self, ctx: &mut crate::grammar::StageCtx, _: &[crate::url::Segment]) -> anyhow::Result<()> {
+            let counted = sea_query::Expr::cust_with_exprs("COUNT($1) OVER ()", [ctx.geom()]);
+            let data = ctx.data();
+            ctx.step(
+                sea_query::Query::select()
+                    .expr(sea_query::Expr::cust("*"))
+                    .expr_as(counted, sea_query::Alias::new("n"))
+                    .from(data)
+                    .take(),
+            );
+            Ok(())
+        }
     }
 
     fn extended_state(tag: &str) -> AppState {
         let base = state(tag, false);
         let mut grammar = crate::grammar::Grammar::core();
-        grammar.action(crate::grammar::action("probe").option(&["n"], counted).terminal(one_row).build());
+        grammar.register_action(Probe);
         AppState::new(base.root.clone(), base.auth.clone(), grammar)
     }
 
