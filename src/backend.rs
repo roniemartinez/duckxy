@@ -70,10 +70,6 @@ pub trait Dialect: Send + Sync {
     }
 }
 
-fn one(name: &'static str) -> impl SqlFn {
-    move |mut args: Vec<SimpleExpr>| Func::cust(name).arg(args.remove(0)).into()
-}
-
 pub struct DuckDb;
 
 impl Dialect for DuckDb {
@@ -88,30 +84,6 @@ impl Dialect for DuckDb {
 
     fn as_geojson(&self, geometry: SimpleExpr) -> SimpleExpr {
         Func::cust("ST_AsGeoJSON").arg(geometry).into()
-    }
-
-    fn vocabulary(&self) -> Vocabulary {
-        let mut v = Vocabulary::default();
-        v.register("extent_agg", one("ST_Extent_Agg"));
-        v.register("x", one("ST_X"));
-        v.register("y", one("ST_Y"));
-        v.register("x_min", one("ST_XMin"));
-        v.register("y_min", one("ST_YMin"));
-        v.register("x_max", one("ST_XMax"));
-        v.register("y_max", one("ST_YMax"));
-        v.register("area_meters", |mut args: Vec<SimpleExpr>| {
-            Func::cust("SUM").arg(Func::cust("ST_Area_Spheroid").arg(args.remove(0))).into()
-        });
-        v.register("geojson_coordinates", |mut args: Vec<SimpleExpr>| {
-            Expr::cust_with_exprs(
-                "json_extract(CAST($1 AS JSON), '$.coordinates')",
-                [Func::cust("ST_AsGeoJSON").arg(args.remove(0)).into()],
-            )
-        });
-        v.register("array", |args: Vec<SimpleExpr>| Func::cust("json_array").args(args).into());
-        v.register("object", |args: Vec<SimpleExpr>| Func::cust("json_object").args(args).into());
-        v.register("as_text", |mut args: Vec<SimpleExpr>| Func::cast_as(args.remove(0), "VARCHAR").into());
-        v
     }
 }
 
@@ -168,10 +140,6 @@ mod tests {
         Expr::col(Alias::new("geom"))
     }
 
-    fn duckdb() -> Backend {
-        Backend::default()
-    }
-
     #[test]
     fn core_only_depends_on_two_dialect_methods() {
         let d = DuckDb;
@@ -193,63 +161,56 @@ mod tests {
         assert!(rendered(DuckDb.transform(geom(), from, to)).contains(expected));
     }
 
-    #[rstest]
-    #[case("extent_agg", "ST_Extent_Agg(\"geom\")")]
-    #[case("x", "ST_X(\"geom\")")]
-    #[case("y", "ST_Y(\"geom\")")]
-    #[case("x_min", "ST_XMin(\"geom\")")]
-    #[case("y_min", "ST_YMin(\"geom\")")]
-    #[case("x_max", "ST_XMax(\"geom\")")]
-    #[case("y_max", "ST_YMax(\"geom\")")]
-    #[case("area_meters", "SUM(ST_Area_Spheroid(\"geom\"))")]
-    #[case("as_text", "CAST(\"geom\" AS VARCHAR)")]
-    fn the_duckdb_vocabulary_spells_each_operation(#[case] op: &str, #[case] expected: &str) {
-        assert_eq!(rendered(duckdb().call(op, vec![geom()]).unwrap()), expected);
+    fn seeded() -> Backend {
+        Backend::default().extend(|v| {
+            v.register("bounds", |mut args: Vec<SimpleExpr>| Func::cust("ST_Extent_Agg").arg(args.remove(0)).into());
+        })
+    }
+
+    #[test]
+    fn a_dialect_seeds_no_vocabulary_of_its_own() {
+        assert!(Backend::default().operations().is_empty(), "core named an operation it never calls");
     }
 
     #[test]
     fn an_unknown_operation_names_itself() {
-        let err = duckdb().call("banana", vec![geom()]).unwrap_err();
+        let err = Backend::default().call("banana", vec![geom()]).unwrap_err();
         assert_eq!(err, UnknownOp("banana".to_string()));
         assert_eq!(err.to_string(), "this backend has no operation named \"banana\"");
     }
 
     #[test]
     fn a_vocabulary_reports_what_it_holds() {
-        let held = duckdb().operations();
-        assert!(held.contains(&"extent_agg"), "{held:?}");
-        assert!(!held.contains(&"banana"), "{held:?}");
-        assert!(duckdb().has("array"));
-        assert!(!duckdb().has("banana"));
+        let backend = seeded();
+        assert_eq!(backend.operations(), vec!["bounds"]);
+        assert!(backend.has("bounds"));
+        assert!(!backend.has("banana"));
     }
 
     #[test]
-    fn a_downstream_can_add_an_operation_core_never_named() {
-        let backend = Backend::default().extend(|v| {
-            v.register("downstream_op", |mut args: Vec<SimpleExpr>| {
+    fn an_operation_core_never_named_can_be_added() {
+        let backend = seeded().extend(|v| {
+            v.register("merged", |mut args: Vec<SimpleExpr>| {
                 Func::cust("ST_Whatever").arg(Func::cust("ST_Union_Agg").arg(args.remove(0))).into()
             });
         });
-        assert_eq!(
-            rendered(backend.call("downstream_op", vec![geom()]).unwrap()),
-            "ST_Whatever(ST_Union_Agg(\"geom\"))"
-        );
-        assert!(backend.has("extent_agg"), "extending must not drop the seeded vocabulary");
+        assert_eq!(rendered(backend.call("merged", vec![geom()]).unwrap()), "ST_Whatever(ST_Union_Agg(\"geom\"))");
+        assert!(backend.has("bounds"), "extending must not drop what was registered before it");
     }
 
     #[test]
-    fn a_downstream_can_replace_an_operation() {
-        let backend = Backend::default().extend(|v| {
-            v.replace("x", |mut args: Vec<SimpleExpr>| Func::cust("ST_XCoord").arg(args.remove(0)).into());
+    fn an_operation_can_be_replaced() {
+        let backend = seeded().extend(|v| {
+            v.replace("bounds", |mut args: Vec<SimpleExpr>| Func::cust("ST_Envelope_Agg").arg(args.remove(0)).into());
         });
-        assert_eq!(rendered(backend.call("x", vec![geom()]).unwrap()), "ST_XCoord(\"geom\")");
+        assert_eq!(rendered(backend.call("bounds", vec![geom()]).unwrap()), "ST_Envelope_Agg(\"geom\")");
     }
 
     #[test]
-    #[should_panic(expected = "operation \"x\" is already registered")]
+    #[should_panic(expected = "operation \"bounds\" is already registered")]
     fn registering_an_operation_twice_panics() {
-        Backend::default().extend(|v| {
-            v.register("x", |mut args: Vec<SimpleExpr>| args.remove(0));
+        seeded().extend(|v| {
+            v.register("bounds", |mut args: Vec<SimpleExpr>| args.remove(0));
         });
     }
 
