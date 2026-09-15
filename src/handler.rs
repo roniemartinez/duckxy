@@ -93,6 +93,9 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
 }
 
 fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
+    if let Some(fault) = e.downcast_ref::<crate::Fault>() {
+        return (fault.status, fault.message.clone());
+    }
     if let Some(unknown) = e.downcast_ref::<crate::backend::UnknownOp>() {
         return (StatusCode::NOT_IMPLEMENTED, unknown.to_string());
     }
@@ -178,6 +181,31 @@ mod tests {
 
     #[test]
     fn any_other_query_failure_stays_a_server_error() {
+        let (status, message) = error_status(&anyhow::anyhow!("disk on fire"), "UTF-8");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "query failed");
+    }
+
+    #[test]
+    fn a_fault_chooses_its_own_status() {
+        for wanted in [StatusCode::BAD_REQUEST, StatusCode::UNPROCESSABLE_ENTITY, StatusCode::NOT_IMPLEMENTED] {
+            let raw = anyhow::Error::new(crate::Fault::new(wanted, "the caller said so"));
+            let (status, message) = error_status(&raw, "UTF-8");
+            assert_eq!(status, wanted);
+            assert_eq!(message, "the caller said so");
+        }
+    }
+
+    #[test]
+    fn the_fault_helpers_name_the_two_common_statuses() {
+        let (status, message) = error_status(&crate::Fault::bad_request("nope"), "UTF-8");
+        assert_eq!((status, message.as_str()), (StatusCode::BAD_REQUEST, "nope"));
+        let (status, _) = error_status(&crate::Fault::unprocessable("nope"), "UTF-8");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn an_error_that_is_not_a_fault_still_falls_through() {
         let (status, message) = error_status(&anyhow::anyhow!("disk on fire"), "UTF-8");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "query failed");
