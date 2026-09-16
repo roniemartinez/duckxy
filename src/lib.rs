@@ -7,6 +7,7 @@ pub mod formats;
 pub mod grammar;
 pub mod handler;
 pub mod parexp;
+pub mod process;
 pub mod query;
 pub mod routes;
 pub mod sql;

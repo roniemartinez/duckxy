@@ -8,12 +8,15 @@ use sea_query::{
 };
 use std::sync::Arc;
 
+pub const WGS84: &str = "EPSG:4326";
+
 pub struct Pipeline {
     ctes: WithClause,
     input: Alias,
     input_name: String,
     steps: Vec<(String, usize)>,
     geometry: String,
+    crs: String,
     backend: Arc<Backend>,
     side: Vec<(String, String, String)>,
     taken: Vec<String>,
@@ -24,6 +27,7 @@ impl Pipeline {
         source: &str,
         encoding: &str,
         columns: &[(String, String)],
+        crs: Option<&str>,
         backend: Arc<Backend>,
     ) -> anyhow::Result<Self> {
         let geometry = query::geometry_of(columns).ok_or(query::NoGeometry)?.to_string();
@@ -47,6 +51,7 @@ impl Pipeline {
             taken: vec!["source".to_string()],
             steps: Vec::new(),
             geometry,
+            crs: crs.unwrap_or(WGS84).to_string(),
             backend,
             side: Vec::new(),
         })
@@ -60,21 +65,32 @@ impl Pipeline {
         Ok(())
     }
 
-    pub fn reproject(&mut self, crs: Option<&str>, output: &dyn Output) {
-        let Some(from) = crs.filter(|c| output.requires_wgs84() && !matches!(*c, "EPSG:4326" | "OGC:CRS84")) else {
+    pub fn output_crs(&mut self, output: &dyn Output) {
+        if !output.requires_wgs84() || self.is_wgs84() {
             return;
-        };
-        let reprojected = Query::select()
-            .expr(Expr::cust_with_exprs(
-                "* REPLACE ($1 AS $2)",
-                [
-                    self.dialect().transform(Expr::col(Alias::new(&self.geometry)), from, "EPSG:4326"),
-                    Expr::col(Alias::new(&self.geometry)),
-                ],
-            ))
-            .from(self.input.clone())
-            .take();
-        self.step("step", reprojected);
+        }
+        let transformed = self.transform(WGS84);
+        self.replace_geometry("step", transformed);
+        self.set_crs(WGS84.to_string());
+    }
+
+    fn is_wgs84(&self) -> bool {
+        matches!(self.crs.to_uppercase().as_str(), "EPSG:4326" | "OGC:CRS84" | "CRS84")
+    }
+
+    pub fn crs(&self) -> &str {
+        &self.crs
+    }
+
+    pub fn set_crs(&mut self, crs: String) {
+        self.crs = crs;
+    }
+
+    pub fn transform(&self, target: &str) -> SimpleExpr {
+        if self.crs.eq_ignore_ascii_case(target) {
+            return Expr::col(Alias::new(&self.geometry));
+        }
+        self.backend.dialect().transform(Expr::col(Alias::new(&self.geometry)), &self.crs, target)
     }
 
     fn reserved(&self, candidate: &str) -> bool {
@@ -169,9 +185,8 @@ pub fn plan(
     crs: Option<&str>,
     backend: Arc<Backend>,
 ) -> anyhow::Result<String> {
-    let mut pipeline = Pipeline::source(source, &parsed.encoding, columns, backend)?;
+    let mut pipeline = Pipeline::source(source, &parsed.encoding, columns, crs, backend)?;
     pipeline.filter(&parsed.filters, columns)?;
-    pipeline.reproject(crs, parsed.output.as_ref());
 
     for action in &parsed.actions {
         let Some(def) = grammar.action_for(&action.name) else {
@@ -193,6 +208,7 @@ pub fn plan(
         let mut ctx = StageCtx::new(&mut pipeline, def.canonical());
         def.run(&mut ctx, &action.segments)?;
     }
+    pipeline.output_crs(parsed.output.as_ref());
 
     let select = {
         let mut ctx = StageCtx::new(&mut pipeline, "out");
@@ -204,6 +220,10 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered_expr(expr: SimpleExpr) -> String {
+        Query::select().expr(expr).to_owned().to_string(PostgresQueryBuilder).trim_start_matches("SELECT ").to_string()
+    }
 
     fn rendered(pipeline: Pipeline) -> String {
         let input = pipeline.input();
@@ -359,7 +379,7 @@ mod tests {
     #[test]
     fn a_step_counter_is_kept_per_prefix() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.step("step", Query::select().expr(Expr::cust("1")).from(p.input()).take());
         p.step("alpha", Query::select().expr(Expr::cust("2")).from(p.input()).take());
         p.step("step", Query::select().expr(Expr::cust("3")).from(p.input()).take());
@@ -372,7 +392,7 @@ mod tests {
     #[test]
     fn a_side_table_and_a_step_never_claim_the_same_name() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.cte_once("test", "1", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.step("test", Query::select().expr(Expr::cust("2")).from(p.input()).take());
         let out = rendered(p);
@@ -386,7 +406,7 @@ mod tests {
     #[test]
     fn a_step_and_a_side_table_never_claim_the_same_name() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.step("test", Query::select().expr(Expr::cust("1")).from(p.input()).take());
         p.cte_once("test", "1", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
         let out = rendered(p);
@@ -466,13 +486,13 @@ mod tests {
     }
 
     #[test]
-    fn an_action_still_reprojects_a_source_that_is_not_wgs84() {
+    fn an_action_runs_in_the_source_crs_and_the_output_converts_after() {
         let grammar = test_action_grammar();
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse("/@dataset:x/@test/count.json", &grammar).unwrap();
         let out = plan(&grammar, &parsed, "/x.geojson", &columns, Some("EPSG:25832"), backend()).unwrap();
-        assert!(out.contains("ST_Transform"), "an action skipped reprojection: {out}");
-        assert!(out.find("ST_Transform") < out.find("COUNT(*)"), "reprojection must precede the action: {out}");
+        assert!(out.contains("ST_Transform"), "the output skipped reprojection: {out}");
+        assert!(out.find("COUNT(*)") < out.find("ST_Transform"), "the action must see the source crs: {out}");
     }
 
     #[test]
@@ -496,7 +516,7 @@ mod tests {
     #[test]
     fn a_step_names_itself_and_becomes_the_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.step("step", Query::select().expr(Expr::cust("1")).from(p.input()).take());
         p.step("step", Query::select().expr(Expr::cust("2")).from(p.input()).take());
         let out = rendered(p);
@@ -508,7 +528,7 @@ mod tests {
     #[test]
     fn a_side_table_is_namespaced_shared_and_does_not_advance_the_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         assert!(p.cte("test", "extent").is_none());
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.cte_once("test", "extent", |_| panic!("a repeated side table must not be rebuilt"));
@@ -521,7 +541,7 @@ mod tests {
     #[test]
     fn a_side_table_lookup_names_the_alias_built_over_the_current_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.filter(&id_filter(), &columns).unwrap();
         assert!(p.cte("test", "extent").is_none(), "a side table from an earlier stage must not be reported as live");
@@ -537,7 +557,7 @@ mod tests {
     #[case(&["a_1", "a", "a"])]
     fn a_side_table_never_reuses_an_alias_another_one_took(#[case] names: &[&str]) {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         for (at, name) in names.iter().enumerate() {
             if at > 0 {
                 p.filter(&id_filter(), &columns).unwrap();
@@ -562,7 +582,7 @@ mod tests {
     #[test]
     fn a_side_table_is_not_shared_across_stages() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         p.filter(&id_filter(), &columns).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
@@ -577,7 +597,7 @@ mod tests {
     #[test]
     fn a_side_table_reads_from_the_current_input() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.filter(&id_filter(), &columns).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         let out = rendered(p);
@@ -587,7 +607,7 @@ mod tests {
     #[test]
     fn the_source_relation_carries_the_reader_and_its_encoding() {
         let columns = geom_columns();
-        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.step("step", Query::select().expr(Expr::cust("1")).from(p.input()).take());
         assert_eq!(
             rendered(p),
@@ -615,6 +635,32 @@ mod tests {
         );
         assert!(out.contains("to_json(\"out_1\")"), "the feature select read the wrong cte: {out}");
         assert!(out.trim_end().ends_with("FROM \"out_1\""), "the feature select read the wrong cte: {out}");
+    }
+
+    #[test]
+    fn a_transform_to_the_crs_already_held_is_a_bare_column() {
+        let columns = geom_columns();
+        let p = Pipeline::source("/x.geojson", "UTF-8", &columns, Some("EPSG:25832"), backend()).unwrap();
+        assert_eq!(p.crs(), "EPSG:25832");
+        assert!(rendered_expr(p.transform("EPSG:4326")).contains("ST_Transform"), "a real reprojection must wrap");
+        assert_eq!(rendered_expr(p.transform("epsg:25832")), "\"geom\"", "a same-crs transform must not wrap");
+    }
+
+    #[test]
+    fn an_unknown_source_crs_is_treated_as_wgs84() {
+        let columns = geom_columns();
+        let p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
+        assert_eq!(p.crs(), WGS84);
+    }
+
+    #[test]
+    fn reprojecting_records_the_crs_it_moved_to() {
+        let columns = geom_columns();
+        let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, Some("EPSG:25832"), backend()).unwrap();
+        p.output_crs(&crate::formats::GeoJson);
+        assert_eq!(p.crs(), WGS84, "the pipeline did not record the reprojection");
+        p.output_crs(&crate::formats::GeoJson);
+        assert_eq!(rendered(p).matches("ST_Transform").count(), 1, "the second call reprojected again");
     }
 
     #[test]

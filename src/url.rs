@@ -30,6 +30,12 @@ pub struct ParsedUrl {
     pub extension: &'static str,
 }
 
+impl ParsedUrl {
+    pub fn has_action(&self, action: &dyn crate::grammar::Action) -> bool {
+        self.actions.iter().any(|seen| seen.name == action.name())
+    }
+}
+
 impl PartialEq for ParsedUrl {
     fn eq(&self, other: &Self) -> bool {
         self.dataset == other.dataset
@@ -513,6 +519,18 @@ mod tests {
     #[case("/@dataset:pts/@test/aa/@t/bb.json")]
     fn an_action_may_not_repeat(#[case] url: &str) {
         assert_eq!(parse(url, &test_grammar()), Err(ParseError::RepeatedAction("test".to_string())));
+    }
+
+    #[test]
+    fn a_parsed_url_reports_which_actions_it_carries() {
+        let out = parse("/@dataset:pts/@test/aa.json", &test_grammar()).unwrap();
+        assert!(out.has_action(&Probe("test", "t", TEST_OPTIONS)), "the action it parsed must be reported");
+        assert!(
+            !out.has_action(&Probe("second", "", TEST_OPTIONS)),
+            "an action the url never named must not be reported"
+        );
+        let bare = parse("/@dataset:pts.json", &test_grammar()).unwrap();
+        assert!(!bare.has_action(&Probe("test", "t", TEST_OPTIONS)), "a url with no action reported one");
     }
 
     #[test]
