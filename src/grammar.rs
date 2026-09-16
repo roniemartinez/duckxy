@@ -127,6 +127,18 @@ impl<'a> StageCtx<'a> {
         self.pipeline.geometry()
     }
 
+    pub fn crs(&self) -> &str {
+        self.pipeline.crs()
+    }
+
+    pub fn set_crs(&mut self, crs: String) {
+        self.pipeline.set_crs(crs);
+    }
+
+    pub fn transform(&self, target: &str) -> SimpleExpr {
+        self.pipeline.transform(target)
+    }
+
     pub fn step(&mut self, select: SelectStatement) {
         self.pipeline.step(self.action, select);
     }
@@ -294,6 +306,7 @@ impl Grammar {
     pub fn core() -> Grammar {
         let mut g = Grammar::default();
         g.register_output(crate::formats::GeoJson);
+        g.register_action(crate::process::Process);
         g.filter("id", "", &[&[Param::Value], &[Param::Operator, Param::Value]]);
         g.filter("prop", "", &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]]);
         g.filter("type", "", &[&[Param::GeometryType]]);
@@ -623,7 +636,7 @@ mod tests {
     #[test]
     fn a_stage_reads_the_relation_it_was_given() {
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
-        let mut pipeline = Pipeline::source("/x.geojson", "UTF-8", &columns, backend()).unwrap();
+        let mut pipeline = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         let mut ctx = StageCtx::new(&mut pipeline, "test");
         assert_eq!(ctx.geometry(), "geom");
         assert!(ctx.cte("extent").is_none());
