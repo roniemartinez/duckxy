@@ -216,13 +216,13 @@ impl Declared for Opt {
     }
 }
 
-impl Declared for SegmentDef {
+impl Declared for crate::filters::FilterDef {
     fn canonical(&self) -> &'static str {
         self.name
     }
 
     fn accepts(&self, params: usize) -> bool {
-        self.shapes.iter().any(|shape| shape.len() == params)
+        crate::filters::FilterDef::accepts(self, params)
     }
 }
 
@@ -245,18 +245,6 @@ pub trait Action: Send + Sync {
 
     fn option(&self, name: &str) -> Option<&'static Opt> {
         self.options().iter().find(|option| option.matches(name))
-    }
-}
-
-pub struct SegmentDef {
-    pub name: &'static str,
-    pub short: &'static str,
-    pub shapes: Vec<Vec<Param>>,
-}
-
-impl SegmentDef {
-    pub fn matches(&self, name: &str) -> bool {
-        self.name == name || (!self.short.is_empty() && self.short == name)
     }
 }
 
@@ -295,7 +283,7 @@ fn assert_scannable(name: &str) {
 
 #[derive(Default)]
 pub struct Grammar {
-    pub filters: Vec<SegmentDef>,
+    pub filters: Vec<crate::filters::FilterDef>,
     pub actions: Vec<Box<dyn Action>>,
     pub outputs: Vec<std::sync::Arc<dyn crate::formats::Output>>,
 }
@@ -305,23 +293,29 @@ impl Grammar {
 
     pub fn core() -> Grammar {
         let mut g = Grammar::default();
-        g.register_output(crate::formats::GeoJson);
+        g.register_filters(crate::filters::CORE);
         g.register_action(crate::process::Process);
-        g.filter("id", "", &[&[Param::Value], &[Param::Operator, Param::Value]]);
-        g.filter("prop", "", &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]]);
-        g.filter("type", "", &[&[Param::GeometryType]]);
-        g.filter("valid", "", &[&[Param::Boolean]]);
-        g.filter("empty", "", &[&[Param::Boolean]]);
-        g.filter("simple", "", &[&[Param::Boolean]]);
-        g.filter("closed", "", &[&[Param::Boolean]]);
+        g.register_output(crate::formats::GeoJson);
         g
     }
 
-    pub fn filter(&mut self, name: &'static str, short: &'static str, shapes: &[&[Param]]) -> &mut Self {
-        assert!(!shapes.is_empty(), "a filter needs at least one shape");
-        assert!(!shapes.iter().any(|shape| shape.is_empty()), "a filter shape needs at least one parameter");
-        assert_pair(name, short);
-        for candidate in [name, short] {
+    pub fn register_filters(&mut self, filters: &[crate::filters::FilterDef]) -> &mut Self {
+        for declared in filters {
+            self.register_filter(*declared);
+        }
+        self
+    }
+
+    pub fn register_filter(&mut self, filter: crate::filters::FilterDef) -> &mut Self {
+        assert!(!filter.shapes.is_empty(), "a filter needs at least one shape");
+        assert!(!filter.shapes.iter().any(|shape| shape.is_empty()), "a filter shape needs at least one parameter");
+        assert_pair(filter.name, filter.short);
+        let mut arities: Vec<usize> = filter.shapes.iter().map(|shape| shape.len()).collect();
+        let total = arities.len();
+        arities.sort_unstable();
+        arities.dedup();
+        assert_eq!(arities.len(), total, "filter {:?} registered two shapes of the same arity", filter.name);
+        for candidate in [filter.name, filter.short] {
             if candidate.is_empty() {
                 continue;
             }
@@ -332,7 +326,7 @@ impl Grammar {
                 panic!("filter {candidate:?} is already registered");
             }
         }
-        self.filters.push(SegmentDef { name, short, shapes: shapes.iter().map(|s| s.to_vec()).collect() });
+        self.filters.push(filter);
         self
     }
 
@@ -372,7 +366,7 @@ impl Grammar {
         self
     }
 
-    pub fn filter_for(&self, name: &str) -> Option<&SegmentDef> {
+    pub fn filter_for(&self, name: &str) -> Option<&crate::filters::FilterDef> {
         self.filters.iter().find(|filter| filter.matches(name))
     }
 
@@ -469,12 +463,24 @@ mod tests {
     #[test]
     fn the_core_grammar_registers_the_built_in_filters() {
         let g = Grammar::core();
-        let names: Vec<&str> = g.filters.iter().map(SegmentDef::canonical).collect();
+        let names: Vec<&str> = g.filters.iter().map(|f| f.name).collect();
         assert_eq!(names, vec!["id", "prop", "type", "valid", "empty", "simple", "closed"]);
     }
 
-    fn kinds(def: &SegmentDef) -> Vec<Vec<Param>> {
-        def.shapes.clone()
+    fn named(
+        name: &'static str,
+        short: &'static str,
+        shapes: &'static [&'static [Param]],
+    ) -> crate::filters::FilterDef {
+        crate::filters::filter(name, short, shapes, |_, _| Ok(sea_query::Expr::cust("1")))
+    }
+
+    const ONE_VALUE: &[&[Param]] = &[&[Param::Value]];
+    const COLUMN_VALUE: &[&[Param]] = &[&[Param::Column, Param::Value]];
+    const NO_PARAMS: &[&[Param]] = &[&[]];
+
+    fn kinds(def: &crate::filters::FilterDef) -> Vec<Vec<Param>> {
+        def.shapes.iter().map(|shape| shape.to_vec()).collect()
     }
 
     fn shapes(option: &Opt) -> Vec<Vec<Param>> {
@@ -530,7 +536,7 @@ mod tests {
     #[test]
     fn a_short_name_resolves_to_the_canonical_one() {
         let mut g = Grammar::default();
-        g.filter("property", "prop", &[&[Param::Column, Param::Value]]);
+        g.register_filter(named("property", "prop", COLUMN_VALUE));
         for name in ["property", "prop"] {
             assert_eq!(g.filter_for(name).unwrap().canonical(), "property");
         }
@@ -542,22 +548,22 @@ mod tests {
     #[should_panic(expected = "filter \"id\" is already registered")]
     fn registering_a_filter_name_twice_panics() {
         let mut g = Grammar::default();
-        g.filter("id", "", &[&[Param::Value]]);
-        g.filter("id", "", &[&[Param::Value]]);
+        g.register_filter(named("id", "", ONE_VALUE));
+        g.register_filter(named("id", "", ONE_VALUE));
     }
 
     #[test]
     #[should_panic(expected = "filter \"p\" is already registered")]
     fn registering_an_alias_that_another_filter_owns_panics() {
         let mut g = Grammar::default();
-        g.filter("prop", "p", &[&[Param::Column, Param::Value]]);
-        g.filter("point", "p", &[&[Param::Value]]);
+        g.register_filter(named("prop", "p", COLUMN_VALUE));
+        g.register_filter(named("point", "p", ONE_VALUE));
     }
 
     #[test]
     #[should_panic(expected = "short name \"p\" repeats the canonical name")]
     fn a_filter_short_name_repeating_its_canonical_one_panics() {
-        Grammar::default().filter("p", "p", &[&[Param::Value]]);
+        Grammar::default().register_filter(named("p", "p", ONE_VALUE));
     }
 
     #[rstest]
@@ -565,7 +571,7 @@ mod tests {
     #[case("encoding")]
     #[should_panic(expected = "is reserved for the source encoding")]
     fn registering_a_reserved_name_panics(#[case] name: &'static str) {
-        Grammar::default().filter(name, "", &[&[Param::Value]]);
+        Grammar::default().register_filter(named(name, "", ONE_VALUE));
     }
 
     #[rstest]
@@ -575,13 +581,20 @@ mod tests {
     #[case("a/b")]
     #[should_panic(expected = "can never be parsed from a url")]
     fn registering_a_name_the_scanner_cannot_produce_panics(#[case] name: &'static str) {
-        Grammar::default().filter(name, "", &[&[Param::Value]]);
+        Grammar::default().register_filter(named(name, "", ONE_VALUE));
+    }
+
+    #[test]
+    #[should_panic(expected = "registered two shapes of the same arity")]
+    fn registering_a_filter_with_two_shapes_of_one_arity_panics() {
+        const SAME_ARITY: &[&[Param]] = &[&[Param::Value], &[Param::Column]];
+        Grammar::default().register_filter(named("dup", "", SAME_ARITY));
     }
 
     #[test]
     #[should_panic(expected = "a filter shape needs at least one parameter")]
     fn registering_a_shape_with_no_parameters_panics() {
-        Grammar::default().filter("flag", "", &[&[]]);
+        Grammar::default().register_filter(named("flag", "", NO_PARAMS));
     }
 
     #[test]
@@ -731,6 +744,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "can never be parsed from a url")]
     fn registering_a_filter_with_no_name_panics() {
-        Grammar::default().filter("", "", &[&[Param::Value]]);
+        Grammar::default().register_filter(named("", "", ONE_VALUE));
     }
 }
