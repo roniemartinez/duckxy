@@ -283,11 +283,7 @@ fn read_params(scan: &mut Scan<'_>) -> Vec<String> {
     params
 }
 
-fn finish_segment<D: crate::grammar::Declared + ?Sized>(
-    key: &str,
-    params: Vec<String>,
-    def: &D,
-) -> Result<Segment, ParseError> {
+fn finish_segment(key: &str, params: Vec<String>, def: &dyn crate::grammar::Declared) -> Result<Segment, ParseError> {
     if params.iter().any(String::is_empty) || (params.is_empty() && !def.accepts(0)) {
         return Err(ParseError::EmptyOptionValue(key.to_string()));
     }

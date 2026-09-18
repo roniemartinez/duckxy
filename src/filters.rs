@@ -37,12 +37,6 @@ pub enum FilterError {
     UnknownGeometryType(String),
 }
 
-enum NumericKind {
-    Integer,
-    Exact,
-    Approximate,
-}
-
 impl fmt::Display for FilterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -149,12 +143,8 @@ impl FilterDef {
         self.name == name || (!self.short.is_empty() && self.short == name)
     }
 
-    pub fn canonical(&self) -> &'static str {
-        self.name
-    }
-
-    pub fn accepts(&self, params: usize) -> bool {
-        self.shapes.iter().any(|shape| shape.len() == params)
+    pub fn shape_for(&self, params: usize) -> Option<&'static [Param]> {
+        self.shapes.iter().copied().find(|shape| shape.len() == params)
     }
 }
 
@@ -168,6 +158,14 @@ pub fn condition(
         let Some(declared) = grammar.filter_for(&held.name) else {
             return Err(anyhow::Error::new(FilterError::UnknownFilter(held.name.clone())));
         };
+        let Some(shape) = declared.shape_for(held.params.len()) else {
+            return Err(anyhow::Error::new(FilterError::BadParams(held.name.clone())));
+        };
+        for (at, (kind, raw)) in shape.iter().zip(&held.params).enumerate() {
+            if !kind.accepts(raw) {
+                return Err(anyhow::Error::new(crate::grammar::ParamError { at, expected: *kind, got: raw.clone() }));
+            }
+        }
         let next = (declared.condition)(ctx, &held.params)?;
         combined = Some(match combined {
             Some(existing) => existing.and(next),
@@ -224,18 +222,29 @@ fn only<'a>(name: &str, params: &'a [String]) -> Result<&'a str, FilterError> {
     }
 }
 
-fn numeric_kind(kind: &str) -> Option<NumericKind> {
+fn is_numeric(kind: &str) -> bool {
     let (name, width) = kind.split_once('(').unwrap_or((kind, ""));
     if !width.is_empty() && !width.ends_with(')') {
-        return None;
+        return false;
     }
-    match name {
-        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT" | "UINTEGER"
-        | "UBIGINT" | "UHUGEINT" => Some(NumericKind::Integer),
-        "DECIMAL" | "NUMERIC" => Some(NumericKind::Exact),
-        "FLOAT" | "DOUBLE" | "REAL" => Some(NumericKind::Approximate),
-        _ => None,
-    }
+    matches!(
+        name,
+        "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "BIGINT"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "UHUGEINT"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "FLOAT"
+            | "DOUBLE"
+            | "REAL"
+    )
 }
 
 fn text(value: SimpleExpr) -> SimpleExpr {
@@ -249,11 +258,8 @@ fn boolean(value: &str) -> Result<bool, FilterError> {
 }
 
 fn named_type(value: &str) -> Result<&'static str, FilterError> {
-    let wanted = value.to_ascii_uppercase();
-    GEOMETRY_TYPES
-        .iter()
-        .find(|known| **known == wanted)
-        .copied()
+    crate::grammar::GeometryType::from_param(value)
+        .map(|parsed| parsed.0)
         .ok_or_else(|| FilterError::UnknownGeometryType(value.to_string()))
 }
 
@@ -298,7 +304,7 @@ fn compare((name, kind): &(String, String), params: &[String], filter: &str) -> 
 }
 
 fn value_set(column: impl Fn() -> SimpleExpr, kind: &str, pattern: &str) -> Result<SimpleExpr, FilterError> {
-    let numeric = numeric_kind(kind).is_some();
+    let numeric = is_numeric(kind);
     if numeric && let Some((lo, hi)) = parexp::as_integer_range(pattern) {
         return Ok(column().between(lo, hi));
     }
@@ -337,9 +343,9 @@ fn ordering(
     operator: &str,
     value: &str,
 ) -> Result<SimpleExpr, FilterError> {
-    let (left, right) = match numeric_kind(kind) {
-        None => (text(column()), Expr::val(value)),
-        Some(_) => {
+    let (left, right) = match is_numeric(kind) {
+        false => (text(column()), Expr::val(value)),
+        true => {
             let exact = numeral(value).ok_or_else(|| FilterError::NotANumber(value.to_string()))?;
             (column(), Expr::cust(exact.to_string()))
         }
@@ -370,7 +376,8 @@ mod tests {
         let columns = columns();
         for def in &crate::grammar::Grammar::core().filters {
             for shape in def.shapes {
-                let segment = Segment { name: def.name.to_string(), params: vec!["name".to_string(); shape.len()] };
+                let params = shape.iter().map(|kind| sample(*kind).to_string()).collect();
+                let segment = Segment { name: def.name.to_string(), params };
                 let outcome = held(&[segment], &columns);
                 assert!(
                     !matches!(outcome, Err(FilterError::UnknownFilter(_))),
@@ -401,6 +408,16 @@ mod tests {
         let mut ctx = FilterCtx::new(&mut pipeline, cols);
         crate::filters::condition(&crate::grammar::Grammar::core(), &mut ctx, filters)
             .map_err(|e| e.downcast::<FilterError>().expect("a core filter reports a FilterError"))
+    }
+
+    fn sample(kind: Param) -> &'static str {
+        match kind {
+            Param::Column | Param::Value => "name",
+            Param::Operator => "eq",
+            Param::Token => "3857",
+            Param::Boolean => "true",
+            Param::GeometryType => "POINT",
+        }
     }
 
     fn seg(params: &[&str]) -> Segment {
@@ -584,19 +601,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case("valid", "yes", FilterError::NotABoolean("yes".to_string()))]
-    #[case("empty", "", FilterError::NotABoolean(String::new()))]
-    #[case("simple", "2", FilterError::NotABoolean("2".to_string()))]
-    #[case("closed", "maybe", FilterError::NotABoolean("maybe".to_string()))]
-    #[case("type", "Banana", FilterError::UnknownGeometryType("Banana".to_string()))]
-    #[case("type", "ST_Point", FilterError::UnknownGeometryType("ST_Point".to_string()))]
-    fn a_geometry_predicate_refuses_a_value_it_cannot_read(
+    #[case("valid", "yes", Param::Boolean)]
+    #[case("empty", "", Param::Boolean)]
+    #[case("simple", "2", Param::Boolean)]
+    #[case("closed", "maybe", Param::Boolean)]
+    #[case("type", "Banana", Param::GeometryType)]
+    #[case("type", "ST_Point", Param::GeometryType)]
+    fn a_geometry_predicate_refuses_a_value_of_the_wrong_kind(
         #[case] name: &str,
         #[case] value: &str,
-        #[case] expected: FilterError,
+        #[case] expected: Param,
     ) {
         let seg = Segment { name: name.to_string(), params: vec![value.to_string()] };
-        assert_eq!(held(&[seg], &columns()).unwrap_err(), expected);
+        let cols = columns();
+        let mut pipeline = pipeline_for(&cols);
+        let mut ctx = FilterCtx::new(&mut pipeline, &cols);
+        let err = crate::filters::condition(&crate::grammar::Grammar::core(), &mut ctx, &[seg]).unwrap_err();
+        let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the declared kind is enforced");
+        assert_eq!(typed.expected, expected);
+        assert_eq!(typed.got, value);
     }
 
     #[rstest]

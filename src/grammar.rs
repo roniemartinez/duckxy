@@ -222,7 +222,7 @@ impl Declared for crate::filters::FilterDef {
     }
 
     fn accepts(&self, params: usize) -> bool {
-        crate::filters::FilterDef::accepts(self, params)
+        self.shape_for(params).is_some()
     }
 }
 
@@ -259,12 +259,16 @@ fn assert_declaration(action: &dyn Action) {
                 panic!("option {:?} is already registered on this action as {:?}", declared.name, earlier.name);
             }
         }
-        let mut arities: Vec<usize> = declared.shapes.iter().map(|shape| shape.len()).collect();
-        let total = arities.len();
-        arities.sort_unstable();
-        arities.dedup();
-        assert_eq!(arities.len(), total, "option {:?} registered two shapes of the same arity", declared.name);
+        assert_unique_arities("option", declared.name, declared.shapes);
     }
+}
+
+fn assert_unique_arities(kind: &str, name: &str, shapes: &[&'static [Param]]) {
+    let mut arities: Vec<usize> = shapes.iter().map(|shape| shape.len()).collect();
+    let total = arities.len();
+    arities.sort_unstable();
+    arities.dedup();
+    assert_eq!(arities.len(), total, "{kind} {name:?} registered two shapes of the same arity");
 }
 
 fn assert_pair(name: &str, short: &str) {
@@ -310,11 +314,7 @@ impl Grammar {
         assert!(!filter.shapes.is_empty(), "a filter needs at least one shape");
         assert!(!filter.shapes.iter().any(|shape| shape.is_empty()), "a filter shape needs at least one parameter");
         assert_pair(filter.name, filter.short);
-        let mut arities: Vec<usize> = filter.shapes.iter().map(|shape| shape.len()).collect();
-        let total = arities.len();
-        arities.sort_unstable();
-        arities.dedup();
-        assert_eq!(arities.len(), total, "filter {:?} registered two shapes of the same arity", filter.name);
+        assert_unique_arities("filter", filter.name, filter.shapes);
         for candidate in [filter.name, filter.short] {
             if candidate.is_empty() {
                 continue;
