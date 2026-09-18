@@ -1,13 +1,27 @@
-use crate::grammar::FromParam;
+use crate::grammar::{FromParam, Param};
 use crate::parexp;
 use crate::url::Segment;
-use sea_query::{Alias, Expr, ExprTrait, Func, LikeExpr, Query, SimpleExpr};
+use sea_query::{Alias, Expr, ExprTrait, Func, LikeExpr, Query, SelectStatement, SimpleExpr};
 use std::fmt;
 
 const ID_CANDIDATES: [&str; 4] = ["id", "fid", "gid", "objectid"];
 pub const GEOMETRY_TYPES: [&str; 7] =
     ["POINT", "LINESTRING", "POLYGON", "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION"];
 const LINEAR_TYPES: [&str; 2] = ["LINESTRING", "MULTILINESTRING"];
+const BOOLEAN: &[&[Param]] = &[&[Param::Boolean]];
+const ID_SHAPE: &[&[Param]] = &[&[Param::Value], &[Param::Operator, Param::Value]];
+const PROP_SHAPE: &[&[Param]] = &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]];
+const TYPE_SHAPE: &[&[Param]] = &[&[Param::GeometryType]];
+
+pub const CORE: &[FilterDef] = &[
+    filter("id", "", ID_SHAPE, id),
+    filter("prop", "", PROP_SHAPE, prop),
+    filter("type", "", TYPE_SHAPE, geometry_type),
+    filter("valid", "", BOOLEAN, valid),
+    filter("empty", "", BOOLEAN, empty),
+    filter("simple", "", BOOLEAN, simple),
+    filter("closed", "", BOOLEAN, closed),
+];
 
 #[derive(Debug, PartialEq)]
 pub enum FilterError {
@@ -21,12 +35,6 @@ pub enum FilterError {
     NotOneValue(String),
     NotABoolean(String),
     UnknownGeometryType(String),
-}
-
-enum NumericKind {
-    Integer,
-    Exact,
-    Approximate,
 }
 
 impl fmt::Display for FilterError {
@@ -56,18 +64,109 @@ impl fmt::Display for FilterError {
 
 impl std::error::Error for FilterError {}
 
+pub struct FilterCtx<'a> {
+    pipeline: &'a mut crate::sql::Pipeline,
+    columns: &'a [(String, String)],
+}
+
+impl<'a> FilterCtx<'a> {
+    pub fn new(pipeline: &'a mut crate::sql::Pipeline, columns: &'a [(String, String)]) -> Self {
+        Self { pipeline, columns }
+    }
+
+    pub fn geometry(&self) -> &str {
+        self.pipeline.geometry()
+    }
+
+    pub fn geom(&self) -> SimpleExpr {
+        Expr::col(Alias::new(self.pipeline.geometry()))
+    }
+
+    pub fn columns(&self) -> &[(String, String)] {
+        self.columns
+    }
+
+    pub fn column(&self, name: &str) -> Option<&(String, String)> {
+        self.columns.iter().find(|(held, _)| held == name)
+    }
+
+    pub fn crs(&self) -> &str {
+        self.pipeline.crs()
+    }
+
+    pub fn transform(&self, target: &str) -> SimpleExpr {
+        self.pipeline.transform(target)
+    }
+
+    pub fn dialect(&self) -> &dyn crate::backend::Dialect {
+        self.pipeline.dialect()
+    }
+
+    pub fn call(&self, name: &str, args: Vec<SimpleExpr>) -> Result<SimpleExpr, crate::backend::UnknownOp> {
+        self.pipeline.backend().call(name, args)
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        self.pipeline.backend().has(name)
+    }
+
+    pub fn cte_once(&mut self, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
+        self.pipeline.cte_once("filter", name, build)
+    }
+
+    pub fn cte(&self, name: &str) -> Option<Alias> {
+        self.pipeline.cte("filter", name)
+    }
+}
+
+pub type FilterFn = fn(&mut FilterCtx, &[String]) -> anyhow::Result<SimpleExpr>;
+
+#[derive(Clone, Copy)]
+pub struct FilterDef {
+    pub name: &'static str,
+    pub short: &'static str,
+    pub shapes: &'static [&'static [Param]],
+    pub condition: FilterFn,
+}
+
+pub const fn filter(
+    name: &'static str,
+    short: &'static str,
+    shapes: &'static [&'static [Param]],
+    condition: FilterFn,
+) -> FilterDef {
+    FilterDef { name, short, shapes, condition }
+}
+
+impl FilterDef {
+    pub fn matches(&self, name: &str) -> bool {
+        self.name == name || (!self.short.is_empty() && self.short == name)
+    }
+
+    pub fn shape_for(&self, params: usize) -> Option<&'static [Param]> {
+        self.shapes.iter().copied().find(|shape| shape.len() == params)
+    }
+}
+
 pub fn condition(
+    grammar: &crate::grammar::Grammar,
+    ctx: &mut FilterCtx,
     filters: &[Segment],
-    columns: &[(String, String)],
-    geometry: &str,
-) -> Result<Option<SimpleExpr>, FilterError> {
+) -> anyhow::Result<Option<SimpleExpr>> {
     let mut combined: Option<SimpleExpr> = None;
-    for filter in filters {
-        let next = match filter.name.as_str() {
-            "id" => id_condition(&filter.params, columns)?,
-            "prop" => prop_condition(&filter.params, columns)?,
-            other => geometry_condition(other, &filter.params, geometry)?,
+    for held in filters {
+        let Some(declared) = grammar.filter_for(&held.name) else {
+            return Err(anyhow::Error::new(FilterError::UnknownFilter(held.name.clone())));
         };
+        let Some(shape) = declared.shape_for(held.params.len()) else {
+            return Err(anyhow::Error::new(FilterError::BadParams(held.name.clone())));
+        };
+        for (at, (kind, raw)) in shape.iter().zip(&held.params).enumerate() {
+            if !kind.accepts(raw) {
+                return Err(anyhow::Error::new(crate::grammar::ParamError { at, expected: *kind, got: raw.clone() }));
+            }
+        }
+        let next = (declared.condition)(ctx, &held.params)?;
         combined = Some(match combined {
             Some(existing) => existing.and(next),
             None => next,
@@ -76,18 +175,76 @@ pub fn condition(
     Ok(combined)
 }
 
-fn numeric_kind(kind: &str) -> Option<NumericKind> {
+fn id(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    let column = ID_CANDIDATES
+        .iter()
+        .find_map(|want| ctx.columns().iter().find(|(name, _)| name.eq_ignore_ascii_case(want)))
+        .ok_or(FilterError::NoIdColumn)?;
+    Ok(compare(column, params, "id")?)
+}
+
+fn prop(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    let [key, rest @ ..] = params else { return Err(FilterError::BadParams("prop".to_string()).into()) };
+    let column = ctx.column(key).ok_or_else(|| FilterError::UnknownColumn(key.clone()))?;
+    Ok(compare(column, rest, "prop")?)
+}
+
+fn geometry_type(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    Ok(shape_of(ctx.geometry()).eq(named_type(only("type", params)?)?))
+}
+
+fn valid(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    Ok(predicate("ST_IsValid", ctx).eq(boolean(only("valid", params)?)?))
+}
+
+fn empty(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    Ok(predicate("ST_IsEmpty", ctx).eq(boolean(only("empty", params)?)?))
+}
+
+fn simple(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    Ok(predicate("ST_IsSimple", ctx).eq(boolean(only("simple", params)?)?))
+}
+
+fn closed(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    let linear: SimpleExpr =
+        Expr::case(shape_of(ctx.geometry()).is_in(LINEAR_TYPES), predicate("ST_IsClosed", ctx)).into();
+    Ok(linear.eq(boolean(only("closed", params)?)?))
+}
+
+fn predicate(function: &'static str, ctx: &FilterCtx) -> SimpleExpr {
+    Func::cust(function).arg(ctx.geom()).into()
+}
+
+fn only<'a>(name: &str, params: &'a [String]) -> Result<&'a str, FilterError> {
+    match params {
+        [single] => Ok(single.as_str()),
+        _ => Err(FilterError::BadParams(name.to_string())),
+    }
+}
+
+fn is_numeric(kind: &str) -> bool {
     let (name, width) = kind.split_once('(').unwrap_or((kind, ""));
     if !width.is_empty() && !width.ends_with(')') {
-        return None;
+        return false;
     }
-    match name {
-        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT" | "UINTEGER"
-        | "UBIGINT" | "UHUGEINT" => Some(NumericKind::Integer),
-        "DECIMAL" | "NUMERIC" => Some(NumericKind::Exact),
-        "FLOAT" | "DOUBLE" | "REAL" => Some(NumericKind::Approximate),
-        _ => None,
-    }
+    matches!(
+        name,
+        "TINYINT"
+            | "SMALLINT"
+            | "INTEGER"
+            | "BIGINT"
+            | "HUGEINT"
+            | "UTINYINT"
+            | "USMALLINT"
+            | "UINTEGER"
+            | "UBIGINT"
+            | "UHUGEINT"
+            | "DECIMAL"
+            | "NUMERIC"
+            | "FLOAT"
+            | "DOUBLE"
+            | "REAL"
+    )
 }
 
 fn text(value: SimpleExpr) -> SimpleExpr {
@@ -101,11 +258,8 @@ fn boolean(value: &str) -> Result<bool, FilterError> {
 }
 
 fn named_type(value: &str) -> Result<&'static str, FilterError> {
-    let wanted = value.to_ascii_uppercase();
-    GEOMETRY_TYPES
-        .iter()
-        .find(|known| **known == wanted)
-        .copied()
+    crate::grammar::GeometryType::from_param(value)
+        .map(|parsed| parsed.0)
         .ok_or_else(|| FilterError::UnknownGeometryType(value.to_string()))
 }
 
@@ -118,40 +272,6 @@ fn numeral(value: &str) -> Option<&str> {
     let digits = body.chars().filter(|c| c.is_ascii_digit()).count();
     let shaped = body.chars().all(|c| c.is_ascii_digit() || c == '.') && body.matches('.').count() <= 1;
     (digits > 0 && shaped).then_some(value)
-}
-
-fn id_condition(params: &[String], columns: &[(String, String)]) -> Result<SimpleExpr, FilterError> {
-    let column = ID_CANDIDATES
-        .iter()
-        .find_map(|want| columns.iter().find(|(name, _)| name.eq_ignore_ascii_case(want)))
-        .ok_or(FilterError::NoIdColumn)?;
-    compare(column, params, "id")
-}
-
-fn prop_condition(params: &[String], columns: &[(String, String)]) -> Result<SimpleExpr, FilterError> {
-    let [key, rest @ ..] = params else { return Err(FilterError::BadParams("prop".to_string())) };
-    let column = columns.iter().find(|(name, _)| name == key).ok_or_else(|| FilterError::UnknownColumn(key.clone()))?;
-    compare(column, rest, "prop")
-}
-
-fn geometry_condition(name: &str, params: &[String], geometry: &str) -> Result<SimpleExpr, FilterError> {
-    let predicate = |function: &'static str| Func::cust(function).arg(Expr::col(Alias::new(geometry)));
-    let only = || match params {
-        [single] => Ok(single.as_str()),
-        _ => Err(FilterError::BadParams(name.to_string())),
-    };
-    Ok(match name {
-        "type" => shape_of(geometry).eq(named_type(only()?)?),
-        "valid" => predicate("ST_IsValid").eq(boolean(only()?)?),
-        "empty" => predicate("ST_IsEmpty").eq(boolean(only()?)?),
-        "simple" => predicate("ST_IsSimple").eq(boolean(only()?)?),
-        "closed" => {
-            let linear: SimpleExpr =
-                Expr::case(shape_of(geometry).is_in(LINEAR_TYPES), predicate("ST_IsClosed")).into();
-            linear.eq(boolean(only()?)?)
-        }
-        other => return Err(FilterError::UnknownFilter(other.to_string())),
-    })
 }
 
 fn compare((name, kind): &(String, String), params: &[String], filter: &str) -> Result<SimpleExpr, FilterError> {
@@ -184,7 +304,7 @@ fn compare((name, kind): &(String, String), params: &[String], filter: &str) -> 
 }
 
 fn value_set(column: impl Fn() -> SimpleExpr, kind: &str, pattern: &str) -> Result<SimpleExpr, FilterError> {
-    let numeric = numeric_kind(kind).is_some();
+    let numeric = is_numeric(kind);
     if numeric && let Some((lo, hi)) = parexp::as_integer_range(pattern) {
         return Ok(column().between(lo, hi));
     }
@@ -223,9 +343,9 @@ fn ordering(
     operator: &str,
     value: &str,
 ) -> Result<SimpleExpr, FilterError> {
-    let (left, right) = match numeric_kind(kind) {
-        None => (text(column()), Expr::val(value)),
-        Some(_) => {
+    let (left, right) = match is_numeric(kind) {
+        false => (text(column()), Expr::val(value)),
+        true => {
             let exact = numeral(value).ok_or_else(|| FilterError::NotANumber(value.to_string()))?;
             (column(), Expr::cust(exact.to_string()))
         }
@@ -253,11 +373,12 @@ mod tests {
 
     #[test]
     fn every_filter_the_core_grammar_registers_is_executable() {
-        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("name".to_string(), "VARCHAR".to_string())];
+        let columns = columns();
         for def in &crate::grammar::Grammar::core().filters {
-            for shape in &def.shapes {
-                let segment = Segment { name: def.name.to_string(), params: vec!["name".to_string(); shape.len()] };
-                let outcome = condition(&[segment], &columns, "geom");
+            for shape in def.shapes {
+                let params = shape.iter().map(|kind| sample(*kind).to_string()).collect();
+                let segment = Segment { name: def.name.to_string(), params };
+                let outcome = held(&[segment], &columns);
                 assert!(
                     !matches!(outcome, Err(FilterError::UnknownFilter(_))),
                     "{:?} is registered but condition cannot execute it",
@@ -277,12 +398,34 @@ mod tests {
         ]
     }
 
+    fn pipeline_for(cols: &[(String, String)]) -> crate::sql::Pipeline {
+        let backend = std::sync::Arc::new(crate::backend::Backend::default());
+        crate::sql::Pipeline::source("/x.geojson", "UTF-8", cols, None, backend).unwrap()
+    }
+
+    fn held(filters: &[Segment], cols: &[(String, String)]) -> Result<Option<SimpleExpr>, FilterError> {
+        let mut pipeline = pipeline_for(cols);
+        let mut ctx = FilterCtx::new(&mut pipeline, cols);
+        crate::filters::condition(&crate::grammar::Grammar::core(), &mut ctx, filters)
+            .map_err(|e| e.downcast::<FilterError>().expect("a core filter reports a FilterError"))
+    }
+
+    fn sample(kind: Param) -> &'static str {
+        match kind {
+            Param::Column | Param::Value => "name",
+            Param::Operator => "eq",
+            Param::Token => "3857",
+            Param::Boolean => "true",
+            Param::GeometryType => "POINT",
+        }
+    }
+
     fn seg(params: &[&str]) -> Segment {
         Segment { name: "id".to_string(), params: params.iter().map(|p| p.to_string()).collect() }
     }
 
     fn render(filters: &[Segment], cols: &[(String, String)]) -> String {
-        let expr = condition(filters, cols, "geom").unwrap().unwrap();
+        let expr = held(filters, cols).unwrap().unwrap();
         Query::select().expr(Expr::cust("1")).and_where(expr).to_string(PostgresQueryBuilder)
     }
 
@@ -291,14 +434,14 @@ mod tests {
     }
 
     fn text_sql(filters: &[Segment]) -> String {
-        let cols = vec![("id".to_string(), "VARCHAR".to_string())];
+        let cols = vec![("id".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         render(filters, &cols)
     }
 
     fn executes(params: &[&str], kind: &str, row: &str) -> Result<bool, String> {
-        let cols = vec![("v".to_string(), kind.to_string())];
+        let cols = vec![("v".to_string(), kind.to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let seg = Segment { name: "prop".to_string(), params: params.iter().map(|p| p.to_string()).collect() };
-        let expr = condition(&[seg], &cols, "geom").map_err(|e| e.to_string())?.unwrap();
+        let expr = held(&[seg], &cols).map_err(|e| e.to_string())?.unwrap();
         let sql = Query::select()
             .expr(Expr::cust("1"))
             .from_subquery(Query::select().expr(Expr::cust(row.to_string())).take(), Alias::new("t"))
@@ -315,7 +458,7 @@ mod tests {
     fn shaped(name: &str, value: &str, wkt: &str) -> Result<bool, String> {
         let cols = vec![("geom".to_string(), "GEOMETRY".to_string())];
         let seg = Segment { name: name.to_string(), params: vec![value.to_string()] };
-        let expr = condition(&[seg], &cols, "geom").map_err(|e| e.to_string())?.unwrap();
+        let expr = held(&[seg], &cols).map_err(|e| e.to_string())?.unwrap();
         let geom = match wkt {
             "NULL" => "NULL::GEOMETRY AS geom".to_string(),
             _ => format!("ST_GeomFromText('{wkt}') AS geom"),
@@ -405,7 +548,7 @@ mod tests {
     fn counted(name: &str, value: &str) -> Result<i64, String> {
         let cols = vec![("geom".to_string(), "GEOMETRY".to_string())];
         let seg = Segment { name: name.to_string(), params: vec![value.to_string()] };
-        let expr = condition(&[seg], &cols, "geom").map_err(|e| e.to_string())?.unwrap();
+        let expr = held(&[seg], &cols).map_err(|e| e.to_string())?.unwrap();
         let sql = Query::select()
             .expr(Expr::cust("count(*)"))
             .from(Alias::new("t"))
@@ -458,19 +601,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case("valid", "yes", FilterError::NotABoolean("yes".to_string()))]
-    #[case("empty", "", FilterError::NotABoolean(String::new()))]
-    #[case("simple", "2", FilterError::NotABoolean("2".to_string()))]
-    #[case("closed", "maybe", FilterError::NotABoolean("maybe".to_string()))]
-    #[case("type", "Banana", FilterError::UnknownGeometryType("Banana".to_string()))]
-    #[case("type", "ST_Point", FilterError::UnknownGeometryType("ST_Point".to_string()))]
-    fn a_geometry_predicate_refuses_a_value_it_cannot_read(
+    #[case("valid", "yes", Param::Boolean)]
+    #[case("empty", "", Param::Boolean)]
+    #[case("simple", "2", Param::Boolean)]
+    #[case("closed", "maybe", Param::Boolean)]
+    #[case("type", "Banana", Param::GeometryType)]
+    #[case("type", "ST_Point", Param::GeometryType)]
+    fn a_geometry_predicate_refuses_a_value_of_the_wrong_kind(
         #[case] name: &str,
         #[case] value: &str,
-        #[case] expected: FilterError,
+        #[case] expected: Param,
     ) {
         let seg = Segment { name: name.to_string(), params: vec![value.to_string()] };
-        assert_eq!(condition(&[seg], &columns(), "geom").unwrap_err(), expected);
+        let cols = columns();
+        let mut pipeline = pipeline_for(&cols);
+        let mut ctx = FilterCtx::new(&mut pipeline, &cols);
+        let err = crate::filters::condition(&crate::grammar::Grammar::core(), &mut ctx, &[seg]).unwrap_err();
+        let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the declared kind is enforced");
+        assert_eq!(typed.expected, expected);
+        assert_eq!(typed.got, value);
     }
 
     #[rstest]
@@ -517,9 +666,50 @@ mod tests {
         }
     }
 
+    fn nearby(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+        ctx.cte_once("reach", |from| Query::select().expr(Expr::cust("ST_Union_Agg(geom)")).from(from.clone()).take());
+        let reach = Query::select().expr(Expr::cust("*")).from(Alias::new("filter_reach")).take();
+        let measured = ctx.call("as_text", vec![ctx.geom()])?;
+        Ok(Expr::cust_with_exprs(
+            format!("ST_Whatever($1, $2, '{}', {})", ctx.crs(), params[0]),
+            [measured, SimpleExpr::SubQuery(None, Box::new(sea_query::SubQueryStatement::SelectStatement(reach)))],
+        ))
+    }
+
+    #[test]
+    fn a_filter_core_never_named_can_be_registered() {
+        let mut g = crate::grammar::Grammar::default();
+        g.register_filter(filter("nearby", "nb", &[&[Param::Value]], nearby));
+        g.register_output(crate::formats::GeoJson);
+        let cols = columns();
+        let backend = crate::backend::Backend::default().extend(|v| {
+            v.register("as_text", |mut args: Vec<SimpleExpr>| Func::cast_as(args.remove(0), "VARCHAR").into());
+        });
+        let mut pipeline =
+            crate::sql::Pipeline::source("/x.geojson", "UTF-8", &cols, None, std::sync::Arc::new(backend)).unwrap();
+        let segment = Segment { name: "nearby".to_string(), params: vec!["500".to_string()] };
+        let expr = {
+            let mut ctx = FilterCtx::new(&mut pipeline, &cols);
+            crate::filters::condition(&g, &mut ctx, &[segment]).unwrap().unwrap()
+        };
+        assert!(pipeline.cte("filter", "reach").is_some(), "the side table was not kept on the pipeline");
+        let input = pipeline.input();
+        let rendered = pipeline.finish(Query::select().expr(Expr::cust("*")).from(input).and_where(expr).take());
+        assert!(rendered.contains("ST_Whatever"), "the registered filter did not reach the sql: {rendered}");
+        assert!(rendered.contains("EPSG:4326"), "the filter could not read the pipeline crs: {rendered}");
+        assert!(
+            rendered.contains("CAST(\"geom\" AS VARCHAR)"),
+            "the filter could not reach the vocabulary: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"filter_reach\" AS (SELECT ST_Union_Agg(geom)"),
+            "the side table was not built from the filter's own query: {rendered}"
+        );
+    }
+
     #[test]
     fn no_filters_is_no_condition() {
-        assert!(condition(&[], &columns(), "geom").unwrap().is_none());
+        assert!(held(&[], &columns()).unwrap().is_none());
     }
 
     #[rstest]
@@ -605,7 +795,7 @@ mod tests {
     #[case("1e400")]
     #[case("(a,b)")]
     fn a_numeric_column_refuses_a_value_that_is_not_a_number(#[case] value: &str) {
-        let outcome = condition(&[seg(&[value])], &columns(), "geom");
+        let outcome = held(&[seg(&[value])], &columns());
         assert!(matches!(outcome, Err(FilterError::NotANumber(_))), "{outcome:?}");
     }
 
@@ -618,12 +808,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case(vec![("fid".to_string(), "BIGINT".to_string())], true)]
-    #[case(vec![("GID".to_string(), "BIGINT".to_string())], true)]
-    #[case(vec![("ObjectID".to_string(), "BIGINT".to_string())], true)]
-    #[case(vec![("name".to_string(), "VARCHAR".to_string())], false)]
+    #[case(vec![("fid".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())], true)]
+    #[case(vec![("GID".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())], true)]
+    #[case(vec![("ObjectID".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())], true)]
+    #[case(vec![("name".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())], false)]
     fn id_finds_its_column_case_insensitively(#[case] cols: Vec<(String, String)>, #[case] found: bool) {
-        let outcome = condition(&[seg(&["1"])], &cols, "geom");
+        let outcome = held(&[seg(&["1"])], &cols);
         assert_eq!(outcome.is_ok(), found, "{outcome:?}");
         if !found {
             assert_eq!(outcome.unwrap_err(), FilterError::NoIdColumn);
@@ -632,7 +822,11 @@ mod tests {
 
     #[test]
     fn id_prefers_id_over_the_other_candidates() {
-        let cols = vec![("fid".to_string(), "BIGINT".to_string()), ("id".to_string(), "BIGINT".to_string())];
+        let cols = vec![
+            ("fid".to_string(), "BIGINT".to_string()),
+            ("id".to_string(), "BIGINT".to_string()),
+            ("geom".to_string(), "GEOMETRY".to_string()),
+        ];
         let out = render(&[seg(&["1"])], &cols);
         assert!(out.contains("\"id\""), "{out}");
         assert!(!out.contains("\"fid\""), "{out}");
@@ -648,10 +842,7 @@ mod tests {
     #[case(&[])]
     #[case(&["a", "b", "c"])]
     fn id_rejects_a_bad_parameter_count(#[case] params: &[&str]) {
-        assert_eq!(
-            condition(&[seg(params)], &columns(), "geom").unwrap_err(),
-            FilterError::BadParams("id".to_string())
-        );
+        assert_eq!(held(&[seg(params)], &columns()).unwrap_err(), FilterError::BadParams("id".to_string()));
     }
 
     #[rstest]
@@ -699,7 +890,7 @@ mod tests {
     #[case("(-5..10)")]
     #[case("(+5..10)")]
     fn a_padded_signed_or_fractional_range_does_not_take_the_numeric_path(#[case] value: &str) {
-        match condition(&[seg(&[value])], &columns(), "geom") {
+        match held(&[seg(&[value])], &columns()) {
             Ok(expr) => {
                 let out =
                     Query::select().expr(Expr::cust("1")).and_where(expr.unwrap()).to_string(PostgresQueryBuilder);
@@ -731,17 +922,14 @@ mod tests {
     #[case(vec![])]
     fn an_unknown_name_is_unknown_whatever_it_carries(#[case] params: Vec<&str>) {
         let seg = Segment { name: "zzz".to_string(), params: params.iter().map(|p| p.to_string()).collect() };
-        let outcome = condition(&[seg], &columns(), "geom");
+        let outcome = held(&[seg], &columns());
         assert_eq!(outcome.unwrap_err(), FilterError::UnknownFilter("zzz".to_string()));
     }
 
     #[test]
     fn an_unknown_filter_name_is_reported() {
         let unknown = Segment { name: "zzz".to_string(), params: vec!["1".to_string()] };
-        assert_eq!(
-            condition(&[unknown], &columns(), "geom").unwrap_err(),
-            FilterError::UnknownFilter("zzz".to_string())
-        );
+        assert_eq!(held(&[unknown], &columns()).unwrap_err(), FilterError::UnknownFilter("zzz".to_string()));
     }
 
     #[rstest]
@@ -749,8 +937,8 @@ mod tests {
     #[case("x'); DROP TABLE t; --")]
     #[case("1' UNION SELECT 'x")]
     fn duckdb_executes_a_hostile_value_as_data(#[case] value: &str) {
-        let cols = vec![("id".to_string(), "VARCHAR".to_string())];
-        let expr = condition(&[seg(&[value])], &cols, "geom").unwrap().unwrap();
+        let cols = vec![("id".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let expr = held(&[seg(&[value])], &cols).unwrap().unwrap();
         let out = Query::select()
             .expr(Expr::cust("1"))
             .from_subquery(Query::select().expr(Expr::cust("'42' AS id")).take(), Alias::new("t"))

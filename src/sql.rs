@@ -57,8 +57,17 @@ impl Pipeline {
         })
     }
 
-    pub fn filter(&mut self, filters: &[Segment], columns: &[(String, String)]) -> anyhow::Result<()> {
-        if let Some(predicate) = filters::condition(filters, columns, &self.geometry)? {
+    pub fn filter(
+        &mut self,
+        grammar: &Grammar,
+        filters: &[Segment],
+        columns: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let held = {
+            let mut ctx = filters::FilterCtx::new(self, columns);
+            filters::condition(grammar, &mut ctx, filters)?
+        };
+        if let Some(predicate) = held {
             let filtered = Query::select().expr(Expr::cust("*")).from(self.input.clone()).and_where(predicate).take();
             self.step("step", filtered);
         }
@@ -186,7 +195,7 @@ pub fn plan(
     backend: Arc<Backend>,
 ) -> anyhow::Result<String> {
     let mut pipeline = Pipeline::source(source, &parsed.encoding, columns, crs, backend)?;
-    pipeline.filter(&parsed.filters, columns)?;
+    pipeline.filter(grammar, &parsed.filters, columns)?;
 
     for action in &parsed.actions {
         let Some(def) = grammar.action_for(&action.name) else {
@@ -543,7 +552,7 @@ mod tests {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
-        p.filter(&id_filter(), &columns).unwrap();
+        p.filter(&Grammar::core(), &id_filter(), &columns).unwrap();
         assert!(p.cte("test", "extent").is_none(), "a side table from an earlier stage must not be reported as live");
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
 
@@ -560,7 +569,7 @@ mod tests {
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         for (at, name) in names.iter().enumerate() {
             if at > 0 {
-                p.filter(&id_filter(), &columns).unwrap();
+                p.filter(&Grammar::core(), &id_filter(), &columns).unwrap();
             }
             p.cte_once("test", name, |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
             assert!(p.cte("test", name).is_some(), "{name} was built but is not live");
@@ -584,7 +593,7 @@ mod tests {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
-        p.filter(&id_filter(), &columns).unwrap();
+        p.filter(&Grammar::core(), &id_filter(), &columns).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("2")).from(from.clone()).take());
         let out = rendered(p);
         assert!(out.contains("\"test_extent\" AS (SELECT 1 FROM \"source\")"), "{out}");
@@ -598,7 +607,7 @@ mod tests {
     fn a_side_table_reads_from_the_current_input() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
-        p.filter(&id_filter(), &columns).unwrap();
+        p.filter(&Grammar::core(), &id_filter(), &columns).unwrap();
         p.cte_once("test", "extent", |from| Query::select().expr(Expr::cust("1")).from(from.clone()).take());
         let out = rendered(p);
         assert!(out.contains("\"test_extent\" AS (SELECT 1 FROM \"step_1\")"), "{out}");
