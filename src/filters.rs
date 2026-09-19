@@ -15,12 +15,12 @@ const TYPE_SHAPE: &[&[Param]] = &[&[Param::GeometryType]];
 
 pub const CORE: &[FilterDef] = &[
     filter("id", "", ID_SHAPE, id),
-    filter("prop", "", PROP_SHAPE, prop),
-    filter("type", "", TYPE_SHAPE, geometry_type),
-    filter("valid", "", BOOLEAN, valid),
-    filter("empty", "", BOOLEAN, empty),
-    filter("simple", "", BOOLEAN, simple),
-    filter("closed", "", BOOLEAN, closed),
+    filter("prop", "p", PROP_SHAPE, prop),
+    filter("type", "ty", TYPE_SHAPE, geometry_type),
+    filter("valid", "va", BOOLEAN, valid),
+    filter("empty", "em", BOOLEAN, empty),
+    filter("simple", "si", BOOLEAN, simple),
+    filter("closed", "cl", BOOLEAN, closed),
 ];
 
 #[derive(Debug, PartialEq)]

@@ -247,7 +247,7 @@ fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<St
                 encoding = Some(value.clone());
             }
             _ => {
-                let segment = finish_segment(key, params, spec.expect("checked above"))?;
+                let segment = finish_segment(params, spec.expect("checked above"))?;
                 if filters.len() == MAX_FILTERS {
                     return Err(ParseError::TooManyFilters);
                 }
@@ -283,17 +283,18 @@ fn read_params(scan: &mut Scan<'_>) -> Vec<String> {
     params
 }
 
-fn finish_segment(key: &str, params: Vec<String>, def: &dyn crate::grammar::Declared) -> Result<Segment, ParseError> {
+fn finish_segment(params: Vec<String>, def: &dyn crate::grammar::Declared) -> Result<Segment, ParseError> {
+    let canonical = def.canonical();
     if params.iter().any(String::is_empty) || (params.is_empty() && !def.accepts(0)) {
-        return Err(ParseError::EmptyOptionValue(key.to_string()));
+        return Err(ParseError::EmptyOptionValue(canonical.to_string()));
     }
     for value in &params {
         validate_value(value)?;
     }
     if !def.accepts(params.len()) {
-        return Err(ParseError::WrongParameterCount(key.to_string()));
+        return Err(ParseError::WrongParameterCount(canonical.to_string()));
     }
-    Ok(Segment { name: def.canonical().to_string(), params })
+    Ok(Segment { name: canonical.to_string(), params })
 }
 
 fn read_action_segments(scan: &mut Scan<'_>, def: &dyn crate::grammar::Action) -> Result<Vec<Segment>, ParseError> {
@@ -306,7 +307,7 @@ fn read_action_segments(scan: &mut Scan<'_>, def: &dyn crate::grammar::Action) -
         let Some(option) = def.option(key) else {
             return Err(ParseError::UnknownOption(key.to_string()));
         };
-        let segment = finish_segment(key, read_params(scan), option)?;
+        let segment = finish_segment(read_params(scan), option)?;
         if out.len() == MAX_OPTIONS {
             return Err(ParseError::TooManyOptions);
         }
@@ -837,6 +838,56 @@ mod tests {
         assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
         assert_eq!(p.filters[0].name, name);
         assert_eq!(p.filters[0].params, vec![value]);
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,p:name:eq:Berlin.geojson", "prop", vec!["name", "eq", "Berlin"])]
+    #[case("/@dataset:x,p:name:Berlin.geojson", "prop", vec!["name", "Berlin"])]
+    #[case("/@dataset:x,ty:Point.geojson", "type", vec!["Point"])]
+    #[case("/@dataset:x,va:true.geojson", "valid", vec!["true"])]
+    #[case("/@dataset:x,em:false.geojson", "empty", vec!["false"])]
+    #[case("/@dataset:x,si:1.geojson", "simple", vec!["1"])]
+    #[case("/@dataset:x,cl:0.geojson", "closed", vec!["0"])]
+    #[case("/@dataset:x,id:eq:1.geojson", "id", vec!["eq", "1"])]
+    fn a_filter_short_name_resolves_to_the_canonical_one(
+        #[case] url: &str,
+        #[case] name: &str,
+        #[case] params: Vec<&str>,
+    ) {
+        let p = parse(url, &Grammar::core()).unwrap();
+        assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
+        assert_eq!(p.filters[0].name, name);
+        assert_eq!(p.filters[0].params, params);
+    }
+
+    #[rstest]
+    #[case("em", "empty")]
+    #[case("si", "simple")]
+    fn a_short_filter_does_not_shadow_the_source_encoding(#[case] short: &str, #[case] canonical: &str) {
+        let url = format!("/@dataset:x,enc:latin1,{short}:true.geojson");
+        let p = parse(&url, &Grammar::core()).unwrap();
+        assert_eq!(p.encoding, "ISO-8859-1");
+        assert_eq!(p.filters.len(), 1, "{:?}", p.filters);
+        assert_eq!(p.filters[0].name, canonical);
+    }
+
+    #[test]
+    fn an_encoding_after_a_short_filter_is_still_misplaced() {
+        assert_eq!(
+            parse("/@dataset:x,em:true,enc:utf-8.geojson", &Grammar::core()),
+            Err(ParseError::MisplacedSourceOption("enc".to_string()))
+        );
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,p:a:b:c:d.geojson", "prop")]
+    #[case("/@dataset:x,va:true:false.geojson", "valid")]
+    fn a_parse_error_names_the_canonical_filter(#[case] url: &str, #[case] canonical: &str) {
+        assert_eq!(
+            parse(url, &Grammar::core()),
+            Err(ParseError::WrongParameterCount(canonical.to_string())),
+            "the error quoted the url spelling instead of the canonical name"
+        );
     }
 
     #[rstest]
