@@ -10,6 +10,7 @@ pub enum Param {
     Token,
     Boolean,
     GeometryType,
+    Source,
 }
 
 impl Param {
@@ -21,6 +22,7 @@ impl Param {
             Param::Token => "letters, digits, dot, dash or underscore",
             Param::Boolean => "true or false",
             Param::GeometryType => "a geometry type",
+            Param::Source => "a nested source",
         }
     }
 }
@@ -51,6 +53,7 @@ pub struct Token(pub String);
 pub struct Operator(pub String);
 pub struct Boolean(pub bool);
 pub struct GeometryType(pub &'static str);
+pub struct Source(pub String);
 
 impl FromParam for Column {
     const KIND: Param = Param::Column;
@@ -90,6 +93,14 @@ impl FromParam for Boolean {
             "false" | "0" => Some(Boolean(false)),
             _ => None,
         }
+    }
+}
+
+impl FromParam for Source {
+    const KIND: Param = Param::Source;
+    fn from_param(raw: &str) -> Option<Self> {
+        let inner = raw.strip_prefix('(')?.strip_suffix(')')?;
+        inner.starts_with('@').then(|| Source(inner.to_string()))
     }
 }
 
@@ -155,6 +166,10 @@ impl<'a> StageCtx<'a> {
         self.pipeline.input()
     }
 
+    pub fn nested(&self, raw: &str) -> Option<&crate::sql::NestedRelation> {
+        self.pipeline.nested(raw)
+    }
+
     pub fn cte_once(&mut self, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
         self.pipeline.cte_once(self.action, name, build)
     }
@@ -173,6 +188,7 @@ impl Param {
             Param::Token => Token::from_param(raw).is_some(),
             Param::Boolean => Boolean::from_param(raw).is_some(),
             Param::GeometryType => GeometryType::from_param(raw).is_some(),
+            Param::Source => Source::from_param(raw).is_some(),
         }
     }
 }
@@ -464,7 +480,7 @@ mod tests {
     fn the_core_grammar_registers_the_built_in_filters() {
         let g = Grammar::core();
         let names: Vec<&str> = g.filters.iter().map(|f| f.name).collect();
-        assert_eq!(names, vec!["id", "prop", "type", "valid", "empty", "simple", "closed"]);
+        assert_eq!(names, vec!["id", "prop", "type", "valid", "empty", "simple", "closed", "intersects"]);
     }
 
     fn named(

@@ -105,22 +105,48 @@ pub fn read_source(source: &str, encoding: &str) -> FunctionCall {
         .arg(Expr::cust_with_exprs("open_options=list_value($1)", [Expr::val(format!("ENCODING={encoding}"))]))
 }
 
+pub struct Resolved {
+    pub raw: String,
+    pub source: String,
+    pub encoding: String,
+}
+
+pub struct Described {
+    pub raw: String,
+    pub source: String,
+    pub encoding: String,
+    pub columns: Vec<(String, String)>,
+    pub crs: Option<String>,
+}
+
+fn read_crs(conn: &Connection, source: &str) -> Option<String> {
+    source_crs(conn, source).unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "could not read the source crs, serving it unprojected");
+        None
+    })
+}
+
 pub fn run(
     source: &str,
     encoding: &str,
     separator: &str,
-    sql_for: impl FnOnce(&[(String, String)], Option<&str>) -> Result<String>,
+    nested: Vec<Resolved>,
+    sql_for: impl FnOnce(&[(String, String)], Option<&str>, &[Described]) -> Result<String>,
     on_ready: impl FnOnce(),
     sink: &mut dyn FnMut(String) -> bool,
 ) -> Result<()> {
     with_connection(|conn| {
         let columns = describe(conn, source, encoding)?;
         geometry_of(&columns).ok_or(NoGeometry)?;
-        let crs = source_crs(conn, source).unwrap_or_else(|e| {
-            tracing::warn!(error = ?e, "could not read the source crs, serving it unprojected");
-            None
-        });
-        let sql = sql_for(&columns, crs.as_deref())?;
+        let crs = read_crs(conn, source);
+        let mut described: Vec<Described> = Vec::with_capacity(nested.len());
+        for held in nested {
+            let columns = describe(conn, &held.source, &held.encoding)?;
+            geometry_of(&columns).ok_or(NoGeometry)?;
+            let crs = read_crs(conn, &held.source);
+            described.push(Described { raw: held.raw, source: held.source, encoding: held.encoding, columns, crs });
+        }
+        let sql = sql_for(&columns, crs.as_deref(), &described)?;
 
         let mut stmt = conn.prepare(&sql).context("prepare query")?;
         let mut rows = stmt.query([]).context("run query")?;
@@ -210,6 +236,106 @@ mod tests {
         crate::url::parse(&format!("/@dataset:x.{ext}"), &crate::grammar::Grammar::core()).unwrap()
     }
 
+    const PARCELS: &str = r#"{"type":"FeatureCollection","features":[
+        {"type":"Feature","properties":{"name":"inside"},"geometry":{"type":"Point","coordinates":[1,1]}},
+        {"type":"Feature","properties":{"name":"outside"},"geometry":{"type":"Point","coordinates":[9,9]}},
+        {"type":"Feature","properties":{"name":"edge"},"geometry":{"type":"Point","coordinates":[2,2]}}]}"#;
+
+    const ZONES: &str = r#"{"type":"FeatureCollection","features":[
+        {"type":"Feature","properties":{"name":"flood"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[0,2],[2,2],[2,0],[0,0]]]}},
+        {"type":"Feature","properties":{"name":"dry"},"geometry":{"type":"Polygon","coordinates":[[[20,20],[20,21],[21,21],[21,20],[20,20]]]}}]}"#;
+
+    fn nested_names(url: &str, outer: &str, inner: &str) -> Vec<String> {
+        crate::ensure_spatial();
+        let g = crate::grammar::Grammar::core();
+        let parsed = crate::url::parse(url, &g).unwrap();
+        let f = parsed.output.clone();
+        let resolved: Vec<Resolved> = parsed
+            .nested
+            .iter()
+            .map(|held| Resolved { raw: held.raw.clone(), source: inner.to_string(), encoding: held.encoding.clone() })
+            .collect();
+        let mut out = String::from(f.header());
+        run(
+            outer,
+            crate::url::DEFAULT_ENCODING,
+            f.separator(),
+            resolved,
+            |c, crs, nested| crate::sql::plan(&g, &parsed, outer, c, crs, nested, backend()),
+            || {},
+            &mut |chunk| {
+                out.push_str(&chunk);
+                true
+            },
+        )
+        .unwrap();
+        out.push_str(f.footer());
+        let held: serde_json::Value = serde_json::from_str(&out).expect(&out);
+        held["features"]
+            .as_array()
+            .expect("features")
+            .iter()
+            .map(|feature| feature["properties"]["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_nested_filter_that_builds_a_side_table_still_runs() {
+        crate::ensure_spatial();
+        let mut g = crate::grammar::Grammar::core();
+        g.register_filter(crate::filters::filter("sided", "sd", &[&[crate::grammar::Param::Value]], |ctx, _| {
+            let held = ctx.cte_once("probe", |from| {
+                sea_query::Query::select()
+                    .expr_as(sea_query::Expr::cust("1"), sea_query::Alias::new("one"))
+                    .from(from.clone())
+                    .take()
+            });
+            let reading = sea_query::Query::select().expr(sea_query::Expr::cust("MAX(one)")).from(held).take();
+            let sub =
+                sea_query::SimpleExpr::SubQuery(None, Box::new(sea_query::SubQueryStatement::SelectStatement(reading)));
+            Ok(sea_query::Expr::cust_with_exprs("$1 = 1", [sub]))
+        }));
+        let outer = fixture("parcels", PARCELS);
+        let inner = fixture("zones", ZONES);
+        let url = "/@dataset:parcels,ix:(@dataset:zones,sided:x).geojson";
+        let parsed = crate::url::parse(url, &g).unwrap();
+        let resolved: Vec<Resolved> = parsed
+            .nested
+            .iter()
+            .map(|held| Resolved { raw: held.raw.clone(), source: inner.clone(), encoding: held.encoding.clone() })
+            .collect();
+        let mut out = String::new();
+        let sent = run(
+            &outer,
+            crate::url::DEFAULT_ENCODING,
+            ",",
+            resolved,
+            |c, crs, nested| crate::sql::plan(&g, &parsed, &outer, c, crs, nested, backend()),
+            || {},
+            &mut |chunk| {
+                out.push_str(&chunk);
+                true
+            },
+        );
+        sent.expect("a nested filter that builds a side table produced unrunnable sql");
+    }
+
+    #[test]
+    fn a_nested_source_filters_by_the_other_datasets_geometry() {
+        let outer = fixture("parcels", PARCELS);
+        let inner = fixture("zones", ZONES);
+        let names = nested_names("/@dataset:parcels,ix:(@dataset:zones).geojson", &outer, &inner);
+        assert_eq!(names, vec!["inside", "edge"], "the nested geometry did not narrow the outer rows");
+    }
+
+    #[test]
+    fn a_nested_source_applies_its_own_filters_first() {
+        let outer = fixture("parcels", PARCELS);
+        let inner = fixture("zones", ZONES);
+        let names = nested_names("/@dataset:parcels,ix:(@dataset:zones,prop:name:dry).geojson", &outer, &inner);
+        assert!(names.is_empty(), "the inner filter was ignored: {names:?}");
+    }
+
     #[test]
     fn installing_the_extension_twice_is_harmless() {
         install_extensions().unwrap();
@@ -250,7 +376,10 @@ mod tests {
             source,
             crate::url::DEFAULT_ENCODING,
             f.separator(),
-            |c, crs| crate::sql::plan(&crate::grammar::Grammar::core(), &parsed, source, c, crs, backend()),
+            Vec::new(),
+            |c, crs, nested| {
+                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed, source, c, crs, nested, backend())
+            },
             || {},
             &mut |chunk| {
                 out.push_str(&chunk);
@@ -286,8 +415,17 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f.separator(),
-            |c, crs| {
-                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            Vec::new(),
+            |c, crs, nested| {
+                crate::sql::plan(
+                    &crate::grammar::Grammar::core(),
+                    &parsed_for("geojson"),
+                    &src,
+                    c,
+                    crs,
+                    nested,
+                    backend(),
+                )
             },
             || {},
             &mut |chunk| {
@@ -347,8 +485,17 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             geojson_output().separator(),
-            |c, crs| {
-                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            Vec::new(),
+            |c, crs, nested| {
+                crate::sql::plan(
+                    &crate::grammar::Grammar::core(),
+                    &parsed_for("geojson"),
+                    &src,
+                    c,
+                    crs,
+                    nested,
+                    backend(),
+                )
             },
             || panic!("a source with no geometry must not reach the ready signal"),
             &mut |_| true,
@@ -460,8 +607,17 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f.separator(),
-            |c, crs| {
-                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            Vec::new(),
+            |c, crs, nested| {
+                crate::sql::plan(
+                    &crate::grammar::Grammar::core(),
+                    &parsed_for("geojson"),
+                    &src,
+                    c,
+                    crs,
+                    nested,
+                    backend(),
+                )
             },
             || {},
             &mut |_| {
@@ -477,8 +633,17 @@ mod tests {
             &src,
             crate::url::DEFAULT_ENCODING,
             f.separator(),
-            |c, crs| {
-                crate::sql::plan(&crate::grammar::Grammar::core(), &parsed_for("geojson"), &src, c, crs, backend())
+            Vec::new(),
+            |c, crs, nested| {
+                crate::sql::plan(
+                    &crate::grammar::Grammar::core(),
+                    &parsed_for("geojson"),
+                    &src,
+                    c,
+                    crs,
+                    nested,
+                    backend(),
+                )
             },
             || {},
             &mut |_| {

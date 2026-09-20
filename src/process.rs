@@ -55,7 +55,7 @@ mod tests {
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse(url, &grammar).unwrap();
         let backend = Arc::new(crate::backend::Backend::default());
-        plan(&grammar, &parsed, "/x.geojson", &columns, crs, backend).unwrap()
+        plan(&grammar, &parsed, "/x.geojson", &columns, crs, &[], backend).unwrap()
     }
 
     #[rstest]

@@ -28,6 +28,16 @@ pub struct ParsedUrl {
     pub actions: Vec<Action>,
     pub output: std::sync::Arc<dyn crate::formats::Output>,
     pub extension: &'static str,
+    pub nested: Vec<Nested>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nested {
+    pub raw: String,
+    pub dataset: String,
+    pub path: Option<String>,
+    pub encoding: String,
+    pub filters: Vec<Segment>,
 }
 
 impl ParsedUrl {
@@ -75,6 +85,7 @@ pub enum ParseError {
     TooManyFilters,
     UnbalancedValue(String),
     ValueTooDeep(String),
+    NestedTooDeep(String),
 }
 
 impl fmt::Display for ParseError {
@@ -104,6 +115,7 @@ impl fmt::Display for ParseError {
             ParseError::TooManyActions => write!(f, "at most {MAX_ACTIONS} actions are allowed"),
             ParseError::TooManyOptions => write!(f, "at most {MAX_OPTIONS} options are allowed"),
             ParseError::UnbalancedValue(s) => write!(f, "value has unbalanced ~ or (): {s}"),
+            ParseError::NestedTooDeep(s) => write!(f, "a nested source cannot contain another: {s}"),
             ParseError::ValueTooDeep(s) => {
                 write!(f, "value nests groups more than {} deep: {s}", crate::parexp::MAX_DEPTH)
             }
@@ -127,45 +139,7 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
     let source = &url[..cut];
 
     let mut scan = Scan { text: source, at: 0 };
-    if !scan.eat(b'@') {
-        return Err(ParseError::MissingSourcePrefix);
-    }
-    let kind = scan.take_until(b":");
-    if !matches!(kind, "dataset" | "ds") {
-        return Err(ParseError::UnknownSource(kind.to_string()));
-    }
-    if !scan.eat(b':') {
-        return Err(ParseError::EmptySourceValue);
-    }
-
-    let name = scan.take_until(b":,/");
-    if name.is_empty() {
-        return Err(ParseError::EmptySourceValue);
-    }
-    if !is_valid_name(name) {
-        return Err(ParseError::InvalidName(name.to_string()));
-    }
-
-    let mut path = None;
-    if scan.eat(b':') {
-        let value = scan.take_until(b",");
-        if value.is_empty() {
-            return Err(ParseError::EmptySourceValue);
-        }
-        let bounded = match action_at(value, grammar) {
-            Some(at) => &value[..at],
-            None => value,
-        };
-        if bounded.is_empty() {
-            return Err(ParseError::EmptySourceValue);
-        }
-        let trimmed = trim_filename(bounded);
-        scan.rewind(value.len() - trimmed.len());
-        if !is_valid_path(trimmed) {
-            return Err(ParseError::InvalidPath(trimmed.to_string()));
-        }
-        path = Some(trimmed.to_string());
-    }
+    let (name, path) = read_source_prefix(&mut scan, grammar)?;
 
     let (encoding, filters) = read_options(&mut scan, grammar)?;
 
@@ -205,6 +179,18 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
         None => DEFAULT_ENCODING.to_string(),
     };
 
+    let mut nested: Vec<Nested> = Vec::new();
+    let carried = filters
+        .iter()
+        .flat_map(|held| &held.params)
+        .chain(actions.iter().flat_map(|held| &held.segments).flat_map(|held| &held.params));
+    for param in carried.filter(|param| is_nested(param)) {
+        if nested.iter().any(|held| &held.raw == param) {
+            continue;
+        }
+        nested.push(parse_nested(param, grammar)?);
+    }
+
     let mut parsed = ParsedUrl {
         dataset: name.to_string(),
         path,
@@ -213,10 +199,80 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
         actions,
         output: std::sync::Arc::new(crate::formats::GeoJson),
         extension,
+        nested,
     };
     parsed.output = crate::formats::claim(extension, &parsed, grammar)
         .ok_or_else(|| ParseError::UnknownFormat(extension.to_ascii_lowercase()))?;
     Ok(parsed)
+}
+
+fn read_source_prefix(scan: &mut Scan<'_>, grammar: &Grammar) -> Result<(String, Option<String>), ParseError> {
+    if !scan.eat(b'@') {
+        return Err(ParseError::MissingSourcePrefix);
+    }
+    let kind = scan.take_until(b":");
+    if !matches!(kind, "dataset" | "ds") {
+        return Err(ParseError::UnknownSource(kind.to_string()));
+    }
+    if !scan.eat(b':') {
+        return Err(ParseError::EmptySourceValue);
+    }
+    let name = scan.take_until(b":,/");
+    if name.is_empty() {
+        return Err(ParseError::EmptySourceValue);
+    }
+    if !is_valid_name(name) {
+        return Err(ParseError::InvalidName(name.to_string()));
+    }
+    let name = name.to_string();
+    let mut path = None;
+    if scan.eat(b':') {
+        let value = scan.take_until(b",");
+        if value.is_empty() {
+            return Err(ParseError::EmptySourceValue);
+        }
+        let bounded = match action_at(value, grammar) {
+            Some(at) => &value[..at],
+            None => value,
+        };
+        if bounded.is_empty() {
+            return Err(ParseError::EmptySourceValue);
+        }
+        let trimmed = trim_filename(bounded);
+        scan.rewind(value.len() - trimmed.len());
+        if !is_valid_path(trimmed) {
+            return Err(ParseError::InvalidPath(trimmed.to_string()));
+        }
+        path = Some(trimmed.to_string());
+    }
+    Ok((name, path))
+}
+
+fn parse_nested(raw: &str, grammar: &Grammar) -> Result<Nested, ParseError> {
+    let inner = raw.strip_prefix('(').and_then(|held| held.strip_suffix(')')).unwrap_or(raw);
+    let mut scan = Scan { text: inner, at: 0 };
+    let (dataset, path) = read_source_prefix(&mut scan, grammar)?;
+    let (encoding, filters) = read_options(&mut scan, grammar)?;
+    if scan.at < inner.len() {
+        return Err(ParseError::MisplacedOption(inner[scan.at..].to_string()));
+    }
+    if filters.iter().flat_map(|held| &held.params).any(|param| is_nested(param)) {
+        return Err(ParseError::NestedTooDeep(raw.to_string()));
+    }
+    Ok(Nested {
+        raw: raw.to_string(),
+        dataset,
+        path,
+        encoding: match encoding {
+            Some(label) => resolve_encoding(&label).ok_or(ParseError::MalformedEncoding(label))?,
+            None => DEFAULT_ENCODING.to_string(),
+        },
+        filters,
+    })
+}
+
+fn is_nested(param: &str) -> bool {
+    param.starts_with("(@")
 }
 
 fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<String>, Vec<Segment>), ParseError> {
@@ -459,6 +515,7 @@ mod tests {
     }
     use rstest::rstest;
 
+    const CLIP_OPTIONS: &[Opt] = &[opt("against", "ag", &[&[Param::Source]])];
     const TEST_OPTIONS: &[Opt] = &[flag("aa", "a"), flag("bb", ""), opt("val", "", &[&[Param::Value]])];
     const MANY_OPTIONS: &[Opt] = &[
         flag("o0", ""),
@@ -888,6 +945,105 @@ mod tests {
             Err(ParseError::WrongParameterCount(canonical.to_string())),
             "the error quoted the url spelling instead of the canonical name"
         );
+    }
+
+    fn nesting_grammar() -> Grammar {
+        let mut g = Grammar::core();
+        g.register_filter(crate::filters::filter("nest", "nx", &[&[Param::Source]], |_, _| {
+            Ok(sea_query::Expr::cust("1"))
+        }));
+        g
+    }
+
+    #[test]
+    fn a_nested_source_is_parsed_into_its_own_parts() {
+        let p = parse("/@dataset:parcels,nest:(@dataset:flood).geojson", &nesting_grammar()).unwrap();
+        assert_eq!(p.dataset, "parcels");
+        assert_eq!(p.filters.len(), 1);
+        assert_eq!(p.filters[0].params, vec!["(@dataset:flood)"]);
+        assert_eq!(p.nested.len(), 1);
+        assert_eq!(p.nested[0].raw, "(@dataset:flood)");
+        assert_eq!(p.nested[0].dataset, "flood");
+        assert!(p.nested[0].filters.is_empty());
+    }
+
+    #[test]
+    fn a_nested_source_keeps_its_own_filters() {
+        let p = parse("/@dataset:stores,nest:(@dataset:cities,prop:name:London).geojson", &nesting_grammar()).unwrap();
+        assert_eq!(p.nested.len(), 1);
+        assert_eq!(p.nested[0].dataset, "cities");
+        assert_eq!(p.nested[0].filters.len(), 1);
+        assert_eq!(p.nested[0].filters[0].name, "prop");
+        assert_eq!(p.nested[0].filters[0].params, vec!["name", "London"]);
+    }
+
+    #[test]
+    fn a_nested_source_keeps_its_own_encoding_and_path() {
+        let p = parse("/@dataset:a,nest:(@dataset:b:inner.shp,enc:latin1).geojson", &nesting_grammar()).unwrap();
+        assert_eq!(p.nested[0].dataset, "b");
+        assert_eq!(p.nested[0].path.as_deref(), Some("inner.shp"));
+        assert_eq!(p.nested[0].encoding, "ISO-8859-1");
+    }
+
+    #[test]
+    fn the_same_nested_source_twice_is_held_once() {
+        let url = "/@dataset:a,nest:(@dataset:b),nest:(@dataset:b).geojson";
+        let p = parse(url, &nesting_grammar()).unwrap();
+        assert_eq!(p.filters.len(), 2);
+        assert_eq!(p.nested.len(), 1, "the same source was described twice: {:?}", p.nested);
+    }
+
+    #[test]
+    fn two_different_nested_sources_are_both_held() {
+        let p = parse("/@dataset:a,nest:(@dataset:b),nest:(@dataset:c).geojson", &nesting_grammar()).unwrap();
+        assert_eq!(p.nested.len(), 2);
+        assert_eq!(p.nested[0].dataset, "b");
+        assert_eq!(p.nested[1].dataset, "c");
+    }
+
+    #[test]
+    fn a_second_level_of_nesting_is_refused() {
+        let url = "/@dataset:a,nest:(@dataset:b,nest:(@dataset:c)).geojson";
+        assert!(
+            matches!(parse(url, &nesting_grammar()), Err(ParseError::NestedTooDeep(_))),
+            "{:?}",
+            parse(url, &nesting_grammar())
+        );
+    }
+
+    #[test]
+    fn an_action_cannot_hide_inside_a_nested_source() {
+        let url = "/@dataset:a,nest:(@dataset:b/@process/r:3857).geojson";
+        assert!(parse(url, &nesting_grammar()).is_err(), "an action was smuggled into a nested source");
+    }
+
+    #[test]
+    fn an_action_option_can_take_a_nested_source() {
+        let mut g = nesting_grammar();
+        g.register_action(Probe("clip", "cl", CLIP_OPTIONS));
+        let p = parse("/@dataset:parcels/@clip/against:(@dataset:zones,id:7).geojson", &g).unwrap();
+        assert_eq!(p.actions.len(), 1);
+        assert_eq!(p.actions[0].segments[0].params, vec!["(@dataset:zones,id:7)"]);
+        assert_eq!(p.nested.len(), 1, "an action option's nested source was not collected: {:?}", p.nested);
+        assert_eq!(p.nested[0].dataset, "zones");
+        assert_eq!(p.nested[0].filters.len(), 1);
+    }
+
+    #[test]
+    fn a_filter_and_an_action_can_share_one_nested_source() {
+        let mut g = nesting_grammar();
+        g.register_action(Probe("clip", "cl", CLIP_OPTIONS));
+        let url = "/@dataset:parcels,nest:(@dataset:zones)/@clip/against:(@dataset:zones).geojson";
+        let p = parse(url, &g).unwrap();
+        assert_eq!(p.nested.len(), 1, "the shared source was described twice: {:?}", p.nested);
+    }
+
+    #[rstest]
+    #[case("/@dataset:a,nest:plain.geojson")]
+    #[case("/@dataset:a,nest:(notasource).geojson")]
+    fn a_source_parameter_refuses_a_value_that_is_not_one(#[case] url: &str) {
+        let parsed = parse(url, &nesting_grammar()).unwrap();
+        assert!(parsed.nested.is_empty(), "a non-source was parsed as one");
     }
 
     #[rstest]

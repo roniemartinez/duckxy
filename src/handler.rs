@@ -28,14 +28,30 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
 
     let name = dataset.clone();
     let selected = parsed.path.clone();
-    let source = match tokio::task::spawn_blocking(move || root.resolve(&name, selected.as_deref())).await {
-        Ok(Ok(source)) => source,
+    let wanted: Vec<(String, Option<String>, String)> =
+        parsed.nested.iter().map(|held| (held.dataset.clone(), held.path.clone(), held.raw.clone())).collect();
+    let encodings: Vec<String> = parsed.nested.iter().map(|held| held.encoding.clone()).collect();
+    let resolving = tokio::task::spawn_blocking(move || {
+        let source = root.resolve(&name, selected.as_deref())?;
+        let mut nested = Vec::with_capacity(wanted.len());
+        for (dataset, path, raw) in wanted {
+            nested.push((raw, root.resolve(&dataset, path.as_deref())?));
+        }
+        Ok::<_, crate::dataset::ResolveError>((source, nested))
+    });
+    let (source, resolved) = match resolving.await {
+        Ok(Ok(held)) => held,
         Ok(Err(e)) => return resolve_error(e),
         Err(e) => {
             tracing::error!(dataset, error = ?e, "resolve failed");
             return error(StatusCode::INTERNAL_SERVER_ERROR, "dataset lookup failed");
         }
     };
+    let nested: Vec<query::Resolved> = resolved
+        .into_iter()
+        .zip(encodings)
+        .map(|((raw, source), encoding)| query::Resolved { raw, source, encoding })
+        .collect();
 
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), (StatusCode, String)>>();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(CHANNEL_DEPTH);
@@ -49,7 +65,10 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
             &source,
             &encoding,
             output.separator(),
-            |columns, crs| crate::sql::plan(&grammar, &parsed, &source, columns, crs, backend.clone()),
+            nested,
+            |columns, crs, described| {
+                crate::sql::plan(&grammar, &parsed, &source, columns, crs, described, backend.clone())
+            },
             || {
                 if let Some(ready_tx) = ready.take() {
                     let _ = ready_tx.send(Ok(()));

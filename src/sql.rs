@@ -20,6 +20,14 @@ pub struct Pipeline {
     backend: Arc<Backend>,
     side: Vec<(String, String, String)>,
     taken: Vec<String>,
+    nested: Vec<NestedRelation>,
+}
+
+pub struct NestedRelation {
+    pub raw: String,
+    pub relation: Alias,
+    pub geometry: String,
+    pub crs: String,
 }
 
 impl Pipeline {
@@ -49,12 +57,64 @@ impl Pipeline {
             input,
             input_name: "source".to_string(),
             taken: vec!["source".to_string()],
+            nested: Vec::new(),
             steps: Vec::new(),
             geometry,
             crs: crs.unwrap_or(WGS84).to_string(),
             backend,
             side: Vec::new(),
         })
+    }
+
+    pub fn attach(&mut self, grammar: &Grammar, parsed: &ParsedUrl, nested: &[query::Described]) -> anyhow::Result<()> {
+        for (at, held) in nested.iter().enumerate() {
+            let Some(declared) = parsed.nested.iter().find(|source| source.raw == held.raw) else {
+                anyhow::bail!("nested source {:?} was described but not parsed", held.raw);
+            };
+            let geometry = query::geometry_of(&held.columns).ok_or(query::NoGeometry)?.to_string();
+            let name = format!("nested_{}", at + 1);
+            let filtered = !declared.filters.is_empty();
+            let reader = Query::select()
+                .expr(Expr::cust("*"))
+                .from_function(query::read_source(&held.source, &held.encoding), "src")
+                .take();
+            let inner = Alias::new(match filtered {
+                true => format!("{name}_src"),
+                false => name.clone(),
+            });
+            self.ctes.cte(CommonTableExpression::new().query(reader).table_name(inner.clone()).to_owned());
+            let crs = held.crs.clone().unwrap_or_else(|| WGS84.to_string());
+            let held_input = std::mem::replace(&mut self.input, inner.clone());
+            let held_name = std::mem::replace(&mut self.input_name, name.clone());
+            let held_geometry = std::mem::replace(&mut self.geometry, geometry.clone());
+            let held_crs = std::mem::replace(&mut self.crs, crs.clone());
+            let built = {
+                let mut ctx = filters::FilterCtx::new(self, &held.columns);
+                filters::condition(grammar, &mut ctx, &declared.filters)
+            };
+            self.input = held_input;
+            self.input_name = held_name;
+            self.geometry = held_geometry;
+            self.crs = held_crs;
+            let predicate = built?;
+            let relation = match predicate {
+                Some(predicate) => {
+                    let alias = Alias::new(&name);
+                    let select = Query::select().expr(Expr::cust("*")).from(inner).and_where(predicate).take();
+                    self.ctes.cte(CommonTableExpression::new().query(select).table_name(alias.clone()).to_owned());
+                    self.taken.push(format!("{name}_src"));
+                    alias
+                }
+                None => inner,
+            };
+            self.taken.push(name);
+            self.nested.push(NestedRelation { raw: held.raw.clone(), relation, geometry, crs });
+        }
+        Ok(())
+    }
+
+    pub fn nested(&self, raw: &str) -> Option<&NestedRelation> {
+        self.nested.iter().find(|held| held.raw == raw)
     }
 
     pub fn filter(
@@ -192,9 +252,11 @@ pub fn plan(
     source: &str,
     columns: &[(String, String)],
     crs: Option<&str>,
+    nested: &[query::Described],
     backend: Arc<Backend>,
 ) -> anyhow::Result<String> {
     let mut pipeline = Pipeline::source(source, &parsed.encoding, columns, crs, backend)?;
+    pipeline.attach(grammar, parsed, nested)?;
     pipeline.filter(grammar, &parsed.filters, columns)?;
 
     for action in &parsed.actions {
@@ -382,7 +444,83 @@ mod tests {
     fn planned_with(url: &str, grammar: Grammar) -> String {
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse(url, &grammar).unwrap();
-        plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap()
+        plan(&grammar, &parsed, "/x.geojson", &columns, None, &[], backend()).unwrap()
+    }
+
+    fn described(raw: &str, source: &str, crs: Option<&str>) -> query::Described {
+        query::Described {
+            raw: raw.to_string(),
+            source: source.to_string(),
+            encoding: "UTF-8".to_string(),
+            columns: geom_columns(),
+            crs: crs.map(str::to_string),
+        }
+    }
+
+    fn planned_nested(url: &str, crs: Option<&str>, nested: &[query::Described]) -> String {
+        let grammar = Grammar::core();
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        plan(&grammar, &parsed, "/x.geojson", &geom_columns(), crs, nested, backend()).unwrap()
+    }
+
+    #[test]
+    fn a_nested_source_with_no_filters_is_one_cte() {
+        let out = planned_nested(
+            "/@dataset:x,ix:(@dataset:zones).geojson",
+            None,
+            &[described("(@dataset:zones)", "/zones.geojson", None)],
+        );
+        assert!(out.contains("\"nested_1\" AS (SELECT * FROM ST_Read('/zones.geojson'"), "{out}");
+        assert!(!out.contains("nested_1_src"), "an unfiltered nested source built a pass-through cte: {out}");
+        assert!(out.contains("ST_Union_Agg"), "{out}");
+        assert!(out.contains("ST_Intersects"), "{out}");
+    }
+
+    #[test]
+    fn a_nested_source_with_filters_reads_then_filters() {
+        let out = planned_nested(
+            "/@dataset:x,ix:(@dataset:zones,id:7).geojson",
+            None,
+            &[described("(@dataset:zones,id:7)", "/zones.geojson", None)],
+        );
+        assert!(out.contains("\"nested_1_src\" AS (SELECT * FROM ST_Read('/zones.geojson'"), "{out}");
+        assert!(out.contains("\"nested_1\" AS (SELECT * FROM \"nested_1_src\" WHERE \"id\" = (7))"), "{out}");
+    }
+
+    #[test]
+    fn a_nested_source_in_another_crs_is_transformed_into_the_outer_one() {
+        let out = planned_nested(
+            "/@dataset:x,ix:(@dataset:zones).geojson",
+            Some("EPSG:25832"),
+            &[described("(@dataset:zones)", "/zones.geojson", Some("EPSG:3857"))],
+        );
+        assert!(
+            out.contains("ST_Transform(\"nested_1\".\"geom\", 'EPSG:3857', 'EPSG:25832'"),
+            "the nested geometry was not brought into the outer crs: {out}"
+        );
+    }
+
+    #[test]
+    fn a_nested_source_in_the_same_crs_is_not_transformed() {
+        let out = planned_nested(
+            "/@dataset:x,ix:(@dataset:zones).geojson",
+            Some("EPSG:25832"),
+            &[described("(@dataset:zones)", "/zones.geojson", Some("epsg:25832"))],
+        );
+        assert!(!out.contains("ST_Transform(\"nested_1\""), "a same-crs nested source was transformed: {out}");
+    }
+
+    #[test]
+    fn two_nested_sources_get_their_own_relations() {
+        let grammar = Grammar::core();
+        let url = "/@dataset:x,ix:(@dataset:a),ix:(@dataset:b).geojson";
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        let nested = [described("(@dataset:a)", "/a.geojson", None), described("(@dataset:b)", "/b.geojson", None)];
+        let out = plan(&grammar, &parsed, "/x.geojson", &geom_columns(), None, &nested, backend()).unwrap();
+        for name in ["nested_1", "nested_2"] {
+            assert_eq!(out.matches(&format!("\"{name}\" AS")).count(), 1, "{name} is wrong: {out}");
+        }
+        assert!(out.contains("'/a.geojson'") && out.contains("'/b.geojson'"), "{out}");
     }
 
     #[test]
@@ -488,7 +626,7 @@ mod tests {
         let grammar = typed_grammar();
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse("/@dataset:x/@typed/pair:true:banana.json", &grammar).unwrap();
-        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap_err();
+        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, &[], backend()).unwrap_err();
         let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
         assert_eq!(typed.at, 1, "the wrong parameter position was reported");
         assert_eq!(typed.got, "banana");
@@ -499,7 +637,7 @@ mod tests {
         let grammar = test_action_grammar();
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse("/@dataset:x/@test/count.json", &grammar).unwrap();
-        let out = plan(&grammar, &parsed, "/x.geojson", &columns, Some("EPSG:25832"), backend()).unwrap();
+        let out = plan(&grammar, &parsed, "/x.geojson", &columns, Some("EPSG:25832"), &[], backend()).unwrap();
         assert!(out.contains("ST_Transform"), "the output skipped reprojection: {out}");
         assert!(out.find("COUNT(*)") < out.find("ST_Transform"), "the action must see the source crs: {out}");
     }
@@ -516,7 +654,7 @@ mod tests {
         let grammar = typed_grammar();
         let columns = vec![("geom".to_string(), "GEOMETRY".to_string())];
         let parsed = crate::url::parse("/@dataset:x/@typed/flag:banana.json", &grammar).unwrap();
-        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, backend()).unwrap_err();
+        let err = plan(&grammar, &parsed, "/x.geojson", &columns, None, &[], backend()).unwrap_err();
         let typed = err.downcast_ref::<crate::grammar::ParamError>().expect("the kind must survive");
         assert_eq!(typed.expected, crate::grammar::Param::Boolean);
         assert_eq!(typed.got, "banana");
@@ -633,6 +771,7 @@ mod tests {
             "/x.geojson",
             &columns,
             Some("EPSG:25832"),
+            &[],
             backend(),
         )
         .unwrap();
@@ -681,6 +820,7 @@ mod tests {
             "/x.geojson",
             &columns,
             Some("EPSG:4326"),
+            &[],
             backend(),
         )
         .unwrap();
@@ -691,25 +831,34 @@ mod tests {
     #[test]
     fn a_source_without_a_geometry_column_errors_rather_than_panics() {
         let columns = vec![("id".to_string(), "BIGINT".to_string())];
-        let err = plan(&Grammar::core(), &parsed_for("/@dataset:x.geojson"), "/x.geojson", &columns, None, backend())
-            .unwrap_err();
+        let err =
+            plan(&Grammar::core(), &parsed_for("/@dataset:x.geojson"), "/x.geojson", &columns, None, &[], backend())
+                .unwrap_err();
         assert!(err.downcast_ref::<query::NoGeometry>().is_some(), "{err:#}");
     }
 
     #[test]
     fn an_unfiltered_request_adds_no_filter_step() {
         let columns = vec![("name".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let out = plan(&Grammar::core(), &parsed_for("/@dataset:x.geojson"), "/x.geojson", &columns, None, backend())
-            .unwrap();
+        let out =
+            plan(&Grammar::core(), &parsed_for("/@dataset:x.geojson"), "/x.geojson", &columns, None, &[], backend())
+                .unwrap();
         assert!(!out.contains("WHERE"), "an empty filter list added a predicate: {out}");
     }
 
     #[test]
     fn a_filtered_request_is_the_first_numbered_step() {
         let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
-        let out =
-            plan(&Grammar::core(), &parsed_for("/@dataset:x,id:7.geojson"), "/x.geojson", &columns, None, backend())
-                .unwrap();
+        let out = plan(
+            &Grammar::core(),
+            &parsed_for("/@dataset:x,id:7.geojson"),
+            "/x.geojson",
+            &columns,
+            None,
+            &[],
+            backend(),
+        )
+        .unwrap();
         assert!(out.contains("\"step_1\" AS (SELECT * FROM \"source\" WHERE"), "{out}");
         assert!(out.contains("\"id\" = (7)"), "{out}");
     }
