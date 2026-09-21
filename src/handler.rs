@@ -28,18 +28,17 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
 
     let name = dataset.clone();
     let selected = parsed.path.clone();
-    let wanted: Vec<(String, Option<String>, String)> =
-        parsed.nested.iter().map(|held| (held.dataset.clone(), held.path.clone(), held.raw.clone())).collect();
-    let encodings: Vec<String> = parsed.nested.iter().map(|held| held.encoding.clone()).collect();
+    let wanted = parsed.nested.clone();
     let resolving = tokio::task::spawn_blocking(move || {
         let source = root.resolve(&name, selected.as_deref())?;
         let mut nested = Vec::with_capacity(wanted.len());
-        for (dataset, path, raw) in wanted {
-            nested.push((raw, root.resolve(&dataset, path.as_deref())?));
+        for held in wanted {
+            let found = root.resolve(&held.dataset, held.path.as_deref())?;
+            nested.push(query::Resolved { raw: held.raw, source: found, encoding: held.encoding });
         }
         Ok::<_, crate::dataset::ResolveError>((source, nested))
     });
-    let (source, resolved) = match resolving.await {
+    let (source, nested) = match resolving.await {
         Ok(Ok(held)) => held,
         Ok(Err(e)) => return resolve_error(e),
         Err(e) => {
@@ -47,12 +46,6 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
             return error(StatusCode::INTERNAL_SERVER_ERROR, "dataset lookup failed");
         }
     };
-    let nested: Vec<query::Resolved> = resolved
-        .into_iter()
-        .zip(encodings)
-        .map(|((raw, source), encoding)| query::Resolved { raw, source, encoding })
-        .collect();
-
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), (StatusCode, String)>>();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(CHANNEL_DEPTH);
 

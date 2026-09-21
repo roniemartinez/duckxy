@@ -217,7 +217,7 @@ fn intersects(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleEx
         return Err(crate::Fault::bad_request(format!("nested source was not resolved: {raw}")));
     };
     let geometry = Expr::col((held.relation.clone(), Alias::new(held.geometry.as_str())));
-    let shaped = match held.crs.eq_ignore_ascii_case(ctx.crs()) {
+    let shaped = match crate::sql::same_crs(&held.crs, ctx.crs()) {
         true => geometry,
         false => ctx.dialect().transform(geometry, &held.crs, ctx.crs()),
     };

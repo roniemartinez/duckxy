@@ -1,11 +1,12 @@
 use std::fmt;
 
-use crate::grammar::Grammar;
+use crate::grammar::{FromParam, Grammar, Param, Source};
 
 pub const DEFAULT_ENCODING: &str = crate::encodings::UTF8;
 pub const MAX_FILTERS: usize = 50;
 pub const MAX_ACTIONS: usize = 10;
 pub const MAX_OPTIONS: usize = 20;
+pub const MAX_NESTED: usize = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Segment {
@@ -54,6 +55,7 @@ impl PartialEq for ParsedUrl {
             && self.filters == other.filters
             && self.actions == other.actions
             && self.extension == other.extension
+            && self.nested == other.nested
             && self.output.extensions() == other.output.extensions()
     }
 }
@@ -78,6 +80,7 @@ pub enum ParseError {
     MisplacedAction(String),
     TooManyActions,
     TooManyOptions,
+    TooManyNested,
     MalformedEncoding(String),
     MisplacedSourceOption(String),
     OptionTakesOneValue(String),
@@ -114,6 +117,7 @@ impl fmt::Display for ParseError {
             ParseError::TooManyFilters => write!(f, "at most {MAX_FILTERS} filters are allowed"),
             ParseError::TooManyActions => write!(f, "at most {MAX_ACTIONS} actions are allowed"),
             ParseError::TooManyOptions => write!(f, "at most {MAX_OPTIONS} options are allowed"),
+            ParseError::TooManyNested => write!(f, "at most {MAX_NESTED} nested sources are allowed"),
             ParseError::UnbalancedValue(s) => write!(f, "value has unbalanced ~ or (): {s}"),
             ParseError::NestedTooDeep(s) => write!(f, "a nested source cannot contain another: {s}"),
             ParseError::ValueTooDeep(s) => {
@@ -180,15 +184,23 @@ pub fn parse(url: &str, grammar: &Grammar) -> Result<ParsedUrl, ParseError> {
     };
 
     let mut nested: Vec<Nested> = Vec::new();
-    let carried = filters
-        .iter()
-        .flat_map(|held| &held.params)
-        .chain(actions.iter().flat_map(|held| &held.segments).flat_map(|held| &held.params));
-    for param in carried.filter(|param| is_nested(param)) {
-        if nested.iter().any(|held| &held.raw == param) {
+    let carried = filter_sources(&filters, grammar).chain(actions.iter().flat_map(|action| {
+        let def = grammar.action_for(&action.name);
+        action.segments.iter().flat_map(move |held| {
+            sources(
+                held,
+                def.and_then(|def| def.option(&held.name)).and_then(|option| option.shape_for(held.params.len())),
+            )
+        })
+    }));
+    for (raw, inner) in carried {
+        if nested.iter().any(|held| &held.raw == raw) {
             continue;
         }
-        nested.push(parse_nested(param, grammar)?);
+        if nested.len() == MAX_NESTED {
+            return Err(ParseError::TooManyNested);
+        }
+        nested.push(parse_nested(raw, &inner, grammar)?);
     }
 
     let mut parsed = ParsedUrl {
@@ -248,15 +260,14 @@ fn read_source_prefix(scan: &mut Scan<'_>, grammar: &Grammar) -> Result<(String,
     Ok((name, path))
 }
 
-fn parse_nested(raw: &str, grammar: &Grammar) -> Result<Nested, ParseError> {
-    let inner = raw.strip_prefix('(').and_then(|held| held.strip_suffix(')')).unwrap_or(raw);
+fn parse_nested(raw: &str, inner: &str, grammar: &Grammar) -> Result<Nested, ParseError> {
     let mut scan = Scan { text: inner, at: 0 };
     let (dataset, path) = read_source_prefix(&mut scan, grammar)?;
     let (encoding, filters) = read_options(&mut scan, grammar)?;
     if scan.at < inner.len() {
         return Err(ParseError::MisplacedOption(inner[scan.at..].to_string()));
     }
-    if filters.iter().flat_map(|held| &held.params).any(|param| is_nested(param)) {
+    if filter_sources(&filters, grammar).next().is_some() {
         return Err(ParseError::NestedTooDeep(raw.to_string()));
     }
     Ok(Nested {
@@ -271,8 +282,19 @@ fn parse_nested(raw: &str, grammar: &Grammar) -> Result<Nested, ParseError> {
     })
 }
 
-fn is_nested(param: &str) -> bool {
-    param.starts_with("(@")
+fn sources<'a>(held: &'a Segment, shape: Option<&'static [Param]>) -> impl Iterator<Item = (&'a String, String)> {
+    shape
+        .unwrap_or_default()
+        .iter()
+        .zip(&held.params)
+        .filter(|(kind, _)| **kind == Param::Source)
+        .filter_map(|(_, raw)| Source::from_param(raw).map(|Source(inner)| (raw, inner)))
+}
+
+fn filter_sources<'a>(filters: &'a [Segment], grammar: &'a Grammar) -> impl Iterator<Item = (&'a String, String)> {
+    filters
+        .iter()
+        .flat_map(|held| sources(held, grammar.filter_for(&held.name).and_then(|def| def.shape_for(held.params.len()))))
 }
 
 fn read_options<'a>(scan: &mut Scan<'a>, grammar: &Grammar) -> Result<(Option<String>, Vec<Segment>), ParseError> {
@@ -1002,6 +1024,36 @@ mod tests {
     }
 
     #[test]
+    fn urls_that_differ_only_in_their_nested_sources_are_not_equal() {
+        let parsed = parse("/@dataset:a,nest:(@dataset:b).geojson", &nesting_grammar()).unwrap();
+        let mut emptied = parsed.clone();
+        emptied.nested.clear();
+        assert_ne!(parsed, emptied);
+    }
+
+    fn nesting(sources: impl Iterator<Item = usize>) -> String {
+        let filters: String = sources.map(|at| format!(",nest:(@dataset:d{at})")).collect();
+        format!("/@dataset:a{filters}.geojson")
+    }
+
+    #[test]
+    fn nested_sources_up_to_the_limit_are_held() {
+        let parsed = parse(&nesting(0..MAX_NESTED), &nesting_grammar()).unwrap();
+        assert_eq!(parsed.nested.len(), MAX_NESTED);
+    }
+
+    #[test]
+    fn one_nested_source_past_the_limit_is_refused() {
+        assert_eq!(parse(&nesting(0..MAX_NESTED + 1), &nesting_grammar()), Err(ParseError::TooManyNested));
+    }
+
+    #[test]
+    fn a_repeated_nested_source_does_not_count_towards_the_limit() {
+        let url = nesting((0..MAX_NESTED).chain(0..MAX_NESTED));
+        assert_eq!(parse(&url, &nesting_grammar()).unwrap().nested.len(), MAX_NESTED);
+    }
+
+    #[test]
     fn a_second_level_of_nesting_is_refused() {
         let url = "/@dataset:a,nest:(@dataset:b,nest:(@dataset:c)).geojson";
         assert!(
@@ -1041,9 +1093,38 @@ mod tests {
     #[rstest]
     #[case("/@dataset:a,nest:plain.geojson")]
     #[case("/@dataset:a,nest:(notasource).geojson")]
+    #[case("/@dataset:a,nest:(@dataset:b)x.geojson")]
     fn a_source_parameter_refuses_a_value_that_is_not_one(#[case] url: &str) {
         let parsed = parse(url, &nesting_grammar()).unwrap();
         assert!(parsed.nested.is_empty(), "a non-source was parsed as one");
+    }
+
+    #[rstest]
+    #[case("/@dataset:a,prop:name:(@dataset:b).geojson")]
+    #[case("/@dataset:a,prop:name:(@home).geojson")]
+    #[case("/@dataset:a,prop:name:eq:(@dataset:b,bogus:1).geojson")]
+    #[case("/@dataset:a/@probe/val:(@dataset:b).geojson")]
+    fn a_value_that_resembles_a_source_stays_a_value(#[case] url: &str) {
+        let mut g = nesting_grammar();
+        g.register_action(Probe("probe", "", TEST_OPTIONS));
+        let parsed = parse(url, &g).unwrap();
+        assert!(parsed.nested.is_empty(), "a plain value was collected as a source: {:?}", parsed.nested);
+    }
+
+    #[test]
+    fn a_lookalike_value_inside_a_nested_source_is_not_a_second_level() {
+        let url = "/@dataset:a,nest:(@dataset:b,prop:name:(@home)).geojson";
+        let parsed = parse(url, &nesting_grammar()).unwrap();
+        assert_eq!(parsed.nested.len(), 1, "{:?}", parsed.nested);
+        assert_eq!(parsed.nested[0].filters[0].params, vec!["name", "(@home)"]);
+    }
+
+    #[test]
+    fn a_source_beside_a_lookalike_value_is_the_only_one_held() {
+        let url = "/@dataset:a,prop:name:(@dataset:b),nest:(@dataset:c).geojson";
+        let parsed = parse(url, &nesting_grammar()).unwrap();
+        assert_eq!(parsed.nested.len(), 1, "{:?}", parsed.nested);
+        assert_eq!(parsed.nested[0].dataset, "c");
     }
 
     #[rstest]

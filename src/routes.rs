@@ -271,6 +271,7 @@ mod tests {
     #[case("/@dataset:pts,enc:utf-8,prop:name:alpha.geojson", vec!["alpha"])]
     #[case("/@dataset:pts,id:1,prop:name:alpha.geojson", vec!["alpha"])]
     #[case("/@dataset:pts,prop:name:~alpha~.geojson", vec!["alpha"])]
+    #[case("/@dataset:pts,prop:name:ne:(@dataset:nosuch).geojson", vec!["alpha", "beta"])]
     #[tokio::test]
     async fn a_prop_filter_returns_exactly_the_matching_features(#[case] path: &str, #[case] expected: Vec<&str>) {
         let s = state("prop", false);
@@ -331,6 +332,12 @@ mod tests {
     #[case("/@dataset:pts,id:1:2.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:~1,enc:latin1.geojson", StatusCode::BAD_REQUEST)]
     #[case("/@dataset:pts,id:1,enc:utf-8.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,ix:plain.geojson", StatusCode::BAD_REQUEST)]
+    #[case("/@dataset:pts,ix:(@dataset:pts)x.geojson", StatusCode::BAD_REQUEST)]
+    #[case(
+        "/@dataset:pts,ix:(@dataset:d0),ix:(@dataset:d1),ix:(@dataset:d2),ix:(@dataset:d3),ix:(@dataset:d4),ix:(@dataset:d5),ix:(@dataset:d6),ix:(@dataset:d7),ix:(@dataset:d8),ix:(@dataset:d9),ix:(@dataset:d10).geojson",
+        StatusCode::BAD_REQUEST
+    )]
     #[tokio::test]
     async fn bad_filters_are_client_errors(#[case] path: &str, #[case] expected: StatusCode) {
         let s = state("filter-err", false);

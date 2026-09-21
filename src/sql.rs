@@ -144,7 +144,7 @@ impl Pipeline {
     }
 
     fn is_wgs84(&self) -> bool {
-        matches!(self.crs.to_uppercase().as_str(), "EPSG:4326" | "OGC:CRS84" | "CRS84")
+        is_wgs84(&self.crs)
     }
 
     pub fn crs(&self) -> &str {
@@ -156,7 +156,7 @@ impl Pipeline {
     }
 
     pub fn transform(&self, target: &str) -> SimpleExpr {
-        if self.crs.eq_ignore_ascii_case(target) {
+        if same_crs(&self.crs, target) {
             return Expr::col(Alias::new(&self.geometry));
         }
         self.backend.dialect().transform(Expr::col(Alias::new(&self.geometry)), &self.crs, target)
@@ -244,6 +244,14 @@ impl Pipeline {
     pub fn finish(self, select: SelectStatement) -> String {
         select.with(self.ctes).to_string(PostgresQueryBuilder)
     }
+}
+
+fn is_wgs84(crs: &str) -> bool {
+    matches!(crs.to_uppercase().as_str(), "EPSG:4326" | "OGC:CRS84" | "CRS84")
+}
+
+pub fn same_crs(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right) || (is_wgs84(left) && is_wgs84(right))
 }
 
 pub fn plan(
@@ -500,12 +508,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_nested_source_in_the_same_crs_is_not_transformed() {
+    #[rstest]
+    #[case(Some("EPSG:25832"), Some("epsg:25832"))]
+    #[case(Some("EPSG:4326"), Some("OGC:CRS84"))]
+    #[case(Some("CRS84"), Some("epsg:4326"))]
+    #[case(None, Some("OGC:CRS84"))]
+    #[case(Some("OGC:CRS84"), None)]
+    fn a_nested_source_in_the_same_crs_is_not_transformed(#[case] outer: Option<&str>, #[case] inner: Option<&str>) {
         let out = planned_nested(
             "/@dataset:x,ix:(@dataset:zones).geojson",
-            Some("EPSG:25832"),
-            &[described("(@dataset:zones)", "/zones.geojson", Some("epsg:25832"))],
+            outer,
+            &[described("(@dataset:zones)", "/zones.geojson", inner)],
         );
         assert!(!out.contains("ST_Transform(\"nested_1\""), "a same-crs nested source was transformed: {out}");
     }
@@ -792,6 +805,16 @@ mod tests {
         assert_eq!(p.crs(), "EPSG:25832");
         assert!(rendered_expr(p.transform("EPSG:4326")).contains("ST_Transform"), "a real reprojection must wrap");
         assert_eq!(rendered_expr(p.transform("epsg:25832")), "\"geom\"", "a same-crs transform must not wrap");
+    }
+
+    #[rstest]
+    #[case(Some("OGC:CRS84"), "EPSG:4326")]
+    #[case(Some("EPSG:4326"), "crs84")]
+    #[case(None, "OGC:CRS84")]
+    fn a_transform_between_wgs84_spellings_is_a_bare_column(#[case] held: Option<&str>, #[case] target: &str) {
+        let columns = geom_columns();
+        let p = Pipeline::source("/x.geojson", "UTF-8", &columns, held, backend()).unwrap();
+        assert_eq!(rendered_expr(p.transform(target)), "\"geom\"", "an identity reprojection was emitted");
     }
 
     #[test]
