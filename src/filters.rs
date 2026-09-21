@@ -12,6 +12,7 @@ const BOOLEAN: &[&[Param]] = &[&[Param::Boolean]];
 const ID_SHAPE: &[&[Param]] = &[&[Param::Value], &[Param::Operator, Param::Value]];
 const PROP_SHAPE: &[&[Param]] = &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]];
 const TYPE_SHAPE: &[&[Param]] = &[&[Param::GeometryType]];
+const SOURCE: &[&[Param]] = &[&[Param::Source]];
 
 pub const CORE: &[FilterDef] = &[
     filter("id", "", ID_SHAPE, id),
@@ -21,6 +22,7 @@ pub const CORE: &[FilterDef] = &[
     filter("empty", "em", BOOLEAN, empty),
     filter("simple", "si", BOOLEAN, simple),
     filter("closed", "cl", BOOLEAN, closed),
+    filter("intersects", "ix", SOURCE, intersects),
 ];
 
 #[derive(Debug, PartialEq)]
@@ -108,6 +110,10 @@ impl<'a> FilterCtx<'a> {
 
     pub fn has(&self, name: &str) -> bool {
         self.pipeline.backend().has(name)
+    }
+
+    pub fn nested(&self, raw: &str) -> Option<&crate::sql::NestedRelation> {
+        self.pipeline.nested(raw)
     }
 
     pub fn cte_once(&mut self, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
@@ -203,6 +209,22 @@ fn empty(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
 
 fn simple(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
     Ok(predicate("ST_IsSimple", ctx).eq(boolean(only("simple", params)?)?))
+}
+
+fn intersects(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    let raw = only("intersects", params)?;
+    let Some(held) = ctx.nested(raw) else {
+        return Err(crate::Fault::bad_request(format!("nested source was not resolved: {raw}")));
+    };
+    let geometry = Expr::col((held.relation.clone(), Alias::new(held.geometry.as_str())));
+    let shaped = match crate::sql::same_crs(&held.crs, ctx.crs()) {
+        true => geometry,
+        false => ctx.dialect().transform(geometry, &held.crs, ctx.crs()),
+    };
+    let relation = held.relation.clone();
+    let gathered = Query::select().expr(Func::cust("ST_Union_Agg").arg(shaped)).from(relation).take();
+    let subquery = SimpleExpr::SubQuery(None, Box::new(sea_query::SubQueryStatement::SelectStatement(gathered)));
+    Ok(Func::cust("ST_Intersects").arg(ctx.geom()).arg(subquery).into())
 }
 
 fn closed(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
@@ -378,12 +400,13 @@ mod tests {
             for shape in def.shapes {
                 let params = shape.iter().map(|kind| sample(*kind).to_string()).collect();
                 let segment = Segment { name: def.name.to_string(), params };
-                let outcome = held(&[segment], &columns);
-                assert!(
-                    !matches!(outcome, Err(FilterError::UnknownFilter(_))),
-                    "{:?} is registered but condition cannot execute it",
-                    def.name
-                );
+                let outcome = raw_held(&[segment], &columns);
+                let unknown = outcome
+                    .as_ref()
+                    .err()
+                    .and_then(|e| e.downcast_ref::<FilterError>())
+                    .is_some_and(|held| matches!(held, FilterError::UnknownFilter(_)));
+                assert!(!unknown, "{:?} is registered but condition cannot execute it", def.name);
             }
         }
     }
@@ -403,11 +426,14 @@ mod tests {
         crate::sql::Pipeline::source("/x.geojson", "UTF-8", cols, None, backend).unwrap()
     }
 
-    fn held(filters: &[Segment], cols: &[(String, String)]) -> Result<Option<SimpleExpr>, FilterError> {
+    fn raw_held(filters: &[Segment], cols: &[(String, String)]) -> anyhow::Result<Option<SimpleExpr>> {
         let mut pipeline = pipeline_for(cols);
         let mut ctx = FilterCtx::new(&mut pipeline, cols);
         crate::filters::condition(&crate::grammar::Grammar::core(), &mut ctx, filters)
-            .map_err(|e| e.downcast::<FilterError>().expect("a core filter reports a FilterError"))
+    }
+
+    fn held(filters: &[Segment], cols: &[(String, String)]) -> Result<Option<SimpleExpr>, FilterError> {
+        raw_held(filters, cols).map_err(|e| e.downcast::<FilterError>().expect("a core filter reports a FilterError"))
     }
 
     fn sample(kind: Param) -> &'static str {
@@ -417,6 +443,7 @@ mod tests {
             Param::Token => "3857",
             Param::Boolean => "true",
             Param::GeometryType => "POINT",
+            Param::Source => "(@dataset:x)",
         }
     }
 
