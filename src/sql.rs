@@ -16,6 +16,7 @@ pub struct Pipeline {
     input_name: String,
     steps: Vec<(String, usize)>,
     geometry: String,
+    columns: Vec<(String, String)>,
     crs: String,
     backend: Arc<Backend>,
     side: Vec<(String, String, String)>,
@@ -60,6 +61,7 @@ impl Pipeline {
             nested: Vec::new(),
             steps: Vec::new(),
             geometry,
+            columns: columns.to_vec(),
             crs: crs.unwrap_or(WGS84).to_string(),
             backend,
             side: Vec::new(),
@@ -219,6 +221,10 @@ impl Pipeline {
 
     pub fn geometry(&self) -> &str {
         &self.geometry
+    }
+
+    pub fn columns(&self) -> &[(String, String)] {
+        &self.columns
     }
 
     pub fn replace_geometry(&mut self, prefix: &str, geometry: SimpleExpr) {
@@ -537,6 +543,24 @@ mod tests {
     }
 
     #[test]
+    fn the_feature_properties_name_the_source_columns() {
+        let out = planned("/@dataset:x.geojson");
+        assert!(out.contains("'properties', json_object('id', \"id\")"), "{out}");
+        assert!(!out.contains("to_json("), "the properties went back to serialising the whole row: {out}");
+        assert!(!out.contains("json_merge_patch"), "{out}");
+    }
+
+    #[test]
+    fn a_column_an_action_added_is_not_a_feature_property() {
+        let out = planned("/@dataset:x/@test/count.geojson");
+        assert!(out.contains("COUNT(*) AS \"count\""), "the action did not add its column: {out}");
+        assert!(
+            out.contains("'properties', json_object('id', \"id\")"),
+            "properties must name the source columns only: {out}"
+        );
+    }
+
+    #[test]
     fn a_step_counter_is_kept_per_prefix() {
         let columns = geom_columns();
         let mut p = Pipeline::source("/x.geojson", "UTF-8", &columns, None, backend()).unwrap();
@@ -794,7 +818,6 @@ mod tests {
             out.contains("\"out_1\" AS (SELECT * REPLACE (ST_AsGeoJSON("),
             "the output did not namespace its step: {out}"
         );
-        assert!(out.contains("to_json(\"out_1\")"), "the feature select read the wrong cte: {out}");
         assert!(out.trim_end().ends_with("FROM \"out_1\""), "the feature select read the wrong cte: {out}");
     }
 

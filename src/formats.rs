@@ -75,6 +75,11 @@ impl Output for GeoJson {
 
     fn rows(&self, ctx: &mut StageCtx, _parsed: &ParsedUrl) -> anyhow::Result<SelectStatement> {
         let geometry = ctx.geometry().to_string();
+        let mut properties: Vec<sea_query::SimpleExpr> = Vec::new();
+        for (name, _) in ctx.columns().iter().filter(|(name, _)| name != &geometry) {
+            properties.push(Expr::val(name.as_str()));
+            properties.push(Expr::col(Alias::new(name.as_str())));
+        }
         let encoded = ctx.dialect().as_geojson(Expr::col(Alias::new(&geometry)));
         ctx.replace_geometry(encoded);
         let data = ctx.data();
@@ -84,10 +89,7 @@ impl Output for GeoJson {
                     Expr::val("type"),
                     Expr::val("Feature"),
                     Expr::val("properties"),
-                    Func::cust("json_merge_patch")
-                        .arg(Func::cust("to_json").arg(Expr::col(data.clone())))
-                        .arg(Func::cust("json_object").args([Expr::val(&geometry), Expr::cust("NULL")]))
-                        .into(),
+                    Func::cust("json_object").args(properties).into(),
                     Expr::val("geometry"),
                     Func::cast_as(Expr::col(Alias::new(&geometry)), "JSON").into(),
                 ]),

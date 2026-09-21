@@ -138,6 +138,10 @@ impl<'a> StageCtx<'a> {
         self.pipeline.geometry()
     }
 
+    pub fn columns(&self) -> &[(String, String)] {
+        self.pipeline.columns()
+    }
+
     pub fn crs(&self) -> &str {
         self.pipeline.crs()
     }
