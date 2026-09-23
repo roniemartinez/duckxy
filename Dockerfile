@@ -40,7 +40,7 @@ COPY favicon.ico ./
 
 RUN cargo build --release
 
-FROM debian:13.6-slim AS final
+FROM debian:13.7-slim AS final
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
