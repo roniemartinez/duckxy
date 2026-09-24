@@ -137,26 +137,37 @@ fn read_crs(conn: &Connection, source: &str) -> Option<String> {
     })
 }
 
-struct TempFile(std::path::PathBuf);
+struct TempFile {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
 
 impl TempFile {
-    fn new(extension: &str) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let at = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        TempFile(std::env::temp_dir().join(format!("duckxy-{}-{at:x}.{extension}", std::process::id())))
+    fn new(extension: &str) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!("duckxy-{}-{:x}", std::process::id(), nonce()));
+        let mut building = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut building, 0o700);
+        building.create(&dir).with_context(|| format!("make a private directory at {}", dir.display()))?;
+        let file = dir.join(format!("out.{extension}"));
+        Ok(TempFile { dir, file })
     }
+}
+
+fn nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut held = std::collections::hash_map::RandomState::new().build_hasher();
+    held.write_u64(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    held.finish()
 }
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let removed = match self.0.is_dir() {
-            true => std::fs::remove_dir_all(&self.0),
-            false => std::fs::remove_file(&self.0),
-        };
-        match removed {
+        match std::fs::remove_dir_all(&self.dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(error = ?e, file = %self.0.display(), "could not remove the temporary response"),
+            Err(e) => tracing::warn!(error = ?e, dir = %self.dir.display(), "could not remove the temporary response"),
         }
     }
 }
@@ -182,6 +193,64 @@ fn copy_statement(inner: &str, file: &std::path::Path, target: &Target<'_>) -> S
     copy
 }
 
+const DEFAULT_EXPORT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn export_limit() -> u64 {
+    let Ok(value) = std::env::var("DUCKXY_MAX_EXPORT_BYTES") else {
+        return DEFAULT_EXPORT_LIMIT;
+    };
+    parse_bytes(value.trim()).unwrap_or_else(|| {
+        tracing::warn!(value, "ignoring an unusable export limit, keeping the default");
+        DEFAULT_EXPORT_LIMIT
+    })
+}
+
+fn parse_bytes(value: &str) -> Option<u64> {
+    let digits = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let scale = match value[digits.len()..].to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "KB" | "KIB" => 1024,
+        "MB" | "MIB" => 1024 * 1024,
+        "GB" | "GIB" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    digits.parse::<u64>().ok().filter(|n| *n > 0)?.checked_mul(scale)
+}
+
+fn copy_bounded(conn: &Connection, statement: &str, file: &std::path::Path, limit: u64) -> Result<()> {
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let interrupt = conn.interrupt_handle();
+    let watched = file.to_path_buf();
+    let watching = std::thread::spawn(move || {
+        while stopped.recv_timeout(WATCH_EVERY) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            if std::fs::metadata(&watched).is_ok_and(|held| held.len() > limit) {
+                interrupt.interrupt();
+                return true;
+            }
+        }
+        false
+    });
+    let written = conn.execute_batch(statement).context("write the response with gdal");
+    drop(stop);
+    let stopped = watching.join().unwrap_or_else(|_| {
+        tracing::warn!("the export watcher panicked, falling back to the size of the finished file");
+        false
+    });
+    if !stopped {
+        written?;
+        let size = std::fs::metadata(file).map(|held| held.len()).unwrap_or(0);
+        if size <= limit {
+            return Ok(());
+        }
+    }
+    Err(crate::Fault::new(
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        format!("the response passed the {limit} byte export limit; narrow it with a filter"),
+    )
+    .into())
+}
+
 pub fn write_with_driver(
     source: &str,
     encoding: &str,
@@ -191,23 +260,24 @@ pub fn write_with_driver(
     on_ready: impl FnOnce(),
     sink: &mut dyn FnMut(Vec<u8>) -> bool,
 ) -> Result<()> {
-    let file = TempFile::new(target.driver.file);
+    let held = TempFile::new(target.driver.file)?;
+    let file = &held.file;
     with_connection(|conn| {
         let columns = describe(conn, source, encoding)?;
         geometry_of(&columns).ok_or(NoGeometry)?;
         let crs = read_crs(conn, source);
         let described = describe_nested(conn, nested)?;
         let inner = sql_for(&columns, crs.as_deref(), &described)?;
-        conn.execute_batch(&copy_statement(&inner, &file.0, &target)).context("write the response with gdal")
+        copy_bounded(conn, &copy_statement(&inner, file, &target), file, export_limit())
     })?;
 
-    if file.0.is_dir() {
+    if file.is_dir() {
         anyhow::bail!(
             "the {} driver wrote a dataset of several files, which cannot be served alone",
             target.driver.name
         );
     }
-    let mut reading = std::fs::File::open(&file.0).context("open the written response")?;
+    let mut reading = std::fs::File::open(file).context("open the written response")?;
     on_ready();
     let mut buf = vec![0u8; CHUNK_BYTES];
     loop {
@@ -440,6 +510,77 @@ mod tests {
         let target = Target { driver, layer: "x" };
         let held = copy_statement("SELECT 1", std::path::Path::new("/tmp/x.fgb"), &target);
         assert_eq!(held, "COPY (SELECT 1) TO '/tmp/x.fgb' WITH (FORMAT GDAL, DRIVER 'FlatGeobuf', LAYER_NAME 'x')");
+    }
+
+    #[test]
+    fn a_temporary_response_lives_in_a_private_directory() {
+        let held = TempFile::new("kml").unwrap();
+        let shared = std::env::temp_dir();
+        assert_eq!(held.file.parent(), Some(held.dir.as_path()));
+        assert_ne!(held.file.parent(), Some(shared.as_path()), "anyone on the host could plant this path");
+        #[cfg(unix)]
+        {
+            let allowed = fs::metadata(&held.dir).unwrap().permissions();
+            let mode = std::os::unix::fs::PermissionsExt::mode(&allowed);
+            assert_eq!(mode & 0o777, 0o700, "the temporary directory is not private: {mode:o}");
+        }
+        let dir = held.dir.clone();
+        drop(held);
+        assert!(!dir.exists(), "the temporary directory outlived the response");
+    }
+
+    #[test]
+    fn two_temporary_responses_do_not_share_a_directory() {
+        let a = TempFile::new("kml").unwrap();
+        let b = TempFile::new("kml").unwrap();
+        assert_ne!(a.dir, b.dir);
+        assert!(a.dir.exists() && b.dir.exists());
+    }
+
+    #[rstest::rstest]
+    #[case("512", 512)]
+    #[case("64KB", 64 * 1024)]
+    #[case("2mb", 2 * 1024 * 1024)]
+    #[case("1GiB", 1024 * 1024 * 1024)]
+    fn an_export_limit_reads_its_unit(#[case] value: &str, #[case] bytes: u64) {
+        assert_eq!(parse_bytes(value), Some(bytes));
+    }
+
+    #[rstest::rstest]
+    #[case("")]
+    #[case("0")]
+    #[case("-1")]
+    #[case("2PB")]
+    #[case("banana")]
+    #[case("1.5GB")]
+    fn an_unusable_export_limit_is_refused(#[case] value: &str) {
+        assert_eq!(parse_bytes(value), None);
+    }
+
+    #[test]
+    fn an_export_past_the_limit_is_refused_and_the_connection_survives() {
+        crate::ensure_spatial();
+        let held = TempFile::new("fgb").unwrap();
+        let big = format!(
+            "COPY (SELECT ST_Point(i, i) AS geom FROM range(4000000) t(i)) TO '{}' \
+             WITH (FORMAT GDAL, DRIVER 'FlatGeobuf', LAYER_NAME 'big', LAYER_CREATION_OPTIONS ('SPATIAL_INDEX=NO'))",
+            held.file.display()
+        );
+        let err = with_connection(|conn| copy_bounded(conn, &big, &held.file, 256 * 1024)).unwrap_err();
+        let fault = err.downcast_ref::<crate::Fault>().unwrap_or_else(|| panic!("{err:#}"));
+        assert_eq!(fault.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(fault.message.contains("narrow it"), "{}", fault.message);
+        let written = fs::metadata(&held.file).map(|held| held.len()).unwrap_or(0);
+        assert!(written < 64 * 1024 * 1024, "the write ran on past the limit: {written} bytes");
+
+        let after = TempFile::new("fgb").unwrap();
+        let small = format!(
+            "COPY (SELECT ST_Point(1, 2) AS geom) TO '{}' WITH (FORMAT GDAL, DRIVER 'FlatGeobuf', LAYER_NAME 'small')",
+            after.file.display()
+        );
+        with_connection(|conn| copy_bounded(conn, &small, &after.file, DEFAULT_EXPORT_LIMIT))
+            .expect("the connection did not survive the interrupt");
+        assert!(after.file.exists(), "the export after the refusal wrote nothing");
     }
 
     #[test]
