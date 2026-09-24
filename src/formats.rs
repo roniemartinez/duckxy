@@ -30,6 +30,17 @@ pub trait Output: Send + Sync {
     fn requires_wgs84(&self) -> bool {
         false
     }
+
+    fn driver(&self) -> Option<Driver> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Driver {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub options: &'static [&'static str],
 }
 
 impl std::fmt::Debug for dyn Output {
@@ -99,6 +110,53 @@ impl Output for GeoJson {
             .take())
     }
 }
+
+pub struct Gdal {
+    pub extensions: &'static [&'static str],
+    pub content_type: &'static str,
+    pub driver: Driver,
+}
+
+impl Output for Gdal {
+    fn extensions(&self) -> &'static [&'static str] {
+        self.extensions
+    }
+
+    fn content_type(&self) -> &'static str {
+        self.content_type
+    }
+
+    fn requires_wgs84(&self) -> bool {
+        true
+    }
+
+    fn driver(&self) -> Option<Driver> {
+        Some(self.driver)
+    }
+
+    fn rows(&self, ctx: &mut StageCtx, _parsed: &ParsedUrl) -> anyhow::Result<SelectStatement> {
+        let geometry = ctx.geometry().to_string();
+        let mut select = Query::select();
+        for (name, _) in ctx.columns().iter().filter(|(name, _)| name != &geometry) {
+            select.expr(Expr::col(Alias::new(name.as_str())));
+        }
+        select.expr(Expr::col(Alias::new(geometry.as_str())));
+        let data = ctx.data();
+        Ok(select.from(data).take())
+    }
+}
+
+pub const KML: Gdal = Gdal {
+    extensions: &["kml"],
+    content_type: "application/vnd.google-earth.kml+xml",
+    driver: Driver { name: "KML", file: "kml", options: &[] },
+};
+
+pub const FLATGEOBUF: Gdal = Gdal {
+    extensions: &["fgb"],
+    content_type: "application/octet-stream",
+    driver: Driver { name: "FlatGeobuf", file: "fgb", options: &[] },
+};
 
 pub fn split(segment: &str, grammar: &Grammar) -> Option<(usize, &'static str)> {
     let lower = segment.to_ascii_lowercase();

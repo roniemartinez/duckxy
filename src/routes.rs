@@ -71,6 +71,35 @@ mod tests {
     const NO_ID: &str = r#"{"type":"FeatureCollection","features":[
         {"type":"Feature","properties":{"name":"alpha"},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
 
+    const FLAT: &str = r#"[{"id":1,"name":"alpha"},{"id":2,"name":"beta"}]"#;
+
+    const SEQ: crate::formats::Gdal = crate::formats::Gdal {
+        extensions: &["geojsonl", "geojsonseq"],
+        content_type: "application/geo+json-seq",
+        driver: crate::formats::Driver { name: "GeoJSONSeq", file: "geojsonl", options: &["RS=YES"] },
+    };
+
+    const SEQ_PLAIN: crate::formats::Gdal = crate::formats::Gdal {
+        extensions: &["geojsonl"],
+        content_type: "application/geo+json-seq",
+        driver: crate::formats::Driver { name: "GeoJSONSeq", file: "geojsonl", options: &[] },
+    };
+
+    const UNINDEXED: crate::formats::Gdal = crate::formats::Gdal {
+        extensions: &["binary"],
+        content_type: "application/octet-stream",
+        driver: crate::formats::Driver { name: "FlatGeobuf", file: "fgb", options: &["SPATIAL_INDEX=NO"] },
+    };
+
+    const SPREAD: crate::formats::Gdal = crate::formats::Gdal {
+        extensions: &["spread"],
+        content_type: "application/octet-stream",
+        driver: crate::formats::Driver { name: "FlatGeobuf", file: "spread", options: &[] },
+    };
+
+    static DRIVERS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     struct Probe;
 
     impl crate::grammar::Action for Probe {
@@ -125,6 +154,7 @@ mod tests {
         fs::write(dir.join("pts.geojson"), POINTS).unwrap();
         fs::write(dir.join("noid.geojson"), NO_ID).unwrap();
         fs::write(dir.join("shapes.geojson"), SHAPES).unwrap();
+        fs::write(dir.join("attrs.json"), FLAT).unwrap();
         AppState::new(
             DatasetRoot::new(dir),
             Auth::new(Some(KEY), allow_insecure).unwrap(),
@@ -137,6 +167,121 @@ mod tests {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn fetch(state: AppState, uri: &str) -> (StatusCode, String, Vec<u8>) {
+        let response = router(state).oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let status = response.status();
+        let kind = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|held| held.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = response.into_body().collect().await.unwrap().to_bytes().to_vec();
+        (status, kind, body)
+    }
+
+    fn strays() -> Vec<std::path::PathBuf> {
+        let dir = std::env::temp_dir();
+        let prefix = format!("duckxy-{}-", std::process::id());
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|held| held.ok())
+                    .map(|held| held.path())
+                    .filter(|path| path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_driver_output_serves_a_whole_file() {
+        let _serial = DRIVERS.lock().await;
+        let s = state("kml", true);
+        let (status, kind, body) = fetch(s.clone(), &signed(&s, "/@dataset:pts.kml")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kind, "application/vnd.google-earth.kml+xml");
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.starts_with("<?xml"), "{text}");
+        assert!(text.contains("<kml") && text.contains("</kml>"), "{text}");
+        assert!(text.contains("<Placemark>"), "{text}");
+        assert!(text.contains("alpha"), "the feature attributes are missing: {text}");
+        assert!(text.contains("<name>pts</name>"), "the layer is not named after the dataset: {text}");
+        assert!(!text.contains("duckxy-"), "the temporary file name reached the response: {text}");
+        assert!(strays().is_empty(), "the response left a temporary file behind: {:?}", strays());
+    }
+
+    #[tokio::test]
+    async fn a_binary_driver_output_keeps_its_own_bytes() {
+        let _serial = DRIVERS.lock().await;
+        let s = state("fgb", true);
+        let (status, kind, body) = fetch(s.clone(), &signed(&s, "/@dataset:pts.fgb")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kind, "application/octet-stream");
+        assert!(body.len() > 8, "the body is too small to be a flatgeobuf: {}", body.len());
+        assert_eq!(&body[..8], b"fgb\x03fgb\x01", "missing the flatgeobuf magic: {:?}", &body[..8]);
+        assert!(strays().is_empty(), "the response left a temporary file behind: {:?}", strays());
+    }
+
+    fn state_with(tag: &str, output: crate::formats::Gdal) -> AppState {
+        let base = state(tag, true);
+        let mut grammar = crate::grammar::Grammar::core();
+        grammar.register_output(output);
+        AppState::new(base.root.clone(), base.auth.clone(), grammar)
+    }
+
+    #[tokio::test]
+    async fn a_registered_driver_output_carries_its_layer_options() {
+        let _serial = DRIVERS.lock().await;
+        let plain = state_with("seqplain", SEQ_PLAIN);
+        let (plain_status, _, without) = fetch(plain.clone(), &signed(&plain, "/@dataset:pts.geojsonl")).await;
+        let s = state_with("seqrs", SEQ);
+        let (status, _, with) = fetch(s.clone(), &signed(&s, "/@dataset:pts.geojsonl")).await;
+        assert_eq!((plain_status, status), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(without.first(), Some(&b'{'), "{}", String::from_utf8_lossy(&without));
+        assert_eq!(with.first(), Some(&0x1e), "the RS layer option never reached the driver");
+        assert!(strays().is_empty(), "the response left a temporary file behind: {:?}", strays());
+    }
+
+    #[tokio::test]
+    async fn a_driver_output_writes_the_file_its_driver_expects() {
+        let _serial = DRIVERS.lock().await;
+        let s = state_with("seqspelling", SEQ);
+        let (canonical, _, first) = fetch(s.clone(), &signed(&s, "/@dataset:pts.geojsonl")).await;
+        let (spelled, _, second) = fetch(s.clone(), &signed(&s, "/@dataset:pts.geojsonseq")).await;
+        assert_eq!(canonical, StatusCode::OK);
+        assert_eq!(spelled, StatusCode::OK, "{}", String::from_utf8_lossy(&second));
+        assert_eq!(first, second, "the url spelling changed the bytes the driver wrote");
+        assert!(strays().is_empty(), "the response left a temporary file behind: {:?}", strays());
+    }
+
+    #[tokio::test]
+    async fn an_extension_the_driver_does_not_know_still_serves_a_file() {
+        let _serial = DRIVERS.lock().await;
+        let s = state_with("binaryspelling", UNINDEXED);
+        let (status, _, body) = fetch(s.clone(), &signed(&s, "/@dataset:pts.binary")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&body[..8], b"fgb\x03fgb\x01", "the driver did not write a flatgeobuf");
+        assert!(strays().is_empty(), "the response left a temporary file behind: {:?}", strays());
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_writes_several_files_fails_before_the_status() {
+        let _serial = DRIVERS.lock().await;
+        let s = state_with("spread", SPREAD);
+        let (status, _, body) = fetch(s.clone(), &signed(&s, "/@dataset:pts.spread")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{}", String::from_utf8_lossy(&body));
+        assert!(strays().is_empty(), "the response left a temporary file behind: {:?}", strays());
+    }
+
+    #[tokio::test]
+    async fn a_driver_output_refuses_a_source_with_no_geometry() {
+        let _serial = DRIVERS.lock().await;
+        let s = state("kmlnogeom", true);
+        let (status, _, body) = fetch(s.clone(), &signed(&s, "/@dataset:attrs.kml")).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{}", String::from_utf8_lossy(&body));
+        assert!(strays().is_empty(), "a failed response left a temporary file behind: {:?}", strays());
     }
 
     fn signed(state: &AppState, path: &str) -> String {
