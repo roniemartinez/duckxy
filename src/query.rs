@@ -193,64 +193,6 @@ fn copy_statement(inner: &str, file: &std::path::Path, target: &Target<'_>) -> S
     copy
 }
 
-const DEFAULT_EXPORT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
-const WATCH_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
-
-fn export_limit() -> u64 {
-    let Ok(value) = std::env::var("DUCKXY_MAX_EXPORT_BYTES") else {
-        return DEFAULT_EXPORT_LIMIT;
-    };
-    parse_bytes(value.trim()).unwrap_or_else(|| {
-        tracing::warn!(value, "ignoring an unusable export limit, keeping the default");
-        DEFAULT_EXPORT_LIMIT
-    })
-}
-
-fn parse_bytes(value: &str) -> Option<u64> {
-    let digits = value.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let scale = match value[digits.len()..].to_ascii_uppercase().as_str() {
-        "" | "B" => 1,
-        "KB" | "KIB" => 1024,
-        "MB" | "MIB" => 1024 * 1024,
-        "GB" | "GIB" => 1024 * 1024 * 1024,
-        _ => return None,
-    };
-    digits.parse::<u64>().ok().filter(|n| *n > 0)?.checked_mul(scale)
-}
-
-fn copy_bounded(conn: &Connection, statement: &str, file: &std::path::Path, limit: u64) -> Result<()> {
-    let (stop, stopped) = std::sync::mpsc::channel::<()>();
-    let interrupt = conn.interrupt_handle();
-    let watched = file.to_path_buf();
-    let watching = std::thread::spawn(move || {
-        while stopped.recv_timeout(WATCH_EVERY) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-            if std::fs::metadata(&watched).is_ok_and(|held| held.len() > limit) {
-                interrupt.interrupt();
-                return true;
-            }
-        }
-        false
-    });
-    let written = conn.execute_batch(statement).context("write the response with gdal");
-    drop(stop);
-    let stopped = watching.join().unwrap_or_else(|_| {
-        tracing::warn!("the export watcher panicked, falling back to the size of the finished file");
-        false
-    });
-    if !stopped {
-        written?;
-        let size = std::fs::metadata(file).map(|held| held.len()).unwrap_or(0);
-        if size <= limit {
-            return Ok(());
-        }
-    }
-    Err(crate::Fault::new(
-        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
-        format!("the response passed the {limit} byte export limit; narrow it with a filter"),
-    )
-    .into())
-}
-
 pub fn write_with_driver(
     source: &str,
     encoding: &str,
@@ -268,7 +210,7 @@ pub fn write_with_driver(
         let crs = read_crs(conn, source);
         let described = describe_nested(conn, nested)?;
         let inner = sql_for(&columns, crs.as_deref(), &described)?;
-        copy_bounded(conn, &copy_statement(&inner, file, &target), file, export_limit())
+        conn.execute_batch(&copy_statement(&inner, file, &target)).context("write the response with gdal")
     })?;
 
     if file.is_dir() {
@@ -535,52 +477,6 @@ mod tests {
         let b = TempFile::new("kml").unwrap();
         assert_ne!(a.dir, b.dir);
         assert!(a.dir.exists() && b.dir.exists());
-    }
-
-    #[rstest::rstest]
-    #[case("512", 512)]
-    #[case("64KB", 64 * 1024)]
-    #[case("2mb", 2 * 1024 * 1024)]
-    #[case("1GiB", 1024 * 1024 * 1024)]
-    fn an_export_limit_reads_its_unit(#[case] value: &str, #[case] bytes: u64) {
-        assert_eq!(parse_bytes(value), Some(bytes));
-    }
-
-    #[rstest::rstest]
-    #[case("")]
-    #[case("0")]
-    #[case("-1")]
-    #[case("2PB")]
-    #[case("banana")]
-    #[case("1.5GB")]
-    fn an_unusable_export_limit_is_refused(#[case] value: &str) {
-        assert_eq!(parse_bytes(value), None);
-    }
-
-    #[test]
-    fn an_export_past_the_limit_is_refused_and_the_connection_survives() {
-        crate::ensure_spatial();
-        let held = TempFile::new("fgb").unwrap();
-        let big = format!(
-            "COPY (SELECT ST_Point(i, i) AS geom FROM range(4000000) t(i)) TO '{}' \
-             WITH (FORMAT GDAL, DRIVER 'FlatGeobuf', LAYER_NAME 'big', LAYER_CREATION_OPTIONS ('SPATIAL_INDEX=NO'))",
-            held.file.display()
-        );
-        let err = with_connection(|conn| copy_bounded(conn, &big, &held.file, 256 * 1024)).unwrap_err();
-        let fault = err.downcast_ref::<crate::Fault>().unwrap_or_else(|| panic!("{err:#}"));
-        assert_eq!(fault.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(fault.message.contains("narrow it"), "{}", fault.message);
-        let written = fs::metadata(&held.file).map(|held| held.len()).unwrap_or(0);
-        assert!(written < 64 * 1024 * 1024, "the write ran on past the limit: {written} bytes");
-
-        let after = TempFile::new("fgb").unwrap();
-        let small = format!(
-            "COPY (SELECT ST_Point(1, 2) AS geom) TO '{}' WITH (FORMAT GDAL, DRIVER 'FlatGeobuf', LAYER_NAME 'small')",
-            after.file.display()
-        );
-        with_connection(|conn| copy_bounded(conn, &small, &after.file, DEFAULT_EXPORT_LIMIT))
-            .expect("the connection did not survive the interrupt");
-        assert!(after.file.exists(), "the export after the refusal wrote nothing");
     }
 
     #[test]

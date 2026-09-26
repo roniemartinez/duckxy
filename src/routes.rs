@@ -276,6 +276,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_client_that_leaves_has_its_temporary_export_removed() {
+        let _serial = DRIVERS.lock().await;
+        crate::ensure_spatial();
+        let dir = std::env::temp_dir().join(format!("duckxy-http-{}-gone", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut many = String::from(r#"{"type":"FeatureCollection","features":["#);
+        for i in 0..4000 {
+            if i > 0 {
+                many.push(',');
+            }
+            many.push_str(&format!(r#"{{"type":"Feature","properties":{{"name":"feature number {i}"}},"#));
+            many.push_str(&format!(r#""geometry":{{"type":"Point","coordinates":[{}.5,{}.25]}}}}"#, i % 90, i % 45));
+        }
+        many.push_str("]}");
+        fs::write(dir.join("many.geojson"), &many).unwrap();
+        let s =
+            AppState::new(DatasetRoot::new(dir), Auth::new(Some(KEY), true).unwrap(), crate::grammar::Grammar::core());
+
+        let asked = Request::builder().uri(signed(&s, "/@dataset:many.kml")).body(Body::empty()).unwrap();
+        let response = router(s.clone()).oneshot(asked).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        for _ in 0..200 {
+            if strays().is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the temporary export outlived the client: {:?}", strays());
+    }
+
+    #[tokio::test]
     async fn a_driver_output_refuses_a_source_with_no_geometry() {
         let _serial = DRIVERS.lock().await;
         let s = state("kmlnogeom", true);
