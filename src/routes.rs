@@ -524,6 +524,45 @@ mod tests {
         assert_eq!(status, expected, "{body}");
     }
 
+    #[rstest]
+    #[case("bb")]
+    #[case("bnd")]
+    #[case("ctr")]
+    #[case("cvh")]
+    #[case("edp")]
+    #[case("er")]
+    #[case("fc")]
+    #[case("f2d")]
+    #[case("lm")]
+    #[case("mv")]
+    #[case("m")]
+    #[case("nd")]
+    #[case("norm")]
+    #[case("oe")]
+    #[case("pos")]
+    #[case("pts")]
+    #[case("rev")]
+    #[case("stp")]
+    #[tokio::test]
+    async fn an_operation_keeps_one_row_per_feature(#[case] op: &str) {
+        let s = state("process", false);
+        let (status, body) = get(s.clone(), &signed(&s, &format!("/@dataset:shapes/@process/{op}.geojson"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{body} ({e})"));
+        assert_eq!(parsed["features"].as_array().unwrap().len(), 4, "{body}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:shapes/@process/banana.geojson")]
+    #[case("/@dataset:shapes/@process/ctr:1.geojson")]
+    #[case("/@dataset:shapes/@process/ctr,banana.geojson")]
+    #[tokio::test]
+    async fn a_bad_operation_is_a_client_error(#[case] path: &str) {
+        let s = state("process-err", false);
+        let (status, body) = get(s.clone(), &signed(&s, path)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
     #[tokio::test]
     async fn an_id_filter_without_an_id_column_is_unprocessable() {
         let s = state("noid", false);
