@@ -50,28 +50,39 @@ pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(CHANNEL_DEPTH);
 
     tokio::task::spawn_blocking(move || {
-        if tx.blocking_send(Ok(Bytes::from_static(output.header().as_bytes()))).is_err() {
+        let header = output.header();
+        if !header.is_empty() && tx.blocking_send(Ok(Bytes::from_static(header.as_bytes()))).is_err() {
             return;
         }
         let mut ready = Some(ready_tx);
-        let sent = query::run(
-            &source,
-            &encoding,
-            output.separator(),
-            nested,
-            |columns, crs, described| {
-                crate::sql::plan(&grammar, &parsed, &source, columns, crs, described, backend.clone())
-            },
-            || {
-                if let Some(ready_tx) = ready.take() {
-                    let _ = ready_tx.send(Ok(()));
-                }
-            },
-            &mut |chunk| tx.blocking_send(Ok(Bytes::from(chunk))).is_ok(),
-        );
+        let plan = |columns: &[(String, String)], crs: Option<&str>, described: &[query::Described]| {
+            crate::sql::plan(&grammar, &parsed, &source, columns, crs, described, backend.clone())
+        };
+        let signal = || {
+            if let Some(ready_tx) = ready.take() {
+                let _ = ready_tx.send(Ok(()));
+            }
+        };
+        let sent = match output.driver() {
+            Some(driver) => query::write_with_driver(
+                &source,
+                &encoding,
+                query::Target { driver, layer: &dataset },
+                nested,
+                plan,
+                signal,
+                &mut |chunk| tx.blocking_send(Ok(Bytes::from(chunk))).is_ok(),
+            ),
+            None => query::run(&source, &encoding, output.separator(), nested, plan, signal, &mut |chunk| {
+                tx.blocking_send(Ok(Bytes::from(chunk))).is_ok()
+            }),
+        };
         match sent {
             Ok(()) => {
-                let _ = tx.blocking_send(Ok(Bytes::from_static(output.footer().as_bytes())));
+                let footer = output.footer();
+                if !footer.is_empty() {
+                    let _ = tx.blocking_send(Ok(Bytes::from_static(footer.as_bytes())));
+                }
             }
             Err(e) => {
                 tracing::error!(dataset, error = ?e, "query failed");

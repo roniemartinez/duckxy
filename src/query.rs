@@ -119,11 +119,115 @@ pub struct Described {
     pub crs: Option<String>,
 }
 
+fn describe_nested(conn: &Connection, nested: Vec<Resolved>) -> Result<Vec<Described>> {
+    let mut described = Vec::with_capacity(nested.len());
+    for held in nested {
+        let columns = describe(conn, &held.source, &held.encoding)?;
+        geometry_of(&columns).ok_or(NoGeometry)?;
+        let crs = read_crs(conn, &held.source);
+        described.push(Described { raw: held.raw, source: held.source, encoding: held.encoding, columns, crs });
+    }
+    Ok(described)
+}
+
 fn read_crs(conn: &Connection, source: &str) -> Option<String> {
     source_crs(conn, source).unwrap_or_else(|e| {
         tracing::warn!(error = ?e, "could not read the source crs, serving it unprojected");
         None
     })
+}
+
+struct TempFile {
+    dir: std::path::PathBuf,
+    file: std::path::PathBuf,
+}
+
+impl TempFile {
+    fn new(extension: &str) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!("duckxy-{}-{:x}", std::process::id(), nonce()));
+        let mut building = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut building, 0o700);
+        building.create(&dir).with_context(|| format!("make a private directory at {}", dir.display()))?;
+        let file = dir.join(format!("out.{extension}"));
+        Ok(TempFile { dir, file })
+    }
+}
+
+fn nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut held = std::collections::hash_map::RandomState::new().build_hasher();
+    held.write_u64(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    held.finish()
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = ?e, dir = %self.dir.display(), "could not remove the temporary response"),
+        }
+    }
+}
+
+pub struct Target<'a> {
+    pub driver: crate::formats::Driver,
+    pub layer: &'a str,
+}
+
+fn copy_statement(inner: &str, file: &std::path::Path, target: &Target<'_>) -> String {
+    let quoted = file.display().to_string().replace('\'', "''");
+    let layer = target.layer.replace('\'', "''");
+    let mut copy = format!(
+        "COPY ({inner}) TO '{quoted}' WITH (FORMAT GDAL, DRIVER '{}', LAYER_NAME '{layer}'",
+        target.driver.name
+    );
+    if !target.driver.options.is_empty() {
+        let held =
+            target.driver.options.iter().map(|o| format!("'{}'", o.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+        copy.push_str(&format!(", LAYER_CREATION_OPTIONS ({held})"));
+    }
+    copy.push(')');
+    copy
+}
+
+pub fn write_with_driver(
+    source: &str,
+    encoding: &str,
+    target: Target<'_>,
+    nested: Vec<Resolved>,
+    sql_for: impl FnOnce(&[(String, String)], Option<&str>, &[Described]) -> Result<String>,
+    on_ready: impl FnOnce(),
+    sink: &mut dyn FnMut(Vec<u8>) -> bool,
+) -> Result<()> {
+    let held = TempFile::new(target.driver.file)?;
+    let file = &held.file;
+    with_connection(|conn| {
+        let columns = describe(conn, source, encoding)?;
+        geometry_of(&columns).ok_or(NoGeometry)?;
+        let crs = read_crs(conn, source);
+        let described = describe_nested(conn, nested)?;
+        let inner = sql_for(&columns, crs.as_deref(), &described)?;
+        conn.execute_batch(&copy_statement(&inner, file, &target)).context("write the response with gdal")
+    })?;
+
+    if file.is_dir() {
+        anyhow::bail!(
+            "the {} driver wrote a dataset of several files, which cannot be served alone",
+            target.driver.name
+        );
+    }
+    let mut reading = std::fs::File::open(file).context("open the written response")?;
+    on_ready();
+    let mut buf = vec![0u8; CHUNK_BYTES];
+    loop {
+        let read = std::io::Read::read(&mut reading, &mut buf).context("read the written response")?;
+        if read == 0 || !sink(buf[..read].to_vec()) {
+            return Ok(());
+        }
+    }
 }
 
 pub fn run(
@@ -139,13 +243,7 @@ pub fn run(
         let columns = describe(conn, source, encoding)?;
         geometry_of(&columns).ok_or(NoGeometry)?;
         let crs = read_crs(conn, source);
-        let mut described: Vec<Described> = Vec::with_capacity(nested.len());
-        for held in nested {
-            let columns = describe(conn, &held.source, &held.encoding)?;
-            geometry_of(&columns).ok_or(NoGeometry)?;
-            let crs = read_crs(conn, &held.source);
-            described.push(Described { raw: held.raw, source: held.source, encoding: held.encoding, columns, crs });
-        }
+        let described = describe_nested(conn, nested)?;
         let sql = sql_for(&columns, crs.as_deref(), &described)?;
 
         let mut stmt = conn.prepare(&sql).context("prepare query")?;
@@ -334,6 +432,51 @@ mod tests {
         let inner = fixture("zones", ZONES);
         let names = nested_names("/@dataset:parcels,ix:(@dataset:zones,prop:name:dry).geojson", &outer, &inner);
         assert!(names.is_empty(), "the inner filter was ignored: {names:?}");
+    }
+
+    #[test]
+    fn a_copy_statement_quotes_the_path_and_lists_every_layer_option() {
+        let driver = crate::formats::Driver { name: "KML", file: "kml", options: &["a=1", "b=2"] };
+        let target = Target { driver, layer: "it's" };
+        let held = copy_statement("SELECT 1", std::path::Path::new("/tmp/it's.kml"), &target);
+        assert_eq!(
+            held,
+            "COPY (SELECT 1) TO '/tmp/it''s.kml' WITH (FORMAT GDAL, DRIVER 'KML', LAYER_NAME 'it''s', \
+             LAYER_CREATION_OPTIONS ('a=1', 'b=2'))"
+        );
+    }
+
+    #[test]
+    fn a_copy_statement_without_layer_options_says_nothing_about_them() {
+        let driver = crate::formats::Driver { name: "FlatGeobuf", file: "fgb", options: &[] };
+        let target = Target { driver, layer: "x" };
+        let held = copy_statement("SELECT 1", std::path::Path::new("/tmp/x.fgb"), &target);
+        assert_eq!(held, "COPY (SELECT 1) TO '/tmp/x.fgb' WITH (FORMAT GDAL, DRIVER 'FlatGeobuf', LAYER_NAME 'x')");
+    }
+
+    #[test]
+    fn a_temporary_response_lives_in_a_private_directory() {
+        let held = TempFile::new("kml").unwrap();
+        let shared = std::env::temp_dir();
+        assert_eq!(held.file.parent(), Some(held.dir.as_path()));
+        assert_ne!(held.file.parent(), Some(shared.as_path()), "anyone on the host could plant this path");
+        #[cfg(unix)]
+        {
+            let allowed = fs::metadata(&held.dir).unwrap().permissions();
+            let mode = std::os::unix::fs::PermissionsExt::mode(&allowed);
+            assert_eq!(mode & 0o777, 0o700, "the temporary directory is not private: {mode:o}");
+        }
+        let dir = held.dir.clone();
+        drop(held);
+        assert!(!dir.exists(), "the temporary directory outlived the response");
+    }
+
+    #[test]
+    fn two_temporary_responses_do_not_share_a_directory() {
+        let a = TempFile::new("kml").unwrap();
+        let b = TempFile::new("kml").unwrap();
+        assert_ne!(a.dir, b.dir);
+        assert!(a.dir.exists() && b.dir.exists());
     }
 
     #[test]

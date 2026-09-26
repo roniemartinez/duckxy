@@ -320,6 +320,8 @@ impl Grammar {
         g.register_filters(crate::filters::CORE);
         g.register_action(crate::process::Process);
         g.register_output(crate::formats::GeoJson);
+        g.register_output(crate::formats::KML);
+        g.register_output(crate::formats::FLATGEOBUF);
         g
     }
 
@@ -449,10 +451,10 @@ mod tests {
     }
 
     #[test]
-    fn the_core_grammar_registers_the_built_in_output() {
+    fn the_core_grammar_registers_the_built_in_outputs() {
         let g = Grammar::core();
-        assert_eq!(g.outputs.len(), 1);
-        assert_eq!(g.outputs[0].extensions(), &["geojson", "json"]);
+        let held: Vec<&[&str]> = g.outputs.iter().map(|output| output.extensions()).collect();
+        assert_eq!(held, vec![&["geojson", "json"][..], &["kml"][..], &["fgb"][..]]);
     }
 
     #[test]
@@ -464,8 +466,9 @@ mod tests {
     #[test]
     fn an_output_that_declares_the_override_may_share_an_extension() {
         let mut g = Grammar::core();
+        let before = g.outputs.len();
         g.register_output(Probe(&["json"], true));
-        assert_eq!(g.outputs.len(), 2);
+        assert_eq!(g.outputs.len(), before + 1);
     }
 
     #[test]
