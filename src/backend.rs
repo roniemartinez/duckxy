@@ -85,6 +85,14 @@ impl Dialect for DuckDb {
     fn as_geojson(&self, geometry: SimpleExpr) -> SimpleExpr {
         Func::cust("ST_AsGeoJSON").arg(geometry).into()
     }
+
+    fn vocabulary(&self) -> Vocabulary {
+        let mut vocabulary = Vocabulary::default();
+        for op in crate::process::UNARY {
+            vocabulary.register(op.call, |args: Vec<SimpleExpr>| Func::cust(op.call).args(args).into());
+        }
+        vocabulary
+    }
 }
 
 pub struct Backend {
@@ -161,15 +169,39 @@ mod tests {
         assert!(rendered(DuckDb.transform(geom(), from, to)).contains(expected));
     }
 
+    struct Bare;
+
+    impl Dialect for Bare {
+        fn transform(&self, g: SimpleExpr, _: &str, _: &str) -> SimpleExpr {
+            g
+        }
+        fn as_geojson(&self, g: SimpleExpr) -> SimpleExpr {
+            g
+        }
+    }
+
     fn seeded() -> Backend {
-        Backend::default().extend(|v| {
+        Backend::new(Bare).extend(|v| {
             v.register("bounds", |mut args: Vec<SimpleExpr>| Func::cust("ST_Extent_Agg").arg(args.remove(0)).into());
         })
     }
 
     #[test]
-    fn a_dialect_seeds_no_vocabulary_of_its_own() {
-        assert!(Backend::default().operations().is_empty(), "core named an operation it never calls");
+    fn duckdb_registers_exactly_the_operations_core_calls() {
+        let mut called: Vec<&str> = crate::process::UNARY.iter().map(|op| op.call).collect();
+        called.sort_unstable();
+        let registered = Backend::default().operations();
+        let unregistered: Vec<&&str> = called.iter().filter(|name| !registered.contains(name)).collect();
+        let uncalled: Vec<&&str> = registered.iter().filter(|name| !called.contains(name)).collect();
+        assert!(unregistered.is_empty(), "core calls an operation duckdb never registered: {unregistered:?}");
+        assert!(uncalled.is_empty(), "duckdb registered an operation core never calls: {uncalled:?}");
+    }
+
+    #[rstest]
+    #[case("ST_Centroid", "ST_Centroid(\"geom\")")]
+    #[case("ST_MinimumRotatedRectangle", "ST_MinimumRotatedRectangle(\"geom\")")]
+    fn a_duckdb_operation_renders_as_its_function(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(rendered(Backend::default().call(name, vec![geom()]).unwrap()), expected);
     }
 
     #[test]
@@ -216,15 +248,6 @@ mod tests {
 
     #[test]
     fn an_empty_dialect_starts_with_no_vocabulary() {
-        struct Bare;
-        impl Dialect for Bare {
-            fn transform(&self, g: SimpleExpr, _: &str, _: &str) -> SimpleExpr {
-                g
-            }
-            fn as_geojson(&self, g: SimpleExpr) -> SimpleExpr {
-                g
-            }
-        }
         assert!(Backend::new(Bare).operations().is_empty());
     }
 }
