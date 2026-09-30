@@ -1,5 +1,6 @@
 use crate::grammar::{Action, Opt, Param, StageCtx, flag, opt};
 use crate::url::Segment;
+use sea_query::{Expr, ExprTrait, SimpleExpr};
 use std::sync::LazyLock;
 
 pub struct Unary {
@@ -11,6 +12,7 @@ pub struct Unary {
 pub const UNARY: &[Unary] = &[
     Unary { name: "bbox", short: "bb", call: "ST_Envelope" },
     Unary { name: "boundary", short: "bnd", call: "ST_Boundary" },
+    Unary { name: "buildarea", short: "ba", call: "ST_BuildArea" },
     Unary { name: "centroid", short: "ctr", call: "ST_Centroid" },
     Unary { name: "convexhull", short: "cvh", call: "ST_ConvexHull" },
     Unary { name: "endpoint", short: "edp", call: "ST_EndPoint" },
@@ -18,6 +20,7 @@ pub const UNARY: &[Unary] = &[
     Unary { name: "flipcoordinates", short: "fc", call: "ST_FlipCoordinates" },
     Unary { name: "force2d", short: "f2d", call: "ST_Force2D" },
     Unary { name: "linemerge", short: "lm", call: "ST_LineMerge" },
+    Unary { name: "makepolygon", short: "mp", call: "ST_MakePolygon" },
     Unary { name: "makevalid", short: "mv", call: "ST_MakeValid" },
     Unary { name: "multi", short: "m", call: "ST_Multi" },
     Unary { name: "node", short: "nd", call: "ST_Node" },
@@ -27,11 +30,165 @@ pub const UNARY: &[Unary] = &[
     Unary { name: "points", short: "pts", call: "ST_Points" },
     Unary { name: "reverse", short: "rev", call: "ST_Reverse" },
     Unary { name: "startpoint", short: "stp", call: "ST_StartPoint" },
+    Unary { name: "voronoidiagram", short: "vd", call: "ST_VoronoiDiagram" },
 ];
+
+pub struct Scalar {
+    pub name: &'static str,
+    pub short: &'static str,
+    pub call: &'static str,
+    pub shapes: &'static [&'static [Param]],
+    pub args: fn(&'static str, &[String], &StageCtx) -> anyhow::Result<Vec<SimpleExpr>>,
+}
+
+const ONE: &[&[Param]] = &[&[Param::Token]];
+const TWO: &[&[Param]] = &[&[Param::Token, Param::Token]];
+const UP_TO_ONE: &[&[Param]] = &[&[], &[Param::Token]];
+const FOUR: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token]];
+const SIX: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token, Param::Token, Param::Token]];
+
+pub const SCALAR: &[Scalar] = &[
+    Scalar { name: "affine", short: "aff", call: "ST_Affine", shapes: SIX, args: numbers },
+    Scalar { name: "buffer", short: "b", call: "ST_Buffer", shapes: ONE, args: distances },
+    Scalar { name: "expand", short: "exp", call: "ST_Expand", shapes: ONE, args: distances },
+    Scalar { name: "extract", short: "ex", call: "ST_CollectionExtract", shapes: ONE, args: dimension },
+    Scalar { name: "force3dm", short: "f3dm", call: "ST_Force3DM", shapes: ONE, args: numbers },
+    Scalar { name: "force3dz", short: "f3dz", call: "ST_Force3DZ", shapes: ONE, args: numbers },
+    Scalar { name: "force4d", short: "f4d", call: "ST_Force4D", shapes: TWO, args: numbers },
+    Scalar { name: "interiorringn", short: "irn", call: "ST_InteriorRingN", shapes: ONE, args: integers },
+    Scalar {
+        name: "lineinterpolatepoint",
+        short: "lip",
+        call: "ST_LineInterpolatePoint",
+        shapes: ONE,
+        args: fractions,
+    },
+    Scalar {
+        name: "lineinterpolatepoints",
+        short: "lips",
+        call: "ST_LineInterpolatePoints",
+        shapes: ONE,
+        args: fractions_repeating,
+    },
+    Scalar { name: "linesubstring", short: "lss", call: "ST_LineSubstring", shapes: TWO, args: rising_fractions },
+    Scalar { name: "pointn", short: "pn", call: "ST_PointN", shapes: ONE, args: integers },
+    Scalar { name: "reduceprecision", short: "rp", call: "ST_ReducePrecision", shapes: ONE, args: tolerances },
+    Scalar {
+        name: "removerepeatedpoints",
+        short: "removepoints",
+        call: "ST_RemoveRepeatedPoints",
+        shapes: UP_TO_ONE,
+        args: tolerances,
+    },
+    Scalar { name: "rotate", short: "rot", call: "ST_Rotate", shapes: ONE, args: numbers },
+    Scalar { name: "rotatex", short: "rotx", call: "ST_RotateX", shapes: ONE, args: numbers },
+    Scalar { name: "rotatey", short: "roty", call: "ST_RotateY", shapes: ONE, args: numbers },
+    Scalar { name: "rotatez", short: "rotz", call: "ST_RotateZ", shapes: ONE, args: numbers },
+    Scalar { name: "scale", short: "sc", call: "ST_Scale", shapes: TWO, args: numbers },
+    Scalar { name: "simplify", short: "s", call: "ST_Simplify", shapes: ONE, args: tolerances },
+    Scalar {
+        name: "simplifypreservetopology",
+        short: "spt",
+        call: "ST_SimplifyPreserveTopology",
+        shapes: ONE,
+        args: tolerances,
+    },
+    Scalar { name: "translate", short: "tl", call: "ST_Translate", shapes: TWO, args: distances },
+    Scalar { name: "transscale", short: "ts", call: "ST_TransScale", shapes: FOUR, args: numbers },
+];
+
+fn number(name: &'static str, value: &str) -> anyhow::Result<f64> {
+    value.parse::<f64>().map_err(|_| crate::Fault::bad_request(format!("{name} needs a number, got {value:?}")))
+}
+
+fn numbers(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    params.iter().map(|held| number(name, held).map(Expr::val)).collect()
+}
+
+fn measured(name: &'static str, param: &str) -> anyhow::Result<crate::units::Measure> {
+    crate::units::parse(param).map_err(|e| crate::Fault::bad_request(format!("{name} {e}")))
+}
+
+fn scaled(measure: crate::units::Measure, ctx: &StageCtx) -> SimpleExpr {
+    match measure {
+        crate::units::Measure::Units(value) => Expr::val(value),
+        crate::units::Measure::Metres(metres) => {
+            Expr::val(metres).div(ctx.dialect().metres_per_unit(ctx.geom(), ctx.crs()))
+        }
+    }
+}
+
+fn distances(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    params.iter().map(|held| Ok(scaled(measured(name, held)?, ctx))).collect()
+}
+
+fn tolerances(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    params
+        .iter()
+        .map(|held| {
+            let measure = measured(name, held)?;
+            match measure.is_negative() {
+                true => Err(crate::Fault::bad_request(format!(
+                    "{name} needs a tolerance that is not negative, got {held:?}"
+                ))),
+                false => Ok(scaled(measure, ctx)),
+            }
+        })
+        .collect()
+}
+
+fn integers(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    params
+        .iter()
+        .map(|held| match held.parse::<i64>() {
+            Ok(held) => Ok(Expr::val(held)),
+            Err(_) => Err(crate::Fault::bad_request(format!("{name} needs a whole number, got {held:?}"))),
+        })
+        .collect()
+}
+
+fn fractions(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    params
+        .iter()
+        .map(|held| {
+            let held = number(name, held)?;
+            match (0.0..=1.0).contains(&held) {
+                true => Ok(Expr::val(held)),
+                false => Err(crate::Fault::bad_request(format!("{name} needs a fraction from 0 to 1, got {held}"))),
+            }
+        })
+        .collect()
+}
+
+fn rising_fractions(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    let ordered = params.iter().map(|held| number(name, held)).collect::<anyhow::Result<Vec<f64>>>()?;
+    match ordered.windows(2).all(|pair| pair[0] <= pair[1]) {
+        true => fractions(name, params, ctx),
+        false => Err(crate::Fault::bad_request(format!("{name} needs its fractions in order, got {ordered:?}"))),
+    }
+}
+
+fn fractions_repeating(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    let mut args = fractions(name, params, ctx)?;
+    args.push(Expr::val(true));
+    Ok(args)
+}
+
+fn dimension(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    let held = params.first().and_then(|held| held.parse::<i32>().ok()).filter(|held| (1..=3).contains(held));
+    match held {
+        Some(held) => Ok(vec![Expr::val(held)]),
+        None => Err(crate::Fault::bad_request(format!(
+            "{name} needs 1 for points, 2 for lines or 3 for polygons, got {:?}",
+            params.first().map(String::as_str).unwrap_or_default()
+        ))),
+    }
+}
 
 static OPTIONS: LazyLock<Vec<Opt>> = LazyLock::new(|| {
     std::iter::once(opt("reproject", "r", &[&[Param::Token], &[Param::Token, Param::Token]]))
         .chain(UNARY.iter().map(|op| flag(op.name, op.short)))
+        .chain(SCALAR.iter().map(|op| opt(op.name, op.short, op.shapes)))
         .collect()
 });
 
@@ -62,10 +219,17 @@ impl Action for Process {
                     ctx.set_crs(target);
                 }
                 other => {
-                    let Some(op) = UNARY.iter().find(|op| op.name == other) else {
+                    if let Some(op) = UNARY.iter().find(|op| op.name == other) {
+                        let geometry = ctx.call(op.call, vec![ctx.geom()])?;
+                        ctx.replace_geometry(geometry);
+                        continue;
+                    }
+                    let Some(op) = SCALAR.iter().find(|op| op.name == other) else {
                         anyhow::bail!("option {other:?} is not handled");
                     };
-                    let geometry = ctx.call(op.call, vec![ctx.geom()])?;
+                    let mut args = vec![ctx.geom()];
+                    args.extend((op.args)(op.name, &segment.params, ctx)?);
+                    let geometry = ctx.call(op.call, args)?;
                     ctx.replace_geometry(geometry);
                 }
             }
@@ -162,6 +326,9 @@ mod tests {
     #[case("points", "pts", "ST_Points")]
     #[case("reverse", "rev", "ST_Reverse")]
     #[case("startpoint", "stp", "ST_StartPoint")]
+    #[case("buildarea", "ba", "ST_BuildArea")]
+    #[case("makepolygon", "mp", "ST_MakePolygon")]
+    #[case("voronoidiagram", "vd", "ST_VoronoiDiagram")]
     fn an_operation_wraps_the_geometry_in_its_function(#[case] name: &str, #[case] short: &str, #[case] call: &str) {
         let long = planned(&format!("/@dataset:x/@process/{name}.geojson"), Some(WGS84));
         let brief = planned(&format!("/@dataset:x/@p/{short}.geojson"), Some(WGS84));
@@ -171,7 +338,246 @@ mod tests {
 
     #[test]
     fn every_operation_is_tested() {
-        assert_eq!(super::UNARY.len(), 18);
+        assert_eq!(super::UNARY.len(), 21);
+    }
+
+    fn failed(url: &str) -> String {
+        let grammar = Grammar::core();
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        let backend = Arc::new(crate::backend::Backend::default());
+        format!("{:#}", plan(&grammar, &parsed, "/x.geojson", &columns, Some(WGS84), &[], backend).unwrap_err())
+    }
+
+    #[rstest]
+    #[case("buffer:5", "b:5", "ST_Buffer")]
+    #[case("extract:3", "ex:3", "ST_CollectionExtract")]
+    #[case("lineinterpolatepoint:0.5", "lip:0.5", "ST_LineInterpolatePoint")]
+    #[case("lineinterpolatepoints:0.25", "lips:0.25", "ST_LineInterpolatePoints")]
+    #[case("linesubstring:0.1:0.9", "lss:0.1:0.9", "ST_LineSubstring")]
+    #[case("reduceprecision:0.001", "rp:0.001", "ST_ReducePrecision")]
+    #[case("removerepeatedpoints", "removepoints", "ST_RemoveRepeatedPoints")]
+    #[case("removerepeatedpoints:0.5", "removepoints:0.5", "ST_RemoveRepeatedPoints")]
+    #[case("rotate:0.785", "rot:0.785", "ST_Rotate")]
+    #[case("scale:2:3", "sc:2:3", "ST_Scale")]
+    #[case("simplify:0.01", "s:0.01", "ST_Simplify")]
+    #[case("translate:10:20", "tl:10:20", "ST_Translate")]
+    #[case("affine:1:0:0:1:0:0", "aff:1:0:0:1:0:0", "ST_Affine")]
+    #[case("expand:5", "exp:5", "ST_Expand")]
+    #[case("force3dm:0", "f3dm:0", "ST_Force3DM")]
+    #[case("force3dz:0", "f3dz:0", "ST_Force3DZ")]
+    #[case("force4d:0:0", "f4d:0:0", "ST_Force4D")]
+    #[case("interiorringn:1", "irn:1", "ST_InteriorRingN")]
+    #[case("pointn:1", "pn:1", "ST_PointN")]
+    #[case("rotatex:0.785", "rotx:0.785", "ST_RotateX")]
+    #[case("rotatey:0.785", "roty:0.785", "ST_RotateY")]
+    #[case("rotatez:0.785", "rotz:0.785", "ST_RotateZ")]
+    #[case("simplifypreservetopology:0.01", "spt:0.01", "ST_SimplifyPreserveTopology")]
+    #[case("transscale:1:2:3:4", "ts:1:2:3:4", "ST_TransScale")]
+    fn a_scalar_operation_calls_its_function(#[case] long: &str, #[case] short: &str, #[case] call: &str) {
+        let spelled = planned(&format!("/@dataset:x/@process/{long}.geojson"), Some(WGS84));
+        let brief = planned(&format!("/@dataset:x/@p/{short}.geojson"), Some(WGS84));
+        assert!(spelled.contains(&format!("{call}(\"geom\"")), "{spelled}");
+        assert_eq!(spelled, brief, "{long} and {short} planned differently");
+    }
+
+    #[rstest]
+    #[case("buffer:5", "5")]
+    #[case("lineinterpolatepoint:0.5", "0.5")]
+    #[case("linesubstring:0.1:0.9", "0.1, 0.9")]
+    #[case("scale:2:3", "2, 3")]
+    #[case("translate:10:20", "10, 20")]
+    fn a_parameter_reaches_the_call_in_order(#[case] op: &str, #[case] expected: &str) {
+        let out = planned(&format!("/@dataset:x/@process/{op}.geojson"), Some(WGS84));
+        assert!(out.contains(expected), "expected {expected} in {out}");
+    }
+
+    #[test]
+    fn the_plural_interpolation_asks_for_every_point() {
+        let out = planned("/@dataset:x/@process/lips:0.25.geojson", Some(WGS84));
+        assert!(out.contains("ST_LineInterpolatePoints(\"geom\", 0.25, TRUE)"), "{out}");
+    }
+
+    #[test]
+    fn a_scalar_operation_without_a_parameter_keeps_the_shorter_call() {
+        let out = planned("/@dataset:x/@process/removepoints.geojson", Some(WGS84));
+        assert!(out.contains("ST_RemoveRepeatedPoints(\"geom\")"), "{out}");
+    }
+
+    #[test]
+    fn operations_chain_left_to_right() {
+        let out = planned("/@dataset:x/@process/mv,s:0.01,ctr.geojson", Some(WGS84));
+        let valid = out.find("ST_MakeValid").expect("makevalid is missing");
+        let simplify = out.find("ST_Simplify").expect("simplify is missing");
+        let centroid = out.find("ST_Centroid").expect("centroid is missing");
+        assert!(valid < simplify && simplify < centroid, "the steps are out of order: {out}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x/@process/b:banana.geojson", "buffer needs a number")]
+    #[case("/@dataset:x/@process/s:none.geojson", "simplify needs a number")]
+    #[case("/@dataset:x/@process/lip:2.geojson", "lineinterpolatepoint needs a fraction from 0 to 1")]
+    #[case("/@dataset:x/@process/lss:0:1.5.geojson", "linesubstring needs a fraction from 0 to 1")]
+    #[case("/@dataset:x/@process/ex:9.geojson", "extract needs 1 for points")]
+    #[case("/@dataset:x/@process/ex:point.geojson", "extract needs 1 for points")]
+    fn an_unusable_parameter_is_refused(#[case] url: &str, #[case] expected: &str) {
+        let held = failed(url);
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x/@process/b.geojson")]
+    #[case("/@dataset:x/@process/b:1:2.geojson")]
+    #[case("/@dataset:x/@process/sc:1.geojson")]
+    #[case("/@dataset:x/@process/removepoints:1:2.geojson")]
+    fn a_scalar_operation_with_the_wrong_arity_is_refused_by_the_parser(#[case] url: &str) {
+        assert!(crate::url::parse(url, &Grammar::core()).is_err(), "{url} parsed");
+    }
+
+    #[test]
+    fn a_bare_distance_stays_in_the_unit_of_the_crs() {
+        let out = planned("/@dataset:x/@process/b:1000.geojson", Some("EPSG:25832"));
+        assert!(out.contains("ST_Buffer(\"geom\", 1000)"), "{out}");
+        assert!(!out.contains("ST_Distance_Spheroid"), "a bare number was converted: {out}");
+    }
+
+    #[test]
+    fn a_distance_with_a_unit_converts_into_the_unit_of_the_crs() {
+        let out = planned("/@dataset:x/@process/b:1km.geojson", Some("EPSG:25832"));
+        assert!(out.contains("ST_Buffer(\"geom\", 1000 / ("), "{out}");
+        assert!(out.contains("ST_Distance_Spheroid"), "{out}");
+        assert!(out.contains("'EPSG:25832', 'EPSG:4326'"), "the measurement did not start at the current crs: {out}");
+        assert!(out.contains("ST_Centroid"), "the measurement did not use the feature: {out}");
+    }
+
+    #[rstest]
+    #[case("1km", "1000m")]
+    #[case("1km", "100000cm")]
+    #[case("1mi", "1609.344m")]
+    fn the_same_distance_written_two_ways_plans_the_same(#[case] one: &str, #[case] two: &str) {
+        let first = planned(&format!("/@dataset:x/@process/b:{one}.geojson"), Some(WGS84));
+        let second = planned(&format!("/@dataset:x/@process/b:{two}.geojson"), Some(WGS84));
+        assert_eq!(first, second, "{one} and {two} planned differently");
+    }
+
+    #[test]
+    fn a_unit_reads_the_crs_a_reproject_set() {
+        let out = planned("/@dataset:x/@process/r:3857,b:1km.geojson", Some("EPSG:25832"));
+        assert!(out.contains("'EPSG:3857', 'EPSG:4326'"), "the measurement ignored the reproject: {out}");
+    }
+
+    #[rstest]
+    #[case("simplify:1m", "ST_Simplify")]
+    #[case("translate:1km:0", "ST_Translate")]
+    #[case("expand:1km", "ST_Expand")]
+    #[case("simplifypreservetopology:1m", "ST_SimplifyPreserveTopology")]
+    #[case("reduceprecision:1m", "ST_ReducePrecision")]
+    #[case("removepoints:1m", "ST_RemoveRepeatedPoints")]
+    fn every_distance_parameter_takes_a_unit(#[case] op: &str, #[case] call: &str) {
+        let out = planned(&format!("/@dataset:x/@process/{op}.geojson"), Some("EPSG:25832"));
+        assert!(out.contains(call), "{out}");
+        assert!(out.contains("ST_Distance_Spheroid"), "{op} did not convert its unit: {out}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x/@process/b:1banana.geojson", "does not know the unit")]
+    #[case("/@dataset:x/@process/s:5furlongs.geojson", "does not know the unit")]
+    #[case("/@dataset:x/@process/tl:1km:2parsec.geojson", "does not know the unit")]
+    fn an_unknown_unit_is_refused(#[case] url: &str, #[case] expected: &str) {
+        let held = failed(url);
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[rstest]
+    #[case("rp:0.5")]
+    #[case("sc:2:3")]
+    #[case("rot:0.785")]
+    #[case("lip:0.5")]
+    #[case("ex:2")]
+    fn a_parameter_that_is_not_a_distance_never_measures_the_crs(#[case] op: &str) {
+        let out = planned(&format!("/@dataset:x/@process/{op}.geojson"), Some("EPSG:25832"));
+        assert!(!out.contains("ST_Distance_Spheroid"), "{op} measured the crs: {out}");
+    }
+
+    #[rstest]
+    #[case("sc:1km:2", "scale needs a number")]
+    #[case("rot:45deg", "rotate needs a number")]
+    fn a_unit_on_a_parameter_that_is_not_a_distance_is_refused(#[case] op: &str, #[case] expected: &str) {
+        let held = failed(&format!("/@dataset:x/@process/{op}.geojson"));
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x/@process/s:-0.5.geojson", "simplify needs a tolerance that is not negative")]
+    #[case("/@dataset:x/@process/s:-1m.geojson", "simplify needs a tolerance that is not negative")]
+    #[case("/@dataset:x/@process/spt:-0.5.geojson", "simplifypreservetopology needs a tolerance")]
+    #[case("/@dataset:x/@process/rp:-1.geojson", "reduceprecision needs a tolerance")]
+    #[case("/@dataset:x/@process/removepoints:-1.geojson", "removerepeatedpoints needs a tolerance")]
+    fn a_negative_tolerance_is_refused(#[case] url: &str, #[case] expected: &str) {
+        let held = failed(url);
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[rstest]
+    #[case("b:-1", "ST_Buffer")]
+    #[case("b:-1km", "ST_Buffer")]
+    #[case("exp:-5", "ST_Expand")]
+    #[case("tl:-1km:0", "ST_Translate")]
+    #[case("rot:-0.785", "ST_Rotate")]
+    #[case("sc:-1:1", "ST_Scale")]
+    #[case("rotx:-0.785", "ST_RotateX")]
+    #[case("pn:-1", "ST_PointN")]
+    fn a_negative_stays_allowed_where_it_has_a_meaning(#[case] op: &str, #[case] call: &str) {
+        let out = planned(&format!("/@dataset:x/@process/{op}.geojson"), Some(WGS84));
+        assert!(out.contains(call), "{out}");
+    }
+
+    #[test]
+    fn a_substring_that_runs_backwards_is_refused() {
+        let held = failed("/@dataset:x/@process/lss:0.9:0.1.geojson");
+        assert!(held.contains("needs its fractions in order"), "{held}");
+    }
+
+    fn spellings() -> Vec<&'static str> {
+        let mut held: Vec<&'static str> = vec!["process", "p", "reproject", "r"];
+        for op in super::UNARY {
+            held.extend([op.name, op.short]);
+        }
+        for op in super::SCALAR {
+            held.extend([op.name, op.short]);
+        }
+        held
+    }
+
+    #[test]
+    fn no_two_operations_share_a_spelling() {
+        let held = spellings();
+        let mut seen: Vec<&str> = Vec::new();
+        let mut twice: Vec<&str> = Vec::new();
+        for name in held {
+            match seen.contains(&name) {
+                true => twice.push(name),
+                false => seen.push(name),
+            }
+        }
+        assert!(twice.is_empty(), "these spellings are claimed twice: {twice:?}");
+    }
+
+    #[test]
+    fn the_operation_tables_stay_in_order() {
+        for held in [
+            super::UNARY.iter().map(|op| op.name).collect::<Vec<_>>(),
+            super::SCALAR.iter().map(|op| op.name).collect::<Vec<_>>(),
+        ] {
+            let mut sorted = held.clone();
+            sorted.sort_unstable();
+            assert_eq!(held, sorted, "the table is out of order, which makes a 20 row table unreadable");
+        }
+    }
+
+    #[test]
+    fn every_scalar_operation_is_tested() {
+        assert_eq!(super::SCALAR.len(), 23);
     }
 
     #[rstest]

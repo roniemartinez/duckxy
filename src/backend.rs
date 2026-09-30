@@ -64,6 +64,7 @@ impl Vocabulary {
 pub trait Dialect: Send + Sync {
     fn transform(&self, geometry: SimpleExpr, from: &str, to: &str) -> SimpleExpr;
     fn as_geojson(&self, geometry: SimpleExpr) -> SimpleExpr;
+    fn metres_per_unit(&self, geometry: SimpleExpr, crs: &str) -> SimpleExpr;
 
     fn vocabulary(&self) -> Vocabulary {
         Vocabulary::default()
@@ -86,10 +87,25 @@ impl Dialect for DuckDb {
         Func::cust("ST_AsGeoJSON").arg(geometry).into()
     }
 
+    fn metres_per_unit(&self, geometry: SimpleExpr, crs: &str) -> SimpleExpr {
+        let crs = crs.to_uppercase().replace('\'', "''");
+        Expr::cust_with_exprs(
+            format!(
+                "(SELECT ST_Distance_Spheroid(ST_Point(ST_Y(a), ST_X(a)), ST_Point(ST_Y(b), ST_X(b))) FROM \
+                 (SELECT ST_Transform(p, '{crs}', 'EPSG:4326', always_xy := true) AS a, \
+                 ST_Transform(ST_Point(ST_X(p), ST_Y(p) + 1), '{crs}', 'EPSG:4326', always_xy := true) AS b \
+                 FROM (SELECT ST_Centroid($1) AS p)))"
+            ),
+            [geometry],
+        )
+    }
+
     fn vocabulary(&self) -> Vocabulary {
         let mut vocabulary = Vocabulary::default();
-        for op in crate::process::UNARY {
-            vocabulary.register(op.call, |args: Vec<SimpleExpr>| Func::cust(op.call).args(args).into());
+        let called =
+            crate::process::UNARY.iter().map(|op| op.call).chain(crate::process::SCALAR.iter().map(|op| op.call));
+        for call in called {
+            vocabulary.register(call, move |args: Vec<SimpleExpr>| Func::cust(call).args(args).into());
         }
         vocabulary
     }
@@ -149,13 +165,17 @@ mod tests {
     }
 
     #[test]
-    fn core_only_depends_on_two_dialect_methods() {
+    fn core_only_depends_on_three_dialect_methods() {
         let d = DuckDb;
         assert_eq!(rendered(d.as_geojson(geom())), "ST_AsGeoJSON(\"geom\")");
         assert_eq!(
             rendered(d.transform(geom(), "EPSG:25832", "EPSG:3857")),
             "ST_Transform(\"geom\", 'EPSG:25832', 'EPSG:3857', always_xy := true)"
         );
+        let measured = rendered(d.metres_per_unit(geom(), "epsg:25832"));
+        assert!(measured.starts_with("(SELECT ST_Distance_Spheroid("), "{measured}");
+        assert_eq!(measured.matches("'EPSG:25832'").count(), 2, "the crs is not measured at both ends: {measured}");
+        assert_eq!(measured.matches("ST_Centroid").count(), 1, "the geometry is walked more than once: {measured}");
     }
 
     #[rstest]
@@ -175,6 +195,10 @@ mod tests {
         fn transform(&self, g: SimpleExpr, _: &str, _: &str) -> SimpleExpr {
             g
         }
+        fn metres_per_unit(&self, _: SimpleExpr, _: &str) -> SimpleExpr {
+            Expr::val(1.0)
+        }
+
         fn as_geojson(&self, g: SimpleExpr) -> SimpleExpr {
             g
         }
@@ -188,7 +212,11 @@ mod tests {
 
     #[test]
     fn duckdb_registers_exactly_the_operations_core_calls() {
-        let mut called: Vec<&str> = crate::process::UNARY.iter().map(|op| op.call).collect();
+        let mut called: Vec<&str> = crate::process::UNARY
+            .iter()
+            .map(|op| op.call)
+            .chain(crate::process::SCALAR.iter().map(|op| op.call))
+            .collect();
         called.sort_unstable();
         let registered = Backend::default().operations();
         let unregistered: Vec<&&str> = called.iter().filter(|name| !registered.contains(name)).collect();
