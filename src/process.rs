@@ -98,7 +98,11 @@ pub const SCALAR: &[Scalar] = &[
 ];
 
 fn number(name: &'static str, value: &str) -> anyhow::Result<f64> {
-    value.parse::<f64>().map_err(|_| crate::Fault::bad_request(format!("{name} needs a number, got {value:?}")))
+    match value.parse::<f64>() {
+        Ok(held) if held.is_finite() => Ok(held),
+        Ok(_) => Err(crate::Fault::bad_request(format!("{name} needs a finite number, got {value:?}"))),
+        Err(_) => Err(crate::Fault::bad_request(format!("{name} needs a number, got {value:?}"))),
+    }
 }
 
 fn numbers(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
@@ -500,6 +504,19 @@ mod tests {
     }
 
     #[rstest]
+    #[case("/@dataset:x/@process/rot:inf.geojson", "rotate needs a finite number")]
+    #[case("/@dataset:x/@process/rot:nan.geojson", "rotate needs a finite number")]
+    #[case("/@dataset:x/@process/rot:1e400.geojson", "rotate needs a finite number")]
+    #[case("/@dataset:x/@process/sc:inf:1.geojson", "scale needs a finite number")]
+    #[case("/@dataset:x/@process/f3dz:nan.geojson", "force3dz needs a finite number")]
+    #[case("/@dataset:x/@process/aff:inf:0:0:1:0:0.geojson", "affine needs a finite number")]
+    #[case("/@dataset:x/@process/lip:nan.geojson", "lineinterpolatepoint needs a finite number")]
+    fn a_number_that_is_not_finite_is_refused(#[case] url: &str, #[case] expected: &str) {
+        let held = failed(url);
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[rstest]
     #[case("sc:1km:2", "scale needs a number")]
     #[case("rot:45deg", "rotate needs a number")]
     fn a_unit_on_a_parameter_that_is_not_a_distance_is_refused(#[case] op: &str, #[case] expected: &str) {
@@ -572,6 +589,30 @@ mod tests {
             let mut sorted = held.clone();
             sorted.sort_unstable();
             assert_eq!(held, sorted, "the table is out of order, which makes a 20 row table unreadable");
+        }
+    }
+
+    #[rstest]
+    #[case("inf")]
+    #[case("-inf")]
+    #[case("Inf")]
+    #[case("infinity")]
+    #[case("nan")]
+    #[case("NaN")]
+    #[case("1e400")]
+    #[case("-1e400")]
+    fn no_operation_accepts_a_value_that_is_not_a_number(#[case] value: &str) {
+        for op in super::SCALAR {
+            let arity = op.shapes.iter().map(|shape| shape.len()).max().unwrap_or(1).max(1);
+            let params = vec![value; arity].join(":");
+            let url = format!("/@dataset:x/@process/{}:{params}.geojson", op.name);
+            let Ok(parsed) = crate::url::parse(&url, &Grammar::core()) else {
+                continue;
+            };
+            let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+            let backend = Arc::new(crate::backend::Backend::default());
+            let held = plan(&Grammar::core(), &parsed, "/x.geojson", &columns, Some(WGS84), &[], backend);
+            assert!(held.is_err(), "{} accepted {value:?}: {:?}", op.name, held.map(|out| out.len()));
         }
     }
 

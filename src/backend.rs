@@ -1,4 +1,4 @@
-use sea_query::{Expr, Func, SimpleExpr};
+use sea_query::{Alias, Expr, ExprTrait, Func, Query, SimpleExpr};
 use std::collections::HashMap;
 
 pub trait SqlFn: Send + Sync {
@@ -88,16 +88,27 @@ impl Dialect for DuckDb {
     }
 
     fn metres_per_unit(&self, geometry: SimpleExpr, crs: &str) -> SimpleExpr {
-        let crs = crs.to_uppercase().replace('\'', "''");
-        Expr::cust_with_exprs(
-            format!(
-                "(SELECT ST_Distance_Spheroid(ST_Point(ST_Y(a), ST_X(a)), ST_Point(ST_Y(b), ST_X(b))) FROM \
-                 (SELECT ST_Transform(p, '{crs}', 'EPSG:4326', always_xy := true) AS a, \
-                 ST_Transform(ST_Point(ST_X(p), ST_Y(p) + 1), '{crs}', 'EPSG:4326', always_xy := true) AS b \
-                 FROM (SELECT ST_Centroid($1) AS p)))"
-            ),
-            [geometry],
-        )
+        let here = Query::select().expr_as(Func::cust("ST_Centroid").arg(geometry), Alias::new("p")).take();
+        let at = || Expr::col(Alias::new("p"));
+        let north = Func::cust("ST_Point")
+            .arg(Func::cust("ST_X").arg(at()))
+            .arg(SimpleExpr::from(Func::cust("ST_Y").arg(at())).add(1))
+            .into();
+        let shifted = Query::select()
+            .expr_as(self.transform(at(), crs, crate::sql::WGS84), Alias::new("a"))
+            .expr_as(self.transform(north, crs, crate::sql::WGS84), Alias::new("b"))
+            .from_subquery(here, Alias::new("centre"))
+            .take();
+        let latitude_first = |name: &'static str| {
+            Func::cust("ST_Point")
+                .arg(Func::cust("ST_Y").arg(Expr::col(Alias::new(name))))
+                .arg(Func::cust("ST_X").arg(Expr::col(Alias::new(name))))
+        };
+        let measured = Query::select()
+            .expr(Func::cust("ST_Distance_Spheroid").arg(latitude_first("a")).arg(latitude_first("b")))
+            .from_subquery(shifted, Alias::new("apart"))
+            .take();
+        SimpleExpr::SubQuery(None, Box::new(sea_query::SubQueryStatement::SelectStatement(measured)))
     }
 
     fn vocabulary(&self) -> Vocabulary {
