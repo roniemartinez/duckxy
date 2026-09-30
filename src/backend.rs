@@ -1,4 +1,4 @@
-use sea_query::{Expr, Func, SimpleExpr};
+use sea_query::{Alias, Expr, ExprTrait, Func, Query, SimpleExpr};
 use std::collections::HashMap;
 
 pub trait SqlFn: Send + Sync {
@@ -64,6 +64,7 @@ impl Vocabulary {
 pub trait Dialect: Send + Sync {
     fn transform(&self, geometry: SimpleExpr, from: &str, to: &str) -> SimpleExpr;
     fn as_geojson(&self, geometry: SimpleExpr) -> SimpleExpr;
+    fn metres_per_unit(&self, geometry: SimpleExpr, crs: &str) -> SimpleExpr;
 
     fn vocabulary(&self) -> Vocabulary {
         Vocabulary::default()
@@ -86,10 +87,36 @@ impl Dialect for DuckDb {
         Func::cust("ST_AsGeoJSON").arg(geometry).into()
     }
 
+    fn metres_per_unit(&self, geometry: SimpleExpr, crs: &str) -> SimpleExpr {
+        let here = Query::select().expr_as(Func::cust("ST_Centroid").arg(geometry), Alias::new("p")).take();
+        let at = || Expr::col(Alias::new("p"));
+        let north = Func::cust("ST_Point")
+            .arg(Func::cust("ST_X").arg(at()))
+            .arg(SimpleExpr::from(Func::cust("ST_Y").arg(at())).add(1))
+            .into();
+        let shifted = Query::select()
+            .expr_as(self.transform(at(), crs, crate::sql::WGS84), Alias::new("a"))
+            .expr_as(self.transform(north, crs, crate::sql::WGS84), Alias::new("b"))
+            .from_subquery(here, Alias::new("centre"))
+            .take();
+        let latitude_first = |name: &'static str| {
+            Func::cust("ST_Point")
+                .arg(Func::cust("ST_Y").arg(Expr::col(Alias::new(name))))
+                .arg(Func::cust("ST_X").arg(Expr::col(Alias::new(name))))
+        };
+        let measured = Query::select()
+            .expr(Func::cust("ST_Distance_Spheroid").arg(latitude_first("a")).arg(latitude_first("b")))
+            .from_subquery(shifted, Alias::new("apart"))
+            .take();
+        SimpleExpr::SubQuery(None, Box::new(sea_query::SubQueryStatement::SelectStatement(measured)))
+    }
+
     fn vocabulary(&self) -> Vocabulary {
         let mut vocabulary = Vocabulary::default();
-        for op in crate::process::UNARY {
-            vocabulary.register(op.call, |args: Vec<SimpleExpr>| Func::cust(op.call).args(args).into());
+        let called =
+            crate::process::UNARY.iter().map(|op| op.call).chain(crate::process::SCALAR.iter().map(|op| op.call));
+        for call in called {
+            vocabulary.register(call, move |args: Vec<SimpleExpr>| Func::cust(call).args(args).into());
         }
         vocabulary
     }
@@ -149,13 +176,17 @@ mod tests {
     }
 
     #[test]
-    fn core_only_depends_on_two_dialect_methods() {
+    fn core_only_depends_on_three_dialect_methods() {
         let d = DuckDb;
         assert_eq!(rendered(d.as_geojson(geom())), "ST_AsGeoJSON(\"geom\")");
         assert_eq!(
             rendered(d.transform(geom(), "EPSG:25832", "EPSG:3857")),
             "ST_Transform(\"geom\", 'EPSG:25832', 'EPSG:3857', always_xy := true)"
         );
+        let measured = rendered(d.metres_per_unit(geom(), "epsg:25832"));
+        assert!(measured.starts_with("(SELECT ST_Distance_Spheroid("), "{measured}");
+        assert_eq!(measured.matches("'EPSG:25832'").count(), 2, "the crs is not measured at both ends: {measured}");
+        assert_eq!(measured.matches("ST_Centroid").count(), 1, "the geometry is walked more than once: {measured}");
     }
 
     #[rstest]
@@ -175,6 +206,10 @@ mod tests {
         fn transform(&self, g: SimpleExpr, _: &str, _: &str) -> SimpleExpr {
             g
         }
+        fn metres_per_unit(&self, _: SimpleExpr, _: &str) -> SimpleExpr {
+            Expr::val(1.0)
+        }
+
         fn as_geojson(&self, g: SimpleExpr) -> SimpleExpr {
             g
         }
@@ -188,7 +223,11 @@ mod tests {
 
     #[test]
     fn duckdb_registers_exactly_the_operations_core_calls() {
-        let mut called: Vec<&str> = crate::process::UNARY.iter().map(|op| op.call).collect();
+        let mut called: Vec<&str> = crate::process::UNARY
+            .iter()
+            .map(|op| op.call)
+            .chain(crate::process::SCALAR.iter().map(|op| op.call))
+            .collect();
         called.sort_unstable();
         let registered = Backend::default().operations();
         let unregistered: Vec<&&str> = called.iter().filter(|name| !registered.contains(name)).collect();
