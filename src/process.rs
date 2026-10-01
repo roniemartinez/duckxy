@@ -1,7 +1,18 @@
 use crate::grammar::{Action, Opt, Param, StageCtx, flag, opt};
 use crate::url::Segment;
-use sea_query::{Expr, ExprTrait, SimpleExpr};
+use sea_query::{Alias, Expr, ExprTrait, Func, Query, SimpleExpr};
 use std::sync::LazyLock;
+
+const ONE: &[&[Param]] = &[&[Param::Token]];
+const TWO: &[&[Param]] = &[&[Param::Token, Param::Token]];
+const FOUR: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token]];
+const SIX: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token, Param::Token, Param::Token]];
+const UP_TO_ONE: &[&[Param]] = &[&[], &[Param::Token]];
+const SOURCE: &[&[Param]] = &[&[Param::Source]];
+const TOLERANCE_AND_SOURCE: &[&[Param]] = &[&[Param::Token, Param::Source]];
+const COUNT: &str = "count";
+pub const UNION: &str = "ST_Union_Agg";
+const MEMBERS: &str = "members";
 
 pub struct Unary {
     pub name: &'static str,
@@ -40,14 +51,6 @@ pub struct Parameterised {
     pub shapes: &'static [&'static [Param]],
     pub args: fn(&'static str, &[String], &StageCtx) -> anyhow::Result<Vec<SimpleExpr>>,
 }
-
-const ONE: &[&[Param]] = &[&[Param::Token]];
-const TWO: &[&[Param]] = &[&[Param::Token, Param::Token]];
-const UP_TO_ONE: &[&[Param]] = &[&[], &[Param::Token]];
-const FOUR: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token]];
-const SOURCE: &[&[Param]] = &[&[Param::Source]];
-const TOLERANCE_AND_SOURCE: &[&[Param]] = &[&[Param::Token, Param::Source]];
-const SIX: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token, Param::Token, Param::Token]];
 
 pub const PARAMETERISED: &[Parameterised] = &[
     Parameterised { name: "affine", short: "aff", call: "ST_Affine", shapes: SIX, args: numbers },
@@ -222,8 +225,60 @@ fn dimension(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Res
     }
 }
 
+fn dissolve(ctx: &mut StageCtx, params: &[String]) -> anyhow::Result<()> {
+    let geometry = ctx.geometry().to_string();
+    let carried: Vec<(String, String)> = ctx.columns().iter().filter(|(name, _)| name != &geometry).cloned().collect();
+
+    let grouping = match params {
+        [] => None,
+        [name] => {
+            if [COUNT, MEMBERS].iter().any(|held| name.eq_ignore_ascii_case(held)) {
+                return Err(crate::Fault::bad_request(format!(
+                    "dissolve cannot group by {name:?}, which is the name it gives its own column"
+                )));
+            }
+            match carried.iter().find(|(held, _)| held == name) {
+                Some(held) => Some(held.clone()),
+                None => return Err(anyhow::Error::new(crate::filters::FilterError::UnknownColumn(name.clone()))),
+            }
+        }
+        _ => return Err(crate::Fault::bad_request("dissolve takes at most one column".to_string())),
+    };
+
+    let mut members: Vec<SimpleExpr> = Vec::new();
+    for (name, _) in &carried {
+        members.push(Expr::val(name.as_str()));
+        members.push(Expr::col(Alias::new(name.as_str())));
+    }
+    let holding = Func::cust("json_group_array").arg(Func::cust("json_object").args(members));
+
+    let mut select = Query::select();
+    if let Some((name, _)) = &grouping {
+        select.expr_as(Expr::col(Alias::new(name.as_str())), Alias::new(name.as_str()));
+    }
+    select
+        .expr_as(Func::count(Expr::cust("*")), Alias::new(COUNT))
+        .expr_as(holding, Alias::new(MEMBERS))
+        .expr_as(ctx.call(UNION, vec![ctx.geom()])?, Alias::new(geometry.as_str()))
+        .from(ctx.data());
+    if let Some((name, _)) = &grouping {
+        select.add_group_by([Expr::col(Alias::new(name.as_str()))]);
+    }
+
+    let mut columns = Vec::new();
+    if let Some(held) = grouping {
+        columns.push(held);
+    }
+    columns.push((COUNT.to_string(), "BIGINT".to_string()));
+    columns.push((MEMBERS.to_string(), "JSON".to_string()));
+    columns.push((geometry, "GEOMETRY".to_string()));
+    ctx.regroup(select.take(), columns);
+    Ok(())
+}
+
 static OPTIONS: LazyLock<Vec<Opt>> = LazyLock::new(|| {
     std::iter::once(opt("reproject", "r", &[&[Param::Token], &[Param::Token, Param::Token]]))
+        .chain(std::iter::once(opt("dissolve", "d", &[&[], &[Param::Column]])))
         .chain(UNARY.iter().map(|op| flag(op.name, op.short)))
         .chain(PARAMETERISED.iter().map(|op| opt(op.name, op.short, op.shapes)))
         .collect()
@@ -255,6 +310,7 @@ impl Action for Process {
                     ctx.replace_geometry(geometry);
                     ctx.set_crs(target);
                 }
+                "dissolve" => dissolve(ctx, &segment.params)?,
                 other => {
                     if let Some(op) = UNARY.iter().find(|op| op.name == other) {
                         let geometry = ctx.call(op.call, vec![ctx.geom()])?;
@@ -761,6 +817,108 @@ mod tests {
         let backend = Arc::new(crate::backend::Backend::default());
         let held = plan(&grammar, &parsed, "/x.geojson", &columns, None, &nested, backend).unwrap_err();
         assert!(format!("{held:#}").contains("not negative"), "{held:#}");
+    }
+
+    fn failed_with(url: &str, columns: Vec<(String, String)>) -> String {
+        let grammar = Grammar::core();
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        let backend = Arc::new(crate::backend::Backend::default());
+        format!("{:#}", plan(&grammar, &parsed, "/x.geojson", &columns, Some(WGS84), &[], backend).unwrap_err())
+    }
+
+    fn planned_with(url: &str, columns: Vec<(String, String)>) -> String {
+        let grammar = Grammar::core();
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        let backend = Arc::new(crate::backend::Backend::default());
+        plan(&grammar, &parsed, "/x.geojson", &columns, Some(WGS84), &[], backend).unwrap()
+    }
+
+    #[test]
+    fn a_dissolve_unions_every_row_into_one() {
+        let out = planned("/@dataset:x/@process/d.geojson", Some(WGS84));
+        assert!(out.contains("ST_Union_Agg"), "{out}");
+        assert!(out.contains("COUNT(*)"), "{out}");
+        assert!(out.contains("json_group_array"), "{out}");
+        assert!(!out.contains("GROUP BY"), "an unkeyed dissolve grouped by something: {out}");
+    }
+
+    #[test]
+    fn a_dissolve_keeps_every_property_inside_members() {
+        let out = planned("/@dataset:x/@process/d.geojson", Some(WGS84));
+        assert!(out.contains("json_object('id', \"id\")"), "the source columns are not carried: {out}");
+    }
+
+    #[test]
+    fn a_dissolve_by_column_groups_by_it_and_keeps_it() {
+        let out = planned_with(
+            "/@dataset:x/@process/d:name.geojson",
+            vec![
+                ("name".to_string(), "VARCHAR".to_string()),
+                ("pop".to_string(), "BIGINT".to_string()),
+                ("geom".to_string(), "GEOMETRY".to_string()),
+            ],
+        );
+        assert!(out.contains("GROUP BY \"name\""), "{out}");
+        assert!(out.contains("json_object('name', \"name\", 'pop', \"pop\")"), "{out}");
+        assert!(out.contains("'properties', json_object('name', \"name\", 'count', \"count\", 'members'"), "{out}");
+    }
+
+    #[test]
+    fn a_dissolve_hands_the_output_only_what_survived() {
+        let out = planned("/@dataset:x/@process/d.geojson", Some(WGS84));
+        let tail = &out[out.rfind("SELECT CAST(json_object").expect("the output select is missing")..];
+        assert!(tail.contains("'count', \"count\""), "{tail}");
+        assert!(tail.contains("'members', \"members\""), "{tail}");
+        assert!(!tail.contains("'id', \"id\""), "a column that no longer exists reached the output: {tail}");
+    }
+
+    #[test]
+    fn a_dissolve_of_a_source_with_only_a_geometry_still_counts() {
+        let out = planned_with("/@dataset:x/@process/d.geojson", vec![("geom".to_string(), "GEOMETRY".to_string())]);
+        assert!(out.contains("json_group_array(json_object())"), "{out}");
+        assert!(out.contains("COUNT(*)"), "{out}");
+    }
+
+    #[test]
+    fn a_dissolve_chains_with_the_operations_around_it() {
+        let out = planned("/@dataset:x/@process/mv,d,ctr.geojson", Some(WGS84));
+        let valid = out.find("ST_MakeValid").expect("makevalid missing");
+        let union = out.find("ST_Union_Agg").expect("dissolve missing");
+        let centre = out.find("ST_Centroid").expect("centroid missing");
+        assert!(valid < union && union < centre, "the steps are out of order: {out}");
+    }
+
+    #[test]
+    fn a_dissolve_reads_the_crs_a_reproject_set() {
+        let out = planned("/@dataset:x/@process/r:3857,d.geojson", Some("EPSG:25832"));
+        assert!(out.contains("'EPSG:3857', 'EPSG:4326'"), "the output did not convert from the last crs: {out}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x/@process/d:nope.geojson", "source has no column: nope")]
+    #[case("/@dataset:x/@process/d:count.geojson", "cannot group by \"count\"")]
+    #[case("/@dataset:x/@process/d:members.geojson", "cannot group by \"members\"")]
+    #[case("/@dataset:x/@process/d:Count.geojson", "cannot group by \"Count\"")]
+    #[case("/@dataset:x/@process/d:COUNT.geojson", "cannot group by \"COUNT\"")]
+    #[case("/@dataset:x/@process/d:Members.geojson", "cannot group by \"Members\"")]
+    #[case("/@dataset:x/@process/d:MEMBERS.geojson", "cannot group by \"MEMBERS\"")]
+    fn a_dissolve_that_cannot_group_says_why(#[case] url: &str, #[case] expected: &str) {
+        let held = failed(url);
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[test]
+    fn a_dissolve_refuses_a_column_duckdb_would_read_as_its_own() {
+        let held = failed_with(
+            "/@dataset:x/@process/d:Count.geojson",
+            vec![("Count".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())],
+        );
+        assert!(held.contains("cannot group by"), "a case that duckdb folds together was allowed: {held:?}");
+    }
+
+    #[test]
+    fn a_dissolve_takes_at_most_one_column() {
+        assert!(crate::url::parse("/@dataset:x/@process/d:a:b.geojson", &Grammar::core()).is_err());
     }
 
     #[test]

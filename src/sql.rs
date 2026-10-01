@@ -202,6 +202,11 @@ impl Pipeline {
         self.input_name = name;
     }
 
+    pub fn regroup(&mut self, prefix: &str, select: SelectStatement, columns: Vec<(String, String)>) {
+        self.step(prefix, select);
+        self.columns = columns;
+    }
+
     pub fn cte_once(&mut self, prefix: &str, name: &str, build: impl FnOnce(&Alias) -> SelectStatement) -> Alias {
         if let Some(alias) = self.cte(prefix, name) {
             return alias;
