@@ -162,6 +162,10 @@ impl<'a> StageCtx<'a> {
         self.pipeline.replace_geometry(self.action, geometry);
     }
 
+    pub fn regroup(&mut self, select: SelectStatement, columns: Vec<(String, String)>) {
+        self.pipeline.regroup(self.action, select, columns);
+    }
+
     pub fn geom(&self) -> SimpleExpr {
         sea_query::Expr::col(Alias::new(self.pipeline.geometry()))
     }
