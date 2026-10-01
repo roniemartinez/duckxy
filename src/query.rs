@@ -6,7 +6,29 @@ use std::cell::RefCell;
 const CHUNK_BYTES: usize = 64 * 1024;
 
 thread_local! {
-    static CONNECTION: RefCell<Option<Connection>> = const { RefCell::new(None) };
+    static CONNECTION: ThreadConnection = const { ThreadConnection(RefCell::new(None)) };
+}
+
+struct ThreadConnection(RefCell<Option<Connection>>);
+
+impl Drop for ThreadConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.get_mut().take() {
+            let _ = closer().send(conn);
+        }
+    }
+}
+
+fn closer() -> &'static std::sync::mpsc::Sender<Connection> {
+    static CLOSER: std::sync::OnceLock<std::sync::mpsc::Sender<Connection>> = std::sync::OnceLock::new();
+    CLOSER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Connection>();
+        std::thread::Builder::new()
+            .name("duckdb-closer".into())
+            .spawn(move || receiver.into_iter().for_each(drop))
+            .expect("spawn the duckdb closer");
+        sender
+    })
 }
 
 #[derive(Debug)]
@@ -38,8 +60,9 @@ fn install_once() -> Result<()> {
 }
 
 pub(crate) fn with_connection<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    CONNECTION.with(|cell| {
+    CONNECTION.with(|ThreadConnection(cell)| {
         if cell.borrow().is_none() {
+            closer();
             let conn = Connection::open_in_memory().context("open duckdb")?;
             conn.execute_batch(&format!("LOAD spatial; {}", tuning())).context("load the spatial extension")?;
             conn.register_table_function::<crate::parexp::Parexp>("parexp").context("register parexp")?;
@@ -683,6 +706,20 @@ mod tests {
         assert!(database_is_invalidated(&err));
 
         assert!(!with_connection(|c| Ok(marker_exists(c))).unwrap(), "the invalidated database was reused");
+    }
+
+    #[test]
+    fn a_thread_that_exits_leaves_the_heap_intact() {
+        crate::ensure_spatial();
+        for _ in 0..32 {
+            std::thread::spawn(|| {
+                let fill = "CREATE TABLE t AS SELECT i, repeat('x', 64) AS s FROM range(200000) r(i)";
+                with_connection(|c| c.execute_batch(fill).context("fill")).unwrap();
+                Connection::open_in_memory().unwrap().execute_batch(fill).unwrap();
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     #[test]
