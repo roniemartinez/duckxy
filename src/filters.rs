@@ -216,15 +216,8 @@ fn intersects(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleEx
     let Some(held) = ctx.nested(raw) else {
         return Err(crate::Fault::bad_request(format!("nested source was not resolved: {raw}")));
     };
-    let geometry = Expr::col((held.relation.clone(), Alias::new(held.geometry.as_str())));
-    let shaped = match crate::sql::same_crs(&held.crs, ctx.crs()) {
-        true => geometry,
-        false => ctx.dialect().transform(geometry, &held.crs, ctx.crs()),
-    };
-    let relation = held.relation.clone();
-    let gathered = Query::select().expr(Func::cust("ST_Union_Agg").arg(shaped)).from(relation).take();
-    let subquery = SimpleExpr::SubQuery(None, Box::new(sea_query::SubQueryStatement::SelectStatement(gathered)));
-    Ok(Func::cust("ST_Intersects").arg(ctx.geom()).arg(subquery).into())
+    let gathered = crate::sql::nested_geometry(held, ctx.crs(), ctx.dialect());
+    Ok(Func::cust("ST_Intersects").arg(ctx.geom()).arg(gathered).into())
 }
 
 fn closed(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {

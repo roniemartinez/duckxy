@@ -4,7 +4,7 @@ use crate::grammar::{Grammar, ParamError, StageCtx};
 use crate::url::{ParsedUrl, Segment};
 use crate::{filters, query};
 use sea_query::{
-    Alias, CommonTableExpression, Expr, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr, WithClause,
+    Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr, WithClause,
 };
 use std::sync::Arc;
 
@@ -29,6 +29,16 @@ pub struct NestedRelation {
     pub relation: Alias,
     pub geometry: String,
     pub crs: String,
+}
+
+pub fn nested_geometry(held: &NestedRelation, crs: &str, dialect: &dyn crate::backend::Dialect) -> SimpleExpr {
+    let geometry = Expr::col((held.relation.clone(), Alias::new(held.geometry.as_str())));
+    let shaped = match same_crs(&held.crs, crs) {
+        true => geometry,
+        false => dialect.transform(geometry, &held.crs, crs),
+    };
+    let gathered = Query::select().expr(Func::cust("ST_Union_Agg").arg(shaped)).from(held.relation.clone()).take();
+    SimpleExpr::SubQuery(None, Box::new(sea_query::SubQueryStatement::SelectStatement(gathered)))
 }
 
 impl Pipeline {
