@@ -232,7 +232,7 @@ fn dissolve(ctx: &mut StageCtx, params: &[String]) -> anyhow::Result<()> {
     let grouping = match params {
         [] => None,
         [name] => {
-            if name == COUNT || name == MEMBERS {
+            if [COUNT, MEMBERS].iter().any(|held| name.eq_ignore_ascii_case(held)) {
                 return Err(crate::Fault::bad_request(format!(
                     "dissolve cannot group by {name:?}, which is the name it gives its own column"
                 )));
@@ -819,6 +819,13 @@ mod tests {
         assert!(format!("{held:#}").contains("not negative"), "{held:#}");
     }
 
+    fn failed_with(url: &str, columns: Vec<(String, String)>) -> String {
+        let grammar = Grammar::core();
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        let backend = Arc::new(crate::backend::Backend::default());
+        format!("{:#}", plan(&grammar, &parsed, "/x.geojson", &columns, Some(WGS84), &[], backend).unwrap_err())
+    }
+
     fn planned_with(url: &str, columns: Vec<(String, String)>) -> String {
         let grammar = Grammar::core();
         let parsed = crate::url::parse(url, &grammar).unwrap();
@@ -891,9 +898,22 @@ mod tests {
     #[case("/@dataset:x/@process/d:nope.geojson", "source has no column: nope")]
     #[case("/@dataset:x/@process/d:count.geojson", "cannot group by \"count\"")]
     #[case("/@dataset:x/@process/d:members.geojson", "cannot group by \"members\"")]
+    #[case("/@dataset:x/@process/d:Count.geojson", "cannot group by \"Count\"")]
+    #[case("/@dataset:x/@process/d:COUNT.geojson", "cannot group by \"COUNT\"")]
+    #[case("/@dataset:x/@process/d:Members.geojson", "cannot group by \"Members\"")]
+    #[case("/@dataset:x/@process/d:MEMBERS.geojson", "cannot group by \"MEMBERS\"")]
     fn a_dissolve_that_cannot_group_says_why(#[case] url: &str, #[case] expected: &str) {
         let held = failed(url);
         assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[test]
+    fn a_dissolve_refuses_a_column_duckdb_would_read_as_its_own() {
+        let held = failed_with(
+            "/@dataset:x/@process/d:Count.geojson",
+            vec![("Count".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())],
+        );
+        assert!(held.contains("cannot group by"), "a case that duckdb folds together was allowed: {held:?}");
     }
 
     #[test]
