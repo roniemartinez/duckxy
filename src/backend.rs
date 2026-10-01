@@ -113,8 +113,10 @@ impl Dialect for DuckDb {
 
     fn vocabulary(&self) -> Vocabulary {
         let mut vocabulary = Vocabulary::default();
-        let called =
-            crate::process::UNARY.iter().map(|op| op.call).chain(crate::process::SCALAR.iter().map(|op| op.call));
+        let called = crate::process::UNARY
+            .iter()
+            .map(|op| op.call)
+            .chain(crate::process::PARAMETERISED.iter().map(|op| op.call));
         for call in called {
             vocabulary.register(call, move |args: Vec<SimpleExpr>| Func::cust(call).args(args).into());
         }
@@ -226,7 +228,7 @@ mod tests {
         let mut called: Vec<&str> = crate::process::UNARY
             .iter()
             .map(|op| op.call)
-            .chain(crate::process::SCALAR.iter().map(|op| op.call))
+            .chain(crate::process::PARAMETERISED.iter().map(|op| op.call))
             .collect();
         called.sort_unstable();
         let registered = Backend::default().operations();

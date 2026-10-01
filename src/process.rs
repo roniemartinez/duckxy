@@ -33,7 +33,7 @@ pub const UNARY: &[Unary] = &[
     Unary { name: "voronoidiagram", short: "vd", call: "ST_VoronoiDiagram" },
 ];
 
-pub struct Scalar {
+pub struct Parameterised {
     pub name: &'static str,
     pub short: &'static str,
     pub call: &'static str,
@@ -45,56 +45,70 @@ const ONE: &[&[Param]] = &[&[Param::Token]];
 const TWO: &[&[Param]] = &[&[Param::Token, Param::Token]];
 const UP_TO_ONE: &[&[Param]] = &[&[], &[Param::Token]];
 const FOUR: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token]];
+const SOURCE: &[&[Param]] = &[&[Param::Source]];
+const TOLERANCE_AND_SOURCE: &[&[Param]] = &[&[Param::Token, Param::Source]];
 const SIX: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::Token, Param::Token, Param::Token]];
 
-pub const SCALAR: &[Scalar] = &[
-    Scalar { name: "affine", short: "aff", call: "ST_Affine", shapes: SIX, args: numbers },
-    Scalar { name: "buffer", short: "b", call: "ST_Buffer", shapes: ONE, args: distances },
-    Scalar { name: "expand", short: "exp", call: "ST_Expand", shapes: ONE, args: distances },
-    Scalar { name: "extract", short: "ex", call: "ST_CollectionExtract", shapes: ONE, args: dimension },
-    Scalar { name: "force3dm", short: "f3dm", call: "ST_Force3DM", shapes: ONE, args: numbers },
-    Scalar { name: "force3dz", short: "f3dz", call: "ST_Force3DZ", shapes: ONE, args: numbers },
-    Scalar { name: "force4d", short: "f4d", call: "ST_Force4D", shapes: TWO, args: numbers },
-    Scalar { name: "interiorringn", short: "irn", call: "ST_InteriorRingN", shapes: ONE, args: integers },
-    Scalar {
+pub const PARAMETERISED: &[Parameterised] = &[
+    Parameterised { name: "affine", short: "aff", call: "ST_Affine", shapes: SIX, args: numbers },
+    Parameterised { name: "buffer", short: "b", call: "ST_Buffer", shapes: ONE, args: distances },
+    Parameterised { name: "clip", short: "cl", call: "ST_Intersection", shapes: SOURCE, args: against },
+    Parameterised { name: "closestpoint", short: "cp", call: "ST_ClosestPoint", shapes: SOURCE, args: against },
+    Parameterised { name: "diff", short: "df", call: "ST_Difference", shapes: SOURCE, args: against },
+    Parameterised { name: "expand", short: "exp", call: "ST_Expand", shapes: ONE, args: distances },
+    Parameterised { name: "extract", short: "ex", call: "ST_CollectionExtract", shapes: ONE, args: dimension },
+    Parameterised { name: "force3dm", short: "f3dm", call: "ST_Force3DM", shapes: ONE, args: numbers },
+    Parameterised { name: "force3dz", short: "f3dz", call: "ST_Force3DZ", shapes: ONE, args: numbers },
+    Parameterised { name: "force4d", short: "f4d", call: "ST_Force4D", shapes: TWO, args: numbers },
+    Parameterised { name: "interiorringn", short: "irn", call: "ST_InteriorRingN", shapes: ONE, args: integers },
+    Parameterised {
         name: "lineinterpolatepoint",
         short: "lip",
         call: "ST_LineInterpolatePoint",
         shapes: ONE,
         args: fractions,
     },
-    Scalar {
+    Parameterised {
         name: "lineinterpolatepoints",
         short: "lips",
         call: "ST_LineInterpolatePoints",
         shapes: ONE,
         args: fractions_repeating,
     },
-    Scalar { name: "linesubstring", short: "lss", call: "ST_LineSubstring", shapes: TWO, args: rising_fractions },
-    Scalar { name: "pointn", short: "pn", call: "ST_PointN", shapes: ONE, args: integers },
-    Scalar { name: "reduceprecision", short: "rp", call: "ST_ReducePrecision", shapes: ONE, args: tolerances },
-    Scalar {
+    Parameterised {
+        name: "linesubstring",
+        short: "lss",
+        call: "ST_LineSubstring",
+        shapes: TWO,
+        args: rising_fractions,
+    },
+    Parameterised { name: "pointn", short: "pn", call: "ST_PointN", shapes: ONE, args: integers },
+    Parameterised { name: "reduceprecision", short: "rp", call: "ST_ReducePrecision", shapes: ONE, args: tolerances },
+    Parameterised {
         name: "removerepeatedpoints",
         short: "removepoints",
         call: "ST_RemoveRepeatedPoints",
         shapes: UP_TO_ONE,
         args: tolerances,
     },
-    Scalar { name: "rotate", short: "rot", call: "ST_Rotate", shapes: ONE, args: numbers },
-    Scalar { name: "rotatex", short: "rotx", call: "ST_RotateX", shapes: ONE, args: numbers },
-    Scalar { name: "rotatey", short: "roty", call: "ST_RotateY", shapes: ONE, args: numbers },
-    Scalar { name: "rotatez", short: "rotz", call: "ST_RotateZ", shapes: ONE, args: numbers },
-    Scalar { name: "scale", short: "sc", call: "ST_Scale", shapes: TWO, args: numbers },
-    Scalar { name: "simplify", short: "s", call: "ST_Simplify", shapes: ONE, args: tolerances },
-    Scalar {
+    Parameterised { name: "rotate", short: "rot", call: "ST_Rotate", shapes: ONE, args: numbers },
+    Parameterised { name: "rotatex", short: "rotx", call: "ST_RotateX", shapes: ONE, args: numbers },
+    Parameterised { name: "rotatey", short: "roty", call: "ST_RotateY", shapes: ONE, args: numbers },
+    Parameterised { name: "rotatez", short: "rotz", call: "ST_RotateZ", shapes: ONE, args: numbers },
+    Parameterised { name: "scale", short: "sc", call: "ST_Scale", shapes: TWO, args: numbers },
+    Parameterised { name: "shortestline", short: "shl", call: "ST_ShortestLine", shapes: SOURCE, args: against },
+    Parameterised { name: "simplify", short: "s", call: "ST_Simplify", shapes: ONE, args: tolerances },
+    Parameterised {
         name: "simplifypreservetopology",
         short: "spt",
         call: "ST_SimplifyPreserveTopology",
         shapes: ONE,
         args: tolerances,
     },
-    Scalar { name: "translate", short: "tl", call: "ST_Translate", shapes: TWO, args: distances },
-    Scalar { name: "transscale", short: "ts", call: "ST_TransScale", shapes: FOUR, args: numbers },
+    Parameterised { name: "snap", short: "sn", call: "ST_Snap", shapes: TOLERANCE_AND_SOURCE, args: snapping },
+    Parameterised { name: "symdiff", short: "sd", call: "ST_SymDifference", shapes: SOURCE, args: against },
+    Parameterised { name: "translate", short: "tl", call: "ST_Translate", shapes: TWO, args: distances },
+    Parameterised { name: "transscale", short: "ts", call: "ST_TransScale", shapes: FOUR, args: numbers },
 ];
 
 fn number(name: &'static str, value: &str) -> anyhow::Result<f64> {
@@ -126,19 +140,16 @@ fn distances(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::R
     params.iter().map(|held| Ok(scaled(measured(name, held)?, ctx))).collect()
 }
 
+fn tolerance(name: &'static str, param: &str, ctx: &StageCtx) -> anyhow::Result<SimpleExpr> {
+    let measure = measured(name, param)?;
+    match measure.is_negative() {
+        true => Err(crate::Fault::bad_request(format!("{name} needs a tolerance that is not negative, got {param:?}"))),
+        false => Ok(scaled(measure, ctx)),
+    }
+}
+
 fn tolerances(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
-    params
-        .iter()
-        .map(|held| {
-            let measure = measured(name, held)?;
-            match measure.is_negative() {
-                true => Err(crate::Fault::bad_request(format!(
-                    "{name} needs a tolerance that is not negative, got {held:?}"
-                ))),
-                false => Ok(scaled(measure, ctx)),
-            }
-        })
-        .collect()
+    params.iter().map(|held| tolerance(name, held, ctx)).collect()
 }
 
 fn integers(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
@@ -178,6 +189,28 @@ fn fractions_repeating(name: &'static str, params: &[String], ctx: &StageCtx) ->
     Ok(args)
 }
 
+fn gathered(name: &'static str, raw: &str, ctx: &StageCtx) -> anyhow::Result<SimpleExpr> {
+    match ctx.nested(raw) {
+        Some(held) => Ok(crate::sql::nested_geometry(held, ctx.crs(), ctx.dialect())),
+        None => Err(crate::Fault::bad_request(format!("{name} could not resolve the source {raw}"))),
+    }
+}
+
+fn against(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    let [raw] = params else {
+        return Err(crate::Fault::bad_request(format!("{name} takes one source")));
+    };
+    Ok(vec![gathered(name, raw, ctx)?])
+}
+
+fn snapping(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
+    let [within, raw] = params else {
+        return Err(crate::Fault::bad_request(format!("{name} takes a tolerance and a source")));
+    };
+    let held = tolerance(name, within, ctx)?;
+    Ok(vec![gathered(name, raw, ctx)?, held])
+}
+
 fn dimension(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
     let held = params.first().and_then(|held| held.parse::<i32>().ok()).filter(|held| (1..=3).contains(held));
     match held {
@@ -192,7 +225,7 @@ fn dimension(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Res
 static OPTIONS: LazyLock<Vec<Opt>> = LazyLock::new(|| {
     std::iter::once(opt("reproject", "r", &[&[Param::Token], &[Param::Token, Param::Token]]))
         .chain(UNARY.iter().map(|op| flag(op.name, op.short)))
-        .chain(SCALAR.iter().map(|op| opt(op.name, op.short, op.shapes)))
+        .chain(PARAMETERISED.iter().map(|op| opt(op.name, op.short, op.shapes)))
         .collect()
 });
 
@@ -228,7 +261,7 @@ impl Action for Process {
                         ctx.replace_geometry(geometry);
                         continue;
                     }
-                    let Some(op) = SCALAR.iter().find(|op| op.name == other) else {
+                    let Some(op) = PARAMETERISED.iter().find(|op| op.name == other) else {
                         anyhow::bail!("option {other:?} is not handled");
                     };
                     let mut args = vec![ctx.geom()];
@@ -560,7 +593,7 @@ mod tests {
         for op in super::UNARY {
             held.extend([op.name, op.short]);
         }
-        for op in super::SCALAR {
+        for op in super::PARAMETERISED {
             held.extend([op.name, op.short]);
         }
         held
@@ -584,7 +617,7 @@ mod tests {
     fn the_operation_tables_stay_in_order() {
         for held in [
             super::UNARY.iter().map(|op| op.name).collect::<Vec<_>>(),
-            super::SCALAR.iter().map(|op| op.name).collect::<Vec<_>>(),
+            super::PARAMETERISED.iter().map(|op| op.name).collect::<Vec<_>>(),
         ] {
             let mut sorted = held.clone();
             sorted.sort_unstable();
@@ -602,7 +635,7 @@ mod tests {
     #[case("1e400")]
     #[case("-1e400")]
     fn no_operation_accepts_a_value_that_is_not_a_number(#[case] value: &str) {
-        for op in super::SCALAR {
+        for op in super::PARAMETERISED {
             let arity = op.shapes.iter().map(|shape| shape.len()).max().unwrap_or(1).max(1);
             let params = vec![value; arity].join(":");
             let url = format!("/@dataset:x/@process/{}:{params}.geojson", op.name);
@@ -616,9 +649,123 @@ mod tests {
         }
     }
 
+    fn described(raw: &str, source: &str, crs: Option<&str>) -> crate::query::Described {
+        crate::query::Described {
+            raw: raw.to_string(),
+            source: source.to_string(),
+            encoding: "UTF-8".to_string(),
+            columns: vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())],
+            crs: crs.map(str::to_string),
+        }
+    }
+
+    fn planned_against(url: &str, crs: Option<&str>, nested: &[crate::query::Described]) -> String {
+        let grammar = Grammar::core();
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        let backend = Arc::new(crate::backend::Backend::default());
+        plan(&grammar, &parsed, "/x.geojson", &columns, crs, nested, backend).unwrap()
+    }
+
+    #[rstest]
+    #[case("clip", "cl", "ST_Intersection")]
+    #[case("closestpoint", "cp", "ST_ClosestPoint")]
+    #[case("diff", "df", "ST_Difference")]
+    #[case("shortestline", "shl", "ST_ShortestLine")]
+    #[case("symdiff", "sd", "ST_SymDifference")]
+    fn an_operation_against_a_source_unions_it(#[case] long: &str, #[case] short: &str, #[case] call: &str) {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", None)];
+        let spelled = planned_against(&format!("/@dataset:x/@process/{long}:(@dataset:zones).geojson"), None, &nested);
+        let brief = planned_against(&format!("/@dataset:x/@p/{short}:(@dataset:zones).geojson"), None, &nested);
+        assert!(spelled.contains(call), "{spelled}");
+        assert!(spelled.contains("ST_Union_Agg"), "the source was not gathered: {spelled}");
+        assert!(spelled.contains("\"nested_1\""), "the source built no cte: {spelled}");
+        assert_eq!(spelled, brief, "{long} and {short} planned differently");
+    }
+
     #[test]
-    fn every_scalar_operation_is_tested() {
-        assert_eq!(super::SCALAR.len(), 23);
+    fn snap_takes_its_tolerance_after_the_source() {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", None)];
+        let out = planned_against("/@dataset:x/@process/sn:0.5:(@dataset:zones).geojson", None, &nested);
+        assert!(out.contains("ST_Snap"), "{out}");
+        let at = out.find("ST_Snap").unwrap();
+        let tail = &out[at..];
+        assert!(tail.contains("0.5"), "the tolerance did not reach the call: {tail}");
+        assert!(
+            tail.find("ST_Union_Agg").unwrap() < tail.find("0.5").unwrap(),
+            "the arguments are the wrong way round: {tail}"
+        );
+    }
+
+    #[test]
+    fn a_source_in_another_crs_is_transformed_before_it_is_gathered() {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", Some("EPSG:3857"))];
+        let out = planned_against("/@dataset:x/@process/cl:(@dataset:zones).geojson", Some("EPSG:25832"), &nested);
+        assert!(out.contains("'EPSG:3857', 'EPSG:25832'"), "the source was not brought into the pipeline crs: {out}");
+    }
+
+    #[test]
+    fn a_source_already_in_the_pipeline_crs_is_not_transformed() {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", Some("EPSG:25832"))];
+        let out = planned_against("/@dataset:x/@process/cl:(@dataset:zones).geojson", Some("EPSG:25832"), &nested);
+        assert!(!out.contains("'EPSG:25832', 'EPSG:25832'"), "the source was transformed to its own crs: {out}");
+    }
+
+    #[test]
+    fn an_operation_against_a_source_can_follow_another_operation() {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", None)];
+        let out = planned_against("/@dataset:x/@process/mv,cl:(@dataset:zones).geojson", None, &nested);
+        assert!(out.find("ST_MakeValid").unwrap() < out.find("ST_Intersection").unwrap(), "out of order: {out}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x/@process/cl.geojson")]
+    #[case("/@dataset:x/@process/sn:(@dataset:zones).geojson")]
+    #[case("/@dataset:x/@process/sn:0.5.geojson")]
+    fn a_source_operation_without_its_source_is_refused_by_the_parser(#[case] url: &str) {
+        assert!(crate::url::parse(url, &Grammar::core()).is_err(), "{url} parsed");
+    }
+
+    #[test]
+    fn a_source_that_is_not_a_source_is_refused_by_the_planner() {
+        let grammar = Grammar::core();
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse("/@dataset:x/@process/cl:zones.geojson", &grammar).unwrap();
+        let backend = Arc::new(crate::backend::Backend::default());
+        let held = plan(&grammar, &parsed, "/x.geojson", &columns, None, &[], backend).unwrap_err();
+        assert!(format!("{held:#}").contains("expected a nested source"), "{held:#}");
+    }
+
+    #[test]
+    fn a_snap_tolerance_takes_a_unit() {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", None)];
+        let out = planned_against("/@dataset:x/@process/sn:100m:(@dataset:zones).geojson", Some("EPSG:4326"), &nested);
+        assert!(out.contains("ST_Snap"), "{out}");
+        assert!(out.contains("ST_Distance_Spheroid"), "the tolerance did not convert its unit: {out}");
+        assert!(out.contains("100 / ("), "the metres did not reach the conversion: {out}");
+    }
+
+    #[test]
+    fn a_bare_snap_tolerance_stays_in_the_crs_unit() {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", None)];
+        let out = planned_against("/@dataset:x/@process/sn:0.5:(@dataset:zones).geojson", Some("EPSG:4326"), &nested);
+        assert!(!out.contains("ST_Distance_Spheroid"), "a bare tolerance was converted: {out}");
+    }
+
+    #[test]
+    fn a_negative_snap_tolerance_is_refused() {
+        let nested = [described("(@dataset:zones)", "/zones.geojson", None)];
+        let grammar = Grammar::core();
+        let columns = vec![("id".to_string(), "BIGINT".to_string()), ("geom".to_string(), "GEOMETRY".to_string())];
+        let parsed = crate::url::parse("/@dataset:x/@process/sn:-1:(@dataset:zones).geojson", &grammar).unwrap();
+        let backend = Arc::new(crate::backend::Backend::default());
+        let held = plan(&grammar, &parsed, "/x.geojson", &columns, None, &nested, backend).unwrap_err();
+        assert!(format!("{held:#}").contains("not negative"), "{held:#}");
+    }
+
+    #[test]
+    fn every_parameterised_operation_is_tested() {
+        assert_eq!(super::PARAMETERISED.len(), 29);
     }
 
     #[rstest]
