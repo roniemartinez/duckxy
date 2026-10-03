@@ -1,6 +1,6 @@
 use crate::grammar::{Action, Boolean, FromParam, Opt, Param, StageCtx, flag, opt};
 use crate::url::Segment;
-use sea_query::{Alias, Expr, ExprTrait, Func, Query, SimpleExpr};
+use sea_query::{Alias, Expr, Func, Query, SimpleExpr};
 use std::sync::LazyLock;
 
 const ONE: &[&[Param]] = &[&[Param::Token]];
@@ -222,12 +222,7 @@ fn measured(name: &'static str, param: &str) -> anyhow::Result<crate::units::Mea
 }
 
 fn scaled(measure: crate::units::Measure, ctx: &StageCtx) -> SimpleExpr {
-    match measure {
-        crate::units::Measure::Units(value) => Expr::val(value),
-        crate::units::Measure::Metres(metres) => {
-            Expr::val(metres).div(ctx.dialect().metres_per_unit(ctx.geom(), ctx.crs()))
-        }
-    }
+    crate::sql::scaled(measure, ctx.geom(), ctx.crs(), ctx.dialect())
 }
 
 fn distances(name: &'static str, params: &[String], ctx: &StageCtx) -> anyhow::Result<Vec<SimpleExpr>> {
