@@ -113,12 +113,15 @@ impl Dialect for DuckDb {
 
     fn vocabulary(&self) -> Vocabulary {
         let mut vocabulary = Vocabulary::default();
-        let called = crate::process::UNARY
+        let mut called: Vec<&'static str> = crate::process::UNARY
             .iter()
             .map(|op| op.call)
             .chain(crate::process::PARAMETERISED.iter().map(|op| op.call))
             .chain(crate::process::COLLAPSING.iter().map(|op| op.call))
-            .chain(std::iter::once(crate::process::DUMP));
+            .chain(crate::process::UNPACKED.iter().map(|op| op.call))
+            .collect();
+        called.sort_unstable();
+        called.dedup();
         for call in called {
             vocabulary.register(call, move |args: Vec<SimpleExpr>| Func::cust(call).args(args).into());
         }
@@ -232,7 +235,7 @@ mod tests {
             .map(|op| op.call)
             .chain(crate::process::PARAMETERISED.iter().map(|op| op.call))
             .chain(crate::process::COLLAPSING.iter().map(|op| op.call))
-            .chain(std::iter::once(crate::process::DUMP))
+            .chain(crate::process::UNPACKED.iter().map(|op| op.call))
             .collect();
         called.sort_unstable();
         let registered = Backend::default().operations();
@@ -240,6 +243,20 @@ mod tests {
         let uncalled: Vec<&&str> = registered.iter().filter(|name| !called.contains(name)).collect();
         assert!(unregistered.is_empty(), "core calls an operation duckdb never registered: {unregistered:?}");
         assert!(uncalled.is_empty(), "duckdb registered an operation core never calls: {uncalled:?}");
+    }
+
+    #[test]
+    fn a_function_two_operations_share_registers_once() {
+        let shared = "ST_Envelope";
+        let users: Vec<&str> = crate::process::UNARY
+            .iter()
+            .map(|op| op.name)
+            .filter(|_| crate::process::UNARY.iter().any(|op| op.call == shared))
+            .chain(crate::process::COLLAPSING.iter().filter(|op| op.call == shared).map(|op| op.name))
+            .collect();
+        assert!(users.len() > 1, "{shared} is no longer shared, so this test proves nothing: {users:?}");
+        let registered = Backend::default().operations();
+        assert_eq!(registered.iter().filter(|name| **name == shared).count(), 1, "{shared} registered twice");
     }
 
     #[rstest]
