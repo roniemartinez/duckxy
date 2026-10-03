@@ -117,7 +117,8 @@ impl Dialect for DuckDb {
             .iter()
             .map(|op| op.call)
             .chain(crate::process::PARAMETERISED.iter().map(|op| op.call))
-            .chain(std::iter::once(crate::process::UNION));
+            .chain(crate::process::COLLAPSING.iter().map(|op| op.call))
+            .chain(std::iter::once(crate::process::DUMP));
         for call in called {
             vocabulary.register(call, move |args: Vec<SimpleExpr>| Func::cust(call).args(args).into());
         }
@@ -230,7 +231,8 @@ mod tests {
             .iter()
             .map(|op| op.call)
             .chain(crate::process::PARAMETERISED.iter().map(|op| op.call))
-            .chain(std::iter::once(crate::process::UNION))
+            .chain(crate::process::COLLAPSING.iter().map(|op| op.call))
+            .chain(std::iter::once(crate::process::DUMP))
             .collect();
         called.sort_unstable();
         let registered = Backend::default().operations();
