@@ -10,9 +10,8 @@ const SIX: &[&[Param]] = &[&[Param::Token, Param::Token, Param::Token, Param::To
 const UP_TO_ONE: &[&[Param]] = &[&[], &[Param::Token]];
 const SOURCE: &[&[Param]] = &[&[Param::Source]];
 const TOLERANCE_AND_SOURCE: &[&[Param]] = &[&[Param::Token, Param::Source]];
-const COUNT: &str = "count";
-pub const UNION: &str = "ST_Union_Agg";
-const MEMBERS: &str = "members";
+const UP_TO_COLUMN: &[&[Param]] = &[&[], &[Param::Column]];
+pub const DUMP: &str = "ST_Dump";
 
 pub struct Unary {
     pub name: &'static str,
@@ -42,6 +41,19 @@ pub const UNARY: &[Unary] = &[
     Unary { name: "reverse", short: "rev", call: "ST_Reverse" },
     Unary { name: "startpoint", short: "stp", call: "ST_StartPoint" },
     Unary { name: "voronoidiagram", short: "vd", call: "ST_VoronoiDiagram" },
+];
+
+pub struct Collapsing {
+    pub name: &'static str,
+    pub short: &'static str,
+    pub call: &'static str,
+    pub listed: bool,
+}
+
+pub const COLLAPSING: &[Collapsing] = &[
+    Collapsing { name: "dissolve", short: "d", call: "ST_Union_Agg", listed: false },
+    Collapsing { name: "makeline", short: "ml", call: "ST_MakeLine", listed: true },
+    Collapsing { name: "polygonize", short: "pgz", call: "ST_Polygonize", listed: true },
 ];
 
 pub struct Parameterised {
@@ -225,16 +237,29 @@ fn dimension(name: &'static str, params: &[String], _: &StageCtx) -> anyhow::Res
     }
 }
 
-fn dissolve(ctx: &mut StageCtx, params: &[String]) -> anyhow::Result<()> {
+fn dump(ctx: &mut StageCtx) -> anyhow::Result<()> {
+    let geometry = ctx.geometry().to_string();
+    let parts = Expr::cust_with_exprs("unnest($1).geom", [ctx.call(DUMP, vec![ctx.geom()])?]);
+    let mut select = Query::select();
+    for (name, _) in ctx.columns().iter().filter(|(name, _)| name != &geometry) {
+        select.expr_as(Expr::col(Alias::new(name.as_str())), Alias::new(name.as_str()));
+    }
+    select.expr_as(parts, Alias::new(geometry.as_str())).from(ctx.data());
+    ctx.step(select.take());
+    Ok(())
+}
+
+fn collapse(ctx: &mut StageCtx, op: &Collapsing, params: &[String]) -> anyhow::Result<()> {
     let geometry = ctx.geometry().to_string();
     let carried: Vec<(String, String)> = ctx.columns().iter().filter(|(name, _)| name != &geometry).cloned().collect();
 
     let grouping = match params {
         [] => None,
         [name] => {
-            if [COUNT, MEMBERS].iter().any(|held| name.eq_ignore_ascii_case(held)) {
+            if ["count", "members"].iter().any(|held| name.eq_ignore_ascii_case(held)) {
                 return Err(crate::Fault::bad_request(format!(
-                    "dissolve cannot group by {name:?}, which is the name it gives its own column"
+                    "{} cannot group by {name:?}, which is the name it gives its own column",
+                    op.name
                 )));
             }
             match carried.iter().find(|(held, _)| held == name) {
@@ -242,7 +267,7 @@ fn dissolve(ctx: &mut StageCtx, params: &[String]) -> anyhow::Result<()> {
                 None => return Err(anyhow::Error::new(crate::filters::FilterError::UnknownColumn(name.clone()))),
             }
         }
-        _ => return Err(crate::Fault::bad_request("dissolve takes at most one column".to_string())),
+        _ => return Err(crate::Fault::bad_request(format!("{} takes at most one column", op.name))),
     };
 
     let mut members: Vec<SimpleExpr> = Vec::new();
@@ -257,9 +282,9 @@ fn dissolve(ctx: &mut StageCtx, params: &[String]) -> anyhow::Result<()> {
         select.expr_as(Expr::col(Alias::new(name.as_str())), Alias::new(name.as_str()));
     }
     select
-        .expr_as(Func::count(Expr::cust("*")), Alias::new(COUNT))
-        .expr_as(holding, Alias::new(MEMBERS))
-        .expr_as(ctx.call(UNION, vec![ctx.geom()])?, Alias::new(geometry.as_str()))
+        .expr_as(Func::count(Expr::cust("*")), Alias::new("count"))
+        .expr_as(holding, Alias::new("members"))
+        .expr_as(gathering(ctx, op)?, Alias::new(geometry.as_str()))
         .from(ctx.data());
     if let Some((name, _)) = &grouping {
         select.add_group_by([Expr::col(Alias::new(name.as_str()))]);
@@ -269,16 +294,25 @@ fn dissolve(ctx: &mut StageCtx, params: &[String]) -> anyhow::Result<()> {
     if let Some(held) = grouping {
         columns.push(held);
     }
-    columns.push((COUNT.to_string(), "BIGINT".to_string()));
-    columns.push((MEMBERS.to_string(), "JSON".to_string()));
+    columns.push(("count".to_string(), "BIGINT".to_string()));
+    columns.push(("members".to_string(), "JSON".to_string()));
     columns.push((geometry, "GEOMETRY".to_string()));
     ctx.regroup(select.take(), columns);
     Ok(())
 }
 
+fn gathering(ctx: &StageCtx, op: &Collapsing) -> anyhow::Result<SimpleExpr> {
+    let geometry = match op.listed {
+        true => Func::cust("array_agg").arg(ctx.geom()).into(),
+        false => ctx.geom(),
+    };
+    Ok(ctx.call(op.call, vec![geometry])?)
+}
+
 static OPTIONS: LazyLock<Vec<Opt>> = LazyLock::new(|| {
     std::iter::once(opt("reproject", "r", &[&[Param::Token], &[Param::Token, Param::Token]]))
-        .chain(std::iter::once(opt("dissolve", "d", &[&[], &[Param::Column]])))
+        .chain(std::iter::once(flag("dump", "dmp")))
+        .chain(COLLAPSING.iter().map(|op| opt(op.name, op.short, UP_TO_COLUMN)))
         .chain(UNARY.iter().map(|op| flag(op.name, op.short)))
         .chain(PARAMETERISED.iter().map(|op| opt(op.name, op.short, op.shapes)))
         .collect()
@@ -310,8 +344,12 @@ impl Action for Process {
                     ctx.replace_geometry(geometry);
                     ctx.set_crs(target);
                 }
-                "dissolve" => dissolve(ctx, &segment.params)?,
+                "dump" => dump(ctx)?,
                 other => {
+                    if let Some(op) = COLLAPSING.iter().find(|op| op.name == other) {
+                        collapse(ctx, op, &segment.params)?;
+                        continue;
+                    }
                     if let Some(op) = UNARY.iter().find(|op| op.name == other) {
                         let geometry = ctx.call(op.call, vec![ctx.geom()])?;
                         ctx.replace_geometry(geometry);
@@ -645,11 +683,14 @@ mod tests {
     }
 
     fn spellings() -> Vec<&'static str> {
-        let mut held: Vec<&'static str> = vec!["process", "p", "reproject", "r"];
+        let mut held: Vec<&'static str> = vec!["process", "p", "reproject", "r", "dump", "dmp"];
         for op in super::UNARY {
             held.extend([op.name, op.short]);
         }
         for op in super::PARAMETERISED {
+            held.extend([op.name, op.short]);
+        }
+        for op in super::COLLAPSING {
             held.extend([op.name, op.short]);
         }
         held
@@ -674,6 +715,7 @@ mod tests {
         for held in [
             super::UNARY.iter().map(|op| op.name).collect::<Vec<_>>(),
             super::PARAMETERISED.iter().map(|op| op.name).collect::<Vec<_>>(),
+            super::COLLAPSING.iter().map(|op| op.name).collect::<Vec<_>>(),
         ] {
             let mut sorted = held.clone();
             sorted.sort_unstable();
@@ -902,15 +944,16 @@ mod tests {
     #[case("/@dataset:x/@process/d:COUNT.geojson", "cannot group by \"COUNT\"")]
     #[case("/@dataset:x/@process/d:Members.geojson", "cannot group by \"Members\"")]
     #[case("/@dataset:x/@process/d:MEMBERS.geojson", "cannot group by \"MEMBERS\"")]
+    #[case("/@dataset:x/@process/ml:MEMBERS.geojson", "cannot group by \"MEMBERS\"")]
     fn a_dissolve_that_cannot_group_says_why(#[case] url: &str, #[case] expected: &str) {
         let held = failed(url);
         assert!(held.contains(expected), "expected {expected:?} in {held:?}");
     }
 
     #[test]
-    fn a_dissolve_refuses_a_column_duckdb_would_read_as_its_own() {
+    fn a_collapsing_operation_refuses_a_column_duckdb_would_read_as_its_own() {
         let held = failed_with(
-            "/@dataset:x/@process/d:Count.geojson",
+            "/@dataset:x/@process/pgz:Count.geojson",
             vec![("Count".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())],
         );
         assert!(held.contains("cannot group by"), "a case that duckdb folds together was allowed: {held:?}");
@@ -919,6 +962,89 @@ mod tests {
     #[test]
     fn a_dissolve_takes_at_most_one_column() {
         assert!(crate::url::parse("/@dataset:x/@process/d:a:b.geojson", &Grammar::core()).is_err());
+    }
+
+    #[rstest]
+    #[case("makeline", "ml", "ST_MakeLine")]
+    #[case("polygonize", "pgz", "ST_Polygonize")]
+    fn a_collapsing_operation_gathers_the_rows_into_a_list(
+        #[case] name: &str,
+        #[case] short: &str,
+        #[case] call: &str,
+    ) {
+        let long = planned(&format!("/@dataset:x/@process/{name}.geojson"), Some(WGS84));
+        let brief = planned(&format!("/@dataset:x/@p/{short}.geojson"), Some(WGS84));
+        assert!(long.contains(&format!("{call}(array_agg(\"geom\"))")), "{long}");
+        assert!(long.contains("COUNT(*)"), "{long}");
+        assert!(long.contains("json_group_array"), "{long}");
+        assert_eq!(long, brief, "{name} and {short} planned differently");
+    }
+
+    #[test]
+    fn a_dissolve_passes_the_geometry_straight_to_its_aggregate() {
+        let out = planned("/@dataset:x/@process/d.geojson", Some(WGS84));
+        assert!(out.contains("ST_Union_Agg(\"geom\")"), "{out}");
+        assert!(!out.contains("array_agg"), "an aggregate was handed a list: {out}");
+    }
+
+    #[test]
+    fn a_collapsing_operation_groups_by_a_column_like_a_dissolve_does() {
+        let out = planned_with(
+            "/@dataset:x/@process/ml:name.geojson",
+            vec![("name".to_string(), "VARCHAR".to_string()), ("geom".to_string(), "GEOMETRY".to_string())],
+        );
+        assert!(out.contains("GROUP BY \"name\""), "{out}");
+        assert!(out.contains("ST_MakeLine(array_agg(\"geom\"))"), "{out}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x/@process/ml:nope.geojson", "source has no column: nope")]
+    #[case("/@dataset:x/@process/pgz:count.geojson", "polygonize cannot group by \"count\"")]
+    fn a_collapsing_operation_that_cannot_group_says_which_one_failed(#[case] url: &str, #[case] expected: &str) {
+        let held = failed(url);
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[test]
+    fn every_collapsing_operation_is_tested() {
+        assert_eq!(super::COLLAPSING.len(), 3);
+    }
+
+    #[test]
+    fn a_dump_unnests_every_part_into_its_own_row() {
+        let out = planned("/@dataset:x/@process/dump.geojson", Some(WGS84));
+        let brief = planned("/@dataset:x/@p/dmp.geojson", Some(WGS84));
+        assert!(out.contains("unnest(ST_Dump(\"geom\")).geom AS \"geom\""), "{out}");
+        assert!(out.contains("\"id\" AS \"id\""), "a dump dropped the other columns: {out}");
+        assert!(!out.contains("GROUP BY"), "a dump grouped rows instead of expanding them: {out}");
+        assert_eq!(out, brief, "dump and dmp planned differently");
+    }
+
+    #[test]
+    fn a_dump_keeps_the_columns_the_output_reads() {
+        let out = planned("/@dataset:x/@process/dump.geojson", Some(WGS84));
+        let tail = &out[out.rfind("SELECT CAST(json_object").expect("the output select is missing")..];
+        assert!(tail.contains("'id', \"id\""), "{tail}");
+    }
+
+    #[test]
+    fn a_dump_chains_with_the_operations_around_it() {
+        let out = planned("/@dataset:x/@process/mv,dump,ctr.geojson", Some(WGS84));
+        let valid = out.find("ST_MakeValid").expect("makevalid missing");
+        let parts = out.find("ST_Dump").expect("dump missing");
+        let centre = out.find("ST_Centroid").expect("centroid missing");
+        assert!(valid < parts && parts < centre, "the steps are out of order: {out}");
+    }
+
+    #[test]
+    fn a_dump_of_a_source_with_only_a_geometry_still_plans() {
+        let out = planned_with("/@dataset:x/@process/dump.geojson", vec![("geom".to_string(), "GEOMETRY".to_string())]);
+        assert!(out.contains("unnest(ST_Dump(\"geom\")).geom"), "{out}");
+    }
+
+    #[test]
+    fn a_dump_takes_no_parameters() {
+        assert!(crate::url::parse("/@dataset:x/@process/dump:1.geojson", &Grammar::core()).is_err());
     }
 
     #[test]
@@ -963,6 +1089,44 @@ mod tests {
             .filter(|call| unary.query_row([call], |r| r.get::<_, i64>(0)).unwrap() == 0)
             .collect();
         assert!(missing.is_empty(), "no GEOMETRY to GEOMETRY overload: {missing:?}");
+    }
+
+    #[test]
+    fn every_collapsing_operation_takes_what_its_row_claims() {
+        crate::ensure_spatial();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("LOAD spatial;").unwrap();
+        let mut found = conn
+            .prepare(
+                "SELECT count(*) FROM duckdb_functions() \
+                 WHERE lower(function_name) = lower(?) AND array_to_string(parameter_types, ',') = ? \
+                 AND return_type = 'GEOMETRY'",
+            )
+            .unwrap();
+        for op in super::COLLAPSING {
+            let takes = match op.listed {
+                true => "GEOMETRY[]",
+                false => "GEOMETRY",
+            };
+            let held: i64 = found.query_row(duckdb::params![op.call, takes], |r| r.get(0)).unwrap();
+            assert!(held > 0, "{} has no overload taking {takes}", op.call);
+        }
+    }
+
+    #[test]
+    fn a_dump_returns_the_parts_duckdb_can_unnest() {
+        crate::ensure_spatial();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("LOAD spatial;").unwrap();
+        let shape: String = conn
+            .query_row(
+                "SELECT return_type FROM duckdb_functions() \
+                 WHERE lower(function_name) = lower(?) AND array_to_string(parameter_types, ',') = 'GEOMETRY'",
+                duckdb::params![super::DUMP],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(shape.contains("geom GEOMETRY"), "a dumped part has no geom field: {shape}");
     }
 
     #[test]

@@ -10,6 +10,8 @@ use crate::{AppState, CHANNEL_DEPTH, error, query, resolve_error, url};
 
 const GEOMETRY_FAILURES: [&str; 3] = ["TopologyException", "IllegalArgumentException", "AssertionFailedException"];
 const UNREADABLE_SOURCE: &str = "Could not open GDAL dataset";
+const SPATIAL_CALL: &str = "ST_";
+const SOURCE_CALL: &str = "ST_Read";
 
 pub async fn dataset(State(state): State<AppState>, SignedPath(path): SignedPath) -> Response {
     let parsed = match url::parse(&path, &state.grammar) {
@@ -142,7 +144,11 @@ fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
     if reported.contains(UNREADABLE_SOURCE) {
         return (StatusCode::UNPROCESSABLE_ENTITY, "source could not be opened as a geospatial dataset".to_string());
     }
-    if reported.contains("Invalid Input Error") {
+    let invalid_input = reported.contains("Invalid Input Error");
+    if invalid_input && reported.contains(SPATIAL_CALL) && !reported.contains(SOURCE_CALL) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "source geometry could not be processed".to_string());
+    }
+    if invalid_input {
         return (StatusCode::UNPROCESSABLE_ENTITY, format!("source could not be read with encoding {encoding}"));
     }
     (StatusCode::INTERNAL_SERVER_ERROR, "query failed".to_string())
@@ -151,6 +157,7 @@ fn error_status(e: &anyhow::Error, encoding: &str) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn a_missing_geometry_column_is_a_client_error() {
@@ -177,6 +184,32 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(message, "source geometry could not be processed");
         assert!(!message.contains("encoding"), "a geometry failure blamed the encoding: {message}");
+    }
+
+    #[test]
+    fn an_operation_refusing_its_input_is_not_blamed_on_the_encoding() {
+        let raw = anyhow::anyhow!("Invalid Input Error: ST_MakeLine requires zero or two or more POINT geometries");
+        let (status, message) = error_status(&raw, "UTF-8");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "source geometry could not be processed");
+        assert!(!message.contains("encoding"), "an operation failure blamed the encoding: {message}");
+    }
+
+    #[test]
+    fn a_read_that_fails_inside_st_read_still_names_the_encoding() {
+        let raw = anyhow::anyhow!("Invalid Input Error: ST_Read could not read /vsizip//srv/data/secret.zip/x.shp");
+        let (status, message) = error_status(&raw, "ISO-8859-1");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, "source could not be read with encoding ISO-8859-1");
+    }
+
+    #[rstest]
+    #[case("Binder Error: No function matches ST_Banana(GEOMETRY)")]
+    #[case("Out of Memory Error: failed to allocate inside ST_Buffer")]
+    fn a_failure_that_is_ours_stays_a_server_error(#[case] raw: &str) {
+        let (status, message) = error_status(&anyhow::anyhow!(raw.to_string()), "UTF-8");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(message, "query failed");
     }
 
     #[test]
