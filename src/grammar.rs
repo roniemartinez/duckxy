@@ -491,7 +491,24 @@ mod tests {
     fn the_core_grammar_registers_the_built_in_filters() {
         let g = Grammar::core();
         let names: Vec<&str> = g.filters.iter().map(|f| f.name).collect();
-        assert_eq!(names, vec!["id", "prop", "type", "valid", "empty", "simple", "closed", "intersects"]);
+        assert_eq!(
+            names,
+            vec![
+                "closed",
+                "contains",
+                "crosses",
+                "empty",
+                "id",
+                "intersects",
+                "prop",
+                "simple",
+                "touches",
+                "type",
+                "valid",
+                "within",
+                "withindist"
+            ]
+        );
     }
 
     fn named(

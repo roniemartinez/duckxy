@@ -4,7 +4,8 @@ use crate::grammar::{Grammar, ParamError, StageCtx};
 use crate::url::{ParsedUrl, Segment};
 use crate::{filters, query};
 use sea_query::{
-    Alias, CommonTableExpression, Expr, Func, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr, WithClause,
+    Alias, CommonTableExpression, Expr, ExprTrait, Func, PostgresQueryBuilder, Query, SelectStatement, SimpleExpr,
+    WithClause,
 };
 use std::sync::Arc;
 
@@ -29,6 +30,18 @@ pub struct NestedRelation {
     pub relation: Alias,
     pub geometry: String,
     pub crs: String,
+}
+
+pub fn scaled(
+    measure: crate::units::Measure,
+    geometry: SimpleExpr,
+    crs: &str,
+    dialect: &dyn crate::backend::Dialect,
+) -> SimpleExpr {
+    match measure {
+        crate::units::Measure::Units(value) => Expr::val(value),
+        crate::units::Measure::Metres(metres) => Expr::val(metres).div(dialect.metres_per_unit(geometry, crs)),
+    }
 }
 
 pub fn nested_geometry(held: &NestedRelation, crs: &str, dialect: &dyn crate::backend::Dialect) -> SimpleExpr {
@@ -503,6 +516,98 @@ mod tests {
         assert!(!out.contains("nested_1_src"), "an unfiltered nested source built a pass-through cte: {out}");
         assert!(out.contains("ST_Union_Agg"), "{out}");
         assert!(out.contains("ST_Intersects"), "{out}");
+    }
+
+    fn failed_nested(url: &str, nested: &[query::Described]) -> String {
+        let grammar = Grammar::core();
+        let parsed = crate::url::parse(url, &grammar).unwrap();
+        let held = plan(&grammar, &parsed, "/x.geojson", &geom_columns(), None, nested, backend()).unwrap_err();
+        format!("{held:#}")
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,wd:-1:(@dataset:zones).geojson", "needs a distance that is not negative")]
+    #[case("/@dataset:x,wd:banana:(@dataset:zones).geojson", "needs a number")]
+    #[case("/@dataset:x,wd:5banana:(@dataset:zones).geojson", "does not know the unit")]
+    #[case("/@dataset:x,wd:inf:(@dataset:zones).geojson", "needs a number")]
+    fn a_within_distance_filter_that_cannot_measure_says_why(#[case] url: &str, #[case] expected: &str) {
+        let held = failed_nested(url, &[described("(@dataset:zones)", "/zones.geojson", None)]);
+        assert!(held.contains(expected), "expected {expected:?} in {held:?}");
+    }
+
+    #[rstest]
+    #[case("/@dataset:x,within:(@dataset:zones):extra.geojson")]
+    #[case("/@dataset:x,wd:(@dataset:zones).geojson")]
+    #[case("/@dataset:x,wd:5.geojson")]
+    #[case("/@dataset:x,contains:5.geojson")]
+    fn a_misshapen_relation_filter_is_refused(#[case] url: &str) {
+        let grammar = Grammar::core();
+        let parsed = crate::url::parse(url, &grammar);
+        let Ok(parsed) = parsed else {
+            return;
+        };
+        let nested = [described("(@dataset:zones)", "/zones.geojson", None)];
+        assert!(
+            plan(&grammar, &parsed, "/x.geojson", &geom_columns(), None, &nested, backend()).is_err(),
+            "{url} planned"
+        );
+    }
+
+    #[rstest]
+    #[case("contains", "ST_Contains")]
+    #[case("cn", "ST_Contains")]
+    #[case("crosses", "ST_Crosses")]
+    #[case("cr", "ST_Crosses")]
+    #[case("intersects", "ST_Intersects")]
+    #[case("ix", "ST_Intersects")]
+    #[case("touches", "ST_Touches")]
+    #[case("to", "ST_Touches")]
+    #[case("within", "ST_Within")]
+    #[case("w", "ST_Within")]
+    fn a_relation_filter_calls_its_function_on_the_gathered_source(#[case] spelled: &str, #[case] call: &str) {
+        let out = planned_nested(
+            &format!("/@dataset:x,{spelled}:(@dataset:zones).geojson"),
+            None,
+            &[described("(@dataset:zones)", "/zones.geojson", None)],
+        );
+        assert!(out.contains(&format!("{call}(\"geom\", (SELECT ST_Union_Agg(")), "{out}");
+    }
+
+    #[test]
+    fn a_within_distance_filter_passes_the_reach_after_the_source() {
+        let out = planned_nested(
+            "/@dataset:x,wd:500:(@dataset:zones).geojson",
+            None,
+            &[described("(@dataset:zones)", "/zones.geojson", None)],
+        );
+        let at = out.find("ST_DWithin").expect("withindist missing");
+        let tail = &out[at..];
+        let geom = tail.find("\"geom\"").expect("no geometry argument");
+        let union = tail.find("ST_Union_Agg").expect("the source was not gathered");
+        let reach = tail.find("500").expect("the distance did not reach the call");
+        assert!(geom < union && union < reach, "the arguments are out of order: {tail}");
+    }
+
+    #[test]
+    fn a_within_distance_filter_converts_a_unit_into_the_source_crs() {
+        let out = planned_nested(
+            "/@dataset:x,wd:100m:(@dataset:zones).geojson",
+            Some("EPSG:25832"),
+            &[described("(@dataset:zones)", "/zones.geojson", Some("EPSG:25832"))],
+        );
+        assert!(out.contains("ST_DWithin"), "{out}");
+        assert!(out.contains("ST_Distance_Spheroid"), "the unit was not measured: {out}");
+    }
+
+    #[test]
+    fn a_within_distance_filter_in_crs_units_measures_nothing() {
+        let out = planned_nested(
+            "/@dataset:x,wd:100:(@dataset:zones).geojson",
+            Some("EPSG:25832"),
+            &[described("(@dataset:zones)", "/zones.geojson", Some("EPSG:25832"))],
+        );
+        assert!(out.contains("ST_DWithin"), "{out}");
+        assert!(!out.contains("ST_Distance_Spheroid"), "a bare number was converted: {out}");
     }
 
     #[test]

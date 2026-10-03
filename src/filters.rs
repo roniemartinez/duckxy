@@ -13,16 +13,22 @@ const ID_SHAPE: &[&[Param]] = &[&[Param::Value], &[Param::Operator, Param::Value
 const PROP_SHAPE: &[&[Param]] = &[&[Param::Column, Param::Value], &[Param::Column, Param::Operator, Param::Value]];
 const TYPE_SHAPE: &[&[Param]] = &[&[Param::GeometryType]];
 const SOURCE: &[&[Param]] = &[&[Param::Source]];
+const DISTANCE_AND_SOURCE: &[&[Param]] = &[&[Param::Token, Param::Source]];
 
 pub const CORE: &[FilterDef] = &[
+    filter("closed", "cl", BOOLEAN, closed),
+    filter("contains", "cn", SOURCE, contains),
+    filter("crosses", "cr", SOURCE, crosses),
+    filter("empty", "em", BOOLEAN, empty),
     filter("id", "", ID_SHAPE, id),
+    filter("intersects", "ix", SOURCE, intersects),
     filter("prop", "p", PROP_SHAPE, prop),
+    filter("simple", "si", BOOLEAN, simple),
+    filter("touches", "to", SOURCE, touches),
     filter("type", "ty", TYPE_SHAPE, geometry_type),
     filter("valid", "va", BOOLEAN, valid),
-    filter("empty", "em", BOOLEAN, empty),
-    filter("simple", "si", BOOLEAN, simple),
-    filter("closed", "cl", BOOLEAN, closed),
-    filter("intersects", "ix", SOURCE, intersects),
+    filter("within", "w", SOURCE, within),
+    filter("withindist", "wd", DISTANCE_AND_SOURCE, withindist),
 ];
 
 #[derive(Debug, PartialEq)]
@@ -211,13 +217,48 @@ fn simple(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> 
     Ok(predicate("ST_IsSimple", ctx).eq(boolean(only("simple", params)?)?))
 }
 
-fn intersects(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
-    let raw = only("intersects", params)?;
+fn relates(call: &'static str, ctx: &FilterCtx, raw: &str, extra: Vec<SimpleExpr>) -> anyhow::Result<SimpleExpr> {
     let Some(held) = ctx.nested(raw) else {
         return Err(crate::Fault::bad_request(format!("nested source was not resolved: {raw}")));
     };
     let gathered = crate::sql::nested_geometry(held, ctx.crs(), ctx.dialect());
-    Ok(Func::cust("ST_Intersects").arg(ctx.geom()).arg(gathered).into())
+    let mut args = vec![ctx.geom(), gathered];
+    args.extend(extra);
+    Ok(Func::cust(call).args(args).into())
+}
+
+fn contains(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    relates("ST_Contains", ctx, only("contains", params)?, Vec::new())
+}
+
+fn crosses(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    relates("ST_Crosses", ctx, only("crosses", params)?, Vec::new())
+}
+
+fn intersects(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    relates("ST_Intersects", ctx, only("intersects", params)?, Vec::new())
+}
+
+fn touches(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    relates("ST_Touches", ctx, only("touches", params)?, Vec::new())
+}
+
+fn within(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    relates("ST_Within", ctx, only("within", params)?, Vec::new())
+}
+
+fn withindist(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
+    let [raw_reach, raw_source] = params else {
+        return Err(FilterError::BadParams("withindist".to_string()).into());
+    };
+    let measure = crate::units::parse(raw_reach).map_err(|e| crate::Fault::bad_request(format!("withindist {e}")))?;
+    if measure.is_negative() {
+        return Err(crate::Fault::bad_request(format!(
+            "withindist needs a distance that is not negative, got {raw_reach:?}"
+        )));
+    }
+    let reach = crate::sql::scaled(measure, ctx.geom(), ctx.crs(), ctx.dialect());
+    relates("ST_DWithin", ctx, raw_source, vec![reach])
 }
 
 fn closed(ctx: &mut FilterCtx, params: &[String]) -> anyhow::Result<SimpleExpr> {
@@ -385,6 +426,34 @@ fn anchor(operator: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_filter_table_stays_in_order() {
+        let held: Vec<&str> = CORE.iter().map(|def| def.name).collect();
+        let mut sorted = held.clone();
+        sorted.sort_unstable();
+        assert_eq!(held, sorted, "the table is out of order, which makes a 13 row table unreadable");
+    }
+
+    #[test]
+    fn no_two_filters_share_a_spelling() {
+        let mut held: Vec<&str> = Vec::new();
+        for def in CORE {
+            held.push(def.name);
+            if !def.short.is_empty() {
+                held.push(def.short);
+            }
+        }
+        let mut twice: Vec<&str> = Vec::new();
+        let mut seen: Vec<&str> = Vec::new();
+        for name in held {
+            match seen.contains(&name) {
+                true => twice.push(name),
+                false => seen.push(name),
+            }
+        }
+        assert!(twice.is_empty(), "these spellings are claimed twice: {twice:?}");
+    }
 
     #[test]
     fn every_filter_the_core_grammar_registers_is_executable() {
