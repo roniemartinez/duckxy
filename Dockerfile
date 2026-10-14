@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.98.1-slim AS base
+FROM rust:1.99.0-slim AS base
 
 WORKDIR /app
 
